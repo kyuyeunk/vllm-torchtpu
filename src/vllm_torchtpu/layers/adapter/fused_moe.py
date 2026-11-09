@@ -22,6 +22,7 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.core import moe_collective_plan
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     quantize_to_native_fp4_kmajor,
@@ -206,7 +207,7 @@ def _get_fused_moe_custom_op(
     skip_padded_tokens: bool | None = None,
 ):
     if skip_padded_tokens is None:
-        skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
+        skip_padded_tokens = moe_collective_plan.skip_padded_tokens_from_envs()
     cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:

@@ -103,6 +103,7 @@ from vllm_torchtpu.layers.adapter.quantization.online_fp8 import (
     map_online_fp8,
     quantize_online_fp8,
 )
+from vllm_torchtpu.layers.core import moe_collective_plan
 from vllm_torchtpu.layers.core.quant_methods import FP8, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
@@ -768,6 +769,27 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
         return None
 
 
+def _collective_plan(method: object) -> moe_collective_plan.CollectivePlan:
+    """The fp8 MoE method's collective plan (see moe_collective_plan).
+
+    A module function, not a method: `supports_internal_mk` is also asked of
+    stand-in objects, and `enable_pipelined_collective_and_compute` is looked
+    up in this module so per-module test patches still apply.
+    """
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+
+    return moe_collective_plan.collective_plan(
+        moe_collective_plan.MoeLayerInfo(
+            quant="fp8",
+            ep_fused_supported=fused_moe_ep_supported(method),
+            adaptive_supported=adaptive_moe.adaptive_fused_moe_supported(method),
+        ),
+        moe_collective_plan.collective_overrides_from_envs(
+            chunk_pipelining=enable_pipelined_collective_and_compute()
+        ),
+    )
+
+
 class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
     """
     TPU-native FP8 MoE method.
@@ -823,14 +845,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         refuses -- TP, over the SMEM bound, under the token threshold, or
         a weight or routing layout the kernel cannot serve.
         """
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
-
-        return (
-            enable_pipelined_collective_and_compute()
-            or fused_moe_ep_supported(self)
-            or adaptive_moe.adaptive_fused_moe_supported(self)
-            or envs.TPU_MOE_FP8_ALL_GATHER
-        )
+        return _collective_plan(self).claims_collectives
 
     def maybe_roundup_sizes(
         self,
@@ -1179,15 +1194,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         # Either reason to take the collectives from vLLM leaves the routing
         # tensors local here, still holding this rank's own tokens. (The third
         # reason, the fused EP kernel, returned above.)
-        owns_collectives = (
-            enable_pipelined_collective_and_compute() or envs.TPU_MOE_FP8_ALL_GATHER
-        )
+        collectives = _collective_plan(self)
 
-        if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+        if collectives.zero_padded_routing_weights:
             topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
                 topk_ids,
                 topk_weights,
-                is_local_tensor=owns_collectives,
+                is_local_tensor=collectives.stages_collectives,
             )
 
         # Step 2: EP global->local remap happens inside fused_moe_gmm via an
@@ -1206,7 +1219,7 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
         }
-        if owns_collectives:
+        if collectives.stages_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
 
         from vllm_torchtpu.layers.adapter.fused_moe_decode import (

@@ -72,6 +72,7 @@ from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
     should_quantize_on_load,
 )
+from vllm_torchtpu.layers.core import moe_collective_plan
 from vllm_torchtpu.layers.core.quant_methods import UNQUANTIZED, get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
@@ -230,6 +231,22 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
         return None
 
 
+def _collective_plan() -> moe_collective_plan.CollectivePlan:
+    """The unquantized MoE method's collective plan (see moe_collective_plan).
+
+    `enable_pipelined_collective_and_compute` is looked up in this module so
+    per-module test patches still apply.
+    """
+    return moe_collective_plan.collective_plan(
+        moe_collective_plan.MoeLayerInfo(
+            quant="unquantized", ep_fused_supported=False, adaptive_supported=False
+        ),
+        moe_collective_plan.collective_overrides_from_envs(
+            chunk_pipelining=enable_pipelined_collective_and_compute()
+        ),
+    )
+
+
 class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMethod):
     """
     TPU-native implementation of unquantized RoutedExperts.
@@ -253,7 +270,7 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
     def supports_internal_mk(self) -> bool:
         # We need to take control of collective communication (AllGather/ReduceScatter)
         # to pipeline them with MoE computation when chunking is enabled.
-        return enable_pipelined_collective_and_compute()
+        return _collective_plan().claims_collectives
 
     def _select_monolithic(self):
         return self._forward_monolithic_tpu
@@ -376,7 +393,7 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
         }
-        if enable_pipelined_collective_and_compute():
+        if _collective_plan().stages_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)
