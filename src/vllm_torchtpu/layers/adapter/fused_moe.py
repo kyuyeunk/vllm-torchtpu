@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Torch bridge for fused MoE based on fused_moe_func in fused_moe_gmm."""
+"""Torch bridge for fused MoE based on fused_moe_op_fn in fused_moe_gmm."""
 
 import enum
 import functools
@@ -24,15 +24,13 @@ from torch_tpu._internal import pallas
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.core import moe_collective_plan
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
-    fused_moe_func,
+    fused_moe_op_fn,
     quantize_to_native_fp4_kmajor,
     requant_unpack_kmajor,
     resolve_onehot_permute_threshold,
     unpack_fp4_to_e2m1,
 )
 
-_kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
@@ -144,81 +142,40 @@ def quantize_native_fp4_kmajor(
     return op(w)
 
 
-def _allocate_kernel_instance_id() -> int:
-    global _kernel_instance_counter
-    kernel_instance_id = _kernel_instance_counter
-    _kernel_instance_counter += 1
-    return kernel_instance_id
+# One custom op for every MoE configuration: topk, activation, use_ep,
+# use_sparse_core, the one-hot threshold, rhs_quant_dtype and skip_padded_tokens
+# are static arguments, so jax_op keys compiled programs on them itself.
+_fused_moe_op = None
+# (use_sparse_core, one-hot threshold): process-wide, resolved once outside
+# tracing by prebuild_fused_moe_kernel, or at first use.
+_moe_statics: tuple[bool, int] | None = None
 
 
-def _build_fused_moe_custom_op(
-    *,
-    topk: int,
-    activation: str,
-    use_ep: bool,
-    skip_padded_tokens: bool,
-    rhs_quant_dtype=None,
-):
-    kernel_instance_id = _allocate_kernel_instance_id()
-    op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
+def _get_fused_moe_op():
+    global _fused_moe_op
+    if _fused_moe_op is None:
+        _fused_moe_op = pallas.jax_op("pallas::fused_moe_gmm", fused_moe_op_fn)
 
-    # TODO: once the pod's vLLM includes --moe-backend (added upstream in
-    # vLLM PR #33807, 2026-03-01; absent in the 0.19.0 we run), register the
-    # SparseCore vs plain variants through that selector + the MoE oracle
-    # instead of this env flag -- the MoE analog of how #191 moved batched
-    # RPA onto --attention-backend CUSTOM. Note MoEBackend has no CUSTOM slot
-    # yet, so that also needs an upstream OOT-backend hook.
-    use_sparse_core = envs.USE_MOE_SPARSE_CORE
+        # vLLM traces hidden_states with a dynamic token dimension, which the
+        # default fake rejects; static arguments arrive here too.
+        def _fake_fused_moe(hidden_states, *args, **kwargs):
+            return torch.empty_like(hidden_states)
 
-    # Pass experts_start as a runtime tensor rather than static closure arg so every EP
-    # rank compiles an identical program.
-    # See fa8faaf5 for background on rank-uniform sharding in compiled Pallas graphs.
-    wrapped_fn = functools.partial(
-        fused_moe_func,
-        topk=topk,
-        activation=activation,
-        use_ep=use_ep,
-        use_sparse_core=use_sparse_core,
-        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
-    )
-
-    fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
-
-    # We must overwrite the default fake implementation as vLLM uses dynamic
-    # dimensions for the hidden_states.
-    def _fake_fused_moe(hidden_states, *args, **kwargs):
-        return torch.empty_like(hidden_states)
-
-    fused_moe_kernel_impl.register_fake(_fake_fused_moe)
-
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
-    _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
-    return fused_moe_kernel_impl
+        _fused_moe_op.register_fake(_fake_fused_moe)
+    return _fused_moe_op
 
 
-def _get_fused_moe_custom_op(
-    *,
-    topk: int,
-    activation: str,
-    use_ep: bool,
-    rhs_quant_dtype=None,
-    skip_padded_tokens: bool | None = None,
-):
-    if skip_padded_tokens is None:
-        skip_padded_tokens = moe_collective_plan.skip_padded_tokens_from_envs()
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
-    kernel = _fused_moe_kernel_cache.get(cache_key)
-    if kernel is not None:
-        return kernel
-    return _build_fused_moe_custom_op(
-        topk=topk,
-        activation=activation,
-        use_ep=use_ep,
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
-    )
+def _get_moe_statics() -> tuple[bool, int]:
+    global _moe_statics
+    if _moe_statics is None:
+        # TODO: once the pod's vLLM includes --moe-backend (added upstream in
+        # vLLM PR #33807, 2026-03-01; absent in the 0.19.0 we run), register
+        # the SparseCore vs plain variants through that selector + the MoE
+        # oracle instead of this env flag -- the MoE analog of how #191 moved
+        # batched RPA onto --attention-backend CUSTOM. Note MoEBackend has no
+        # CUSTOM slot yet, so that also needs an upstream OOT-backend hook.
+        _moe_statics = (envs.USE_MOE_SPARSE_CORE, resolve_onehot_permute_threshold())
+    return _moe_statics
 
 
 def prebuild_fused_moe_kernel(
@@ -229,14 +186,15 @@ def prebuild_fused_moe_kernel(
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
 ) -> None:
-    """Prebuild and cache fused MoE custom op outside compile-time tracing."""
-    _get_fused_moe_custom_op(
-        topk=topk,
-        activation=activation,
-        use_ep=use_ep,
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
-    )
+    """Registers the fused MoE op and resolves its process-wide statics.
+
+    Runs at weight load, outside compile-time tracing. The arguments are the
+    layer's configuration; the single op takes them per call, so they are
+    accepted for the callers' sake and not needed here.
+    """
+    del topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens
+    _get_moe_statics()
+    _get_fused_moe_op()
 
 
 def fused_moe_gmm(
@@ -268,18 +226,18 @@ def fused_moe_gmm(
     the sparse-core parity path dispatches ragged gather/gather-reduce.
     """
     use_ep = experts_start is not None
-    fused_moe = _get_fused_moe_custom_op(
-        topk=topk,
-        activation=activation,
-        use_ep=use_ep,
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
-    )
+    if skip_padded_tokens is None:
+        skip_padded_tokens = moe_collective_plan.skip_padded_tokens_from_envs()
+    use_sparse_core, onehot_threshold = _get_moe_statics()
+    fused_moe = _get_fused_moe_op()
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand
         # (see the `if use_ep:` guard in fused_moe_func), but the custom op
         # still needs a concrete tensor to call with a fixed arity.
         experts_start = torch.zeros((), dtype=torch.int32, device=hidden_states.device)
+    # Pass experts_start as a runtime tensor rather than a static argument so
+    # every EP rank compiles an identical program. See fa8faaf5 for background
+    # on rank-uniform sharding in compiled Pallas graphs.
     return fused_moe(
         hidden_states,
         w1,
@@ -291,4 +249,11 @@ def fused_moe_gmm(
         topk_weights,
         topk_ids,
         experts_start,
+        topk,
+        activation,
+        use_ep,
+        use_sparse_core,
+        onehot_threshold,
+        None if rhs_quant_dtype is None else rhs_quant_dtype.__name__,
+        skip_padded_tokens,
     )

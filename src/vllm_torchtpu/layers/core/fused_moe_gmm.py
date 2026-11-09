@@ -826,3 +826,52 @@ def fused_moe_func(
         rhs_quant_dtype=rhs_quant_dtype,
     )
     return x[:num_tokens, :hidden_size]
+
+
+def fused_moe_op_fn(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2_bias: jax.Array | None,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    experts_start: jax.Array,
+    topk: int,
+    activation: str,
+    use_ep: bool,
+    use_sparse_core: bool,
+    onehot_moe_permute_threshold: int,
+    rhs_quant_dtype: str | None,
+    skip_padded_tokens: bool,
+) -> jax.Array:
+    """`fused_moe_func` with its configuration as plain static arguments.
+
+    The entry the fused MoE torch custom op registers: `jax_op` treats every
+    non-array argument as static. `rhs_quant_dtype` crosses the torch schema
+    as the `jax.numpy` type's name (torch has no int4 dtype) and is mapped
+    back to that same type object here.
+    """
+    return fused_moe_func(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        topk_weights,
+        topk_ids,
+        experts_start,
+        topk=topk,
+        activation=activation,
+        use_ep=use_ep,
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        rhs_quant_dtype=None
+        if rhs_quant_dtype is None
+        else getattr(jnp, rhs_quant_dtype),
+        skip_padded_tokens=skip_padded_tokens,
+    )
