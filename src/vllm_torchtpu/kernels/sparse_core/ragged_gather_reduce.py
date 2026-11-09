@@ -22,6 +22,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu.kernels.sparse_core import core_map_helper
+from vllm_torchtpu.kernels.sparse_core import ragged_gather_reduce_fallback as fallback
 
 
 # ceil up to the nearest multiple of b.
@@ -444,13 +445,14 @@ def _preprocess(
     )
 
 
-@jax.jit(static_argnames=("reduce_group_size",))
+@jax.jit(static_argnames=("reduce_group_size", "tc_fallback"))
 def ragged_gather_reduce(
     x: jax.Array,
     indices: jax.Array,
     topk_weights: jax.Array,
     valid_rows_mask: jax.Array,
     reduce_group_size: int,
+    tc_fallback: bool | None = None,
 ) -> jax.Array:
     """Gathers `x` according to `indices`, applies weights and masks, and reduces.
 
@@ -473,6 +475,9 @@ def ragged_gather_reduce(
         valid, with shape `(input_size,)`.
       reduce_group_size: An integer representing the number of consecutive rows to
         reduce (sum) together.
+      tc_fallback: The caller's decision to run the TensorCore fallback (the
+        MoE plan decides it with `ragged_gather_reduce_fallback`); None decides
+        here with the same rule.
 
     Returns:
       A 2D JAX array of reduced data with shape
@@ -487,21 +492,22 @@ def ragged_gather_reduce(
     )
 
     sc_info = pltpu.get_tpu_info().sparse_core
-    if sc_info is None:
+    if tc_fallback is None:
+        tc_fallback = fallback.takes_tensorcore_path(
+            version="v1",
+            size=x.size,
+            hidden=x.shape[-1],
+            dtype=str(x.dtype),
+            dtype_bytes=jax.dtypes.itemsize_bits(x.dtype) // 8,
+            vmem_capacity_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
+            has_sparse_core=sc_info is not None,
+            num_lanes=pltpu.get_tpu_info().num_lanes,
+        )
+    if tc_fallback:
         return _fallback_implementation(
             x, indices, topk_weights, valid_rows_mask, reduce_group_size
         )
-
-    # Heuristic threshold on whether to fallback for small inputs.
-    dtype = x.dtype
-    dtype_bytes = jax.dtypes.itemsize_bits(dtype) // 8
-    if jnp.size(x) * dtype_bytes * 2 < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6:
-        # For small {input + output}, it's likely that both can be put in TC VMEM,
-        # so it's likely faster to run TC-based implementation on it than going
-        # through SC, without data movement to/from HBM.
-        return _fallback_implementation(
-            x, indices, topk_weights, valid_rows_mask, reduce_group_size
-        )
+    assert sc_info is not None, "the SparseCore path needs a SparseCore"
 
     hidden_size = x.shape[-1]
     input_size = indices.size

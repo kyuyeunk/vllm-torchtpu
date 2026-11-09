@@ -494,8 +494,8 @@ def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):
             side_effect=[gmm1_res, gmm2_res],
         ),
         patch.object(
-            fused_moe_gmm,
-            "can_use_blockwise_onehot_unpermute",
+            fused_moe_gmm.moe_plan,
+            "owner_onehot_admits",
             return_value=True,
         ) as support_check,
         patch.object(
@@ -1288,9 +1288,7 @@ def test_prepare_routed_counting_sort_eliminates_redundant_sorts(
 
     with monkeypatch.context() as m:
         m.setattr(fused_moe_gmm, "_COUNTING_SORT_SCATTER_MAX_ROWS", 0)
-        m.setattr(
-            fused_moe_gmm, "_counting_sort_positions", lambda *a, **kw: (None, None)
-        )
+        m.setattr(fused_moe_gmm.moe_plan, "counting_sort_accepts", lambda op: False)
         ref_out = prepare_routed_gmm_inputs(
             hidden_states, topk_indices, topk_weights, **common
         )

@@ -371,14 +371,25 @@ def _new_entry(process, op, can_use_dense_expert):
     return events
 
 
+def _refuse(op):
+    del op
+    return False
+
+
 def _new_routing(process, op, inject_refusal):
-    """Mirrors the prototype: try the counting sort, then plan on its result."""
-    sorted_ok = False
-    if moe_plan.counting_sort_attempted(process, op):
-        # The kernel's own refusal rule (verbatim), or an injected refusal.
-        block = min(_COUNTING_SORT_BLOCK, op.routed_rows)
-        sorted_ok = not inject_refusal and not op.local_num_experts + 1 > block
-    return moe_plan.plan_routing(process, op, counting_sorted=sorted_ok)
+    """The plan decides; an injected refusal patches its acceptance rule.
+
+    That is how the existing TPU tests now stand the counting sort down
+    (they used to patch `_counting_sort_positions` to return None).
+    """
+    if not inject_refusal:
+        return moe_plan.plan_routing(process, op)
+    saved = moe_plan.counting_sort_accepts
+    moe_plan.counting_sort_accepts = _refuse
+    try:
+        return moe_plan.plan_routing(process, op)
+    finally:
+        moe_plan.counting_sort_accepts = saved
 
 
 def _new_prepare(routing):
@@ -416,13 +427,15 @@ def _new_combine(process, op, out, info_or_none, owner_output_mode):
         moe_plan.combine_reads_owner_mode(process, op, out)
         and owner_output_mode.lower() == "on"
     )
-    needs = moe_plan.combine_needs_target(process, op, out, owner_output=owner_output)
-    target = (
-        TpuTarget.from_tpu_info(info_or_none)
-        if needs and info_or_none is not None
-        else None
-    )
-    return needs, moe_plan.plan_combine(
+    need = moe_plan.combine_target_need(process, op, out, owner_output=owner_output)
+    target = None
+    if need != "none":
+        if info_or_none is not None:
+            target = TpuTarget.from_tpu_info(info_or_none)
+        elif need == "required":
+            # TpuTarget.from_runtime raises like get_tpu_info.
+            raise ValueError("Unsupported TPU device kind: cpu")
+    return need != "none", moe_plan.plan_combine(
         process, op, out, target, owner_output=owner_output
     )
 
@@ -531,9 +544,6 @@ class MoeRoutingOracleTest(unittest.TestCase):
                 use_ep=use_ep,
             )
             routing = _new_routing(process, op, inject)
-            if not inject:
-                # Without the counting result the plan predicts the same.
-                self.assertEqual(moe_plan.plan_routing(process, op), routing)
             expected = _reference_prepare(
                 num_tokens_local=num_tokens,
                 topk=topk,

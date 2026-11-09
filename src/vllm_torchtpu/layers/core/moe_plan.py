@@ -21,18 +21,18 @@ a pure function of three values:
 - `MoeOpIn` and `GmmOutSpec`: the concrete shapes and dtypes of this call;
 - `TpuTarget`: the chip.
 
-The rules are today's inline conditions, moved without change. Where a kernel
-re-checks a condition and silently runs another path (the SparseCore
-gather-reduce kernels' TensorCore fallbacks, the counting sort's refusal,
-the owner-output kernel's admission), the rule here computes the same
-predicate so the plan names the path that actually runs. The kernels are
-untouched, so each such predicate is a duplicate; each is marked
-"DUPLICATE of" with the kernel line it mirrors.
+The rules are today's inline conditions, moved without change. The plan is
+the single decider: where a kernel used to re-decide (the SparseCore
+gather-reduce kernels' TensorCore fallbacks, the counting sort's refusal, the
+owner-output kernel's admission), the kernel now receives the plan's decision
+or asserts its precondition. Kernel-specific rules live next to their kernel
+as pure modules (`ragged_gather_reduce_fallback`,
+`ragged_gather_reduce_v3_partition`, `moe_onehot_unpermute_admission`) that
+both the kernel and this plan import.
 
 The decision resolves in three stages, each where its inputs first exist:
 `plan_entry` (non-finite scrub, dense expert) at the top of `fused_moe_func`;
-`plan_routing` in `prepare_routed_gmm_inputs`, because the sort form depends
-on whether the counting sort returned positions; and `plan_combine` after the
+`plan_routing` in `prepare_routed_gmm_inputs`; and `plan_combine` after the
 second GMM, because the combine depends on that output's width, which
 `gmm_v2` derives internally (it pads N to a lane multiple).
 
@@ -42,6 +42,9 @@ Imports no JAX or TPU runtime, so every rule here runs on CPU.
 import dataclasses
 from typing import Literal
 
+from vllm_torchtpu.kernels.megablox import moe_onehot_unpermute_admission as owner
+from vllm_torchtpu.kernels.sparse_core import ragged_gather_reduce_fallback as fallback
+from vllm_torchtpu.kernels.sparse_core import ragged_gather_reduce_v3_partition as v3
 from vllm_torchtpu.layers.core.tpu_target import TpuTarget
 
 # Cap on the auto one-hot threshold.
@@ -63,15 +66,6 @@ COUNTING_SORT_BLOCK = 512
 COUNTING_SORT_SCATTER_MAX_ROWS = COUNTING_SORT_BLOCK
 # A packed (key, payload) sort key must fit in a non-negative int32.
 _PACKED_SORT_BITS = 31
-# The local v3 combine packs source indices into 20 bits
-# (`ragged_gather_reduce_v3._ROUTE_INDEX_BITS`).
-LOCAL_V3_MAX_SOURCE_ROWS = 1 << 20
-# DUPLICATE of `ragged_gather_reduce_v3._TOKEN_BLOCK` (16 x 4).
-_V3_TOKEN_BLOCK = 64
-# DUPLICATE of `moe_onehot_unpermute._ROUTE_BLOCK_SIZE`.
-_OWNER_ROUTE_BLOCK_SIZE = 128
-# DUPLICATE of `moe_onehot_unpermute._VMEM_WORKSPACE_MARGIN_BYTES`.
-_OWNER_VMEM_WORKSPACE_MARGIN_BYTES = 4 * 1024 * 1024
 
 GatherReduceVersion = Literal["v1", "v2", "v3"]
 
@@ -126,8 +120,8 @@ Combine = Literal[
 - `ep_onehot`: EP, dense one-hot combine matmul.
 - `ep_ragged_sc`: EP, the configured SparseCore gather-reduce kernel runs on
   the SparseCore.
-- `ep_ragged_tc_fallback`: EP, the same kernel entry point is called but it
-  takes its own TensorCore fallback (no SparseCore, or the input is small).
+- `ep_ragged_tc_fallback`: EP, the same kernel entry point runs its
+  TensorCore fallback (no SparseCore, or the input is small).
 - `tensorcore`: plain XLA gather, weight, mask and sum.
 """
 
@@ -392,7 +386,7 @@ def _ragged_permute(process: MoeProcessPlan, op: MoeOpIn) -> bool:
 
 
 def counting_sort_attempted(process: MoeProcessPlan, op: MoeOpIn) -> bool:
-    """Whether `_counting_sort_positions` is called.
+    """Whether the counting sort is wanted (it runs if it also accepts).
 
     Always on the ragged permute; elsewhere when TPU_MOE_COUNTING_SORT is on
     and the routed rows are within the single-sort cap.
@@ -410,55 +404,37 @@ def counting_sort_attempted(process: MoeProcessPlan, op: MoeOpIn) -> bool:
 
 
 def counting_sort_accepts(op: MoeOpIn) -> bool:
-    """Predicts whether `_counting_sort_positions` returns positions.
+    """Whether the counting sort can serve this bucket.
 
-    DUPLICATE of its refusal: it returns (None, None), emitting nothing, when
-    `local_num_experts + 1 > min(COUNTING_SORT_BLOCK, routed_rows)`. Used by
-    `plan_bucket` (logs, tests); `prepare_routed_gmm_inputs` passes the
-    actual result instead.
+    The rank contraction runs in blocks of `min(COUNTING_SORT_BLOCK, rows)`;
+    XLA miscompiles it on jaxlib 0.10.2 + libtpu 0.0.44.1 when there are more
+    buckets than block rows (the positions come back not a permutation), so
+    that region uses the comparison sorts. `_counting_sort_positions` asserts
+    this precondition.
 
     Args:
         op: This call's shapes.
 
     Returns:
-        True when the counting sort would produce positions.
+        True when the counting sort may run.
     """
     return not op.local_num_experts + 1 > min(COUNTING_SORT_BLOCK, op.routed_rows)
 
 
-def plan_routing(
-    process: MoeProcessPlan, op: MoeOpIn, *, counting_sorted: bool | None = None
-) -> MoeRoutingPlan:
+def plan_routing(process: MoeProcessPlan, op: MoeOpIn) -> MoeRoutingPlan:
     """How the routed layout is built for one bucket.
-
-    The sort form depends on whether the counting sort produced positions, a
-    value computed while tracing. `prepare_routed_gmm_inputs` calls the
-    counting sort when `counting_sort_attempted` holds and passes whether it
-    returned positions; callers without that result (logs, tests) leave it
-    None and get `counting_sort_accepts`' prediction.
 
     Args:
         process: Process-wide knobs.
         op: This call's shapes.
-        counting_sorted: The counting sort ran and returned positions, or
-            None to predict it.
 
     Returns:
         The routing plan.
-
-    Raises:
-        ValueError: If `counting_sorted` is True but the counting sort would
-            not have been attempted.
     """
     rows = op.routed_rows
     num_buckets = op.local_num_experts + 1
     ragged_permute = _ragged_permute(process, op)
-    attempted = counting_sort_attempted(process, op)
-    if counting_sorted is None:
-        counting_sorted = attempted and counting_sort_accepts(op)
-    elif counting_sorted and not attempted:
-        raise ValueError(f"counting sort reported for a bucket that skips it: {op}")
-    counting = counting_sorted
+    counting = counting_sort_attempted(process, op) and counting_sort_accepts(op)
     token_bits = max(1, (op.num_tokens - 1).bit_length())
     packable = num_buckets.bit_length() + token_bits < _PACKED_SORT_BITS
     flat_bits = max(1, (rows - 1).bit_length())
@@ -514,100 +490,53 @@ def _local_v3_precondition(
         # BF16 kernel input.
         and out.dtype == "bfloat16"
         # Packed source-index capacity.
-        and out.rows <= LOCAL_V3_MAX_SOURCE_ROWS
+        and out.rows <= 1 << v3.ROUTE_INDEX_BITS
     )
 
 
-def _v3_num_column_partitions(hidden_size: int, num_cores: int, num_lanes: int) -> int:
-    # DUPLICATE of `ragged_gather_reduce_v3._calculate_num_column_partitions`.
-    preferred_num_stages = 4
-    num_column_partitions = 1
-    while (
-        num_cores % (num_column_partitions * 2) == 0
-        and hidden_size % (num_lanes * num_column_partitions * 2) == 0
-        and hidden_size // (num_column_partitions * 2 * num_lanes)
-        >= preferred_num_stages
-    ):
-        num_column_partitions *= 2
-    if num_column_partitions >= 2 and hidden_size <= 1024 * (
-        num_column_partitions // 2
-    ):
-        num_column_partitions //= 2
-    return num_column_partitions
-
-
-def v3_token_block_alignment(hidden_size: int, target: TpuTarget) -> int:
-    """Destination-token granularity of `ragged_gather_reduce_v3`.
-
-    DUPLICATE of `ragged_gather_reduce_v3.token_block_alignment`: one 64-token
-    block per SparseCore row partition.
-
-    Args:
-        hidden_size: Combine input width.
-        target: A chip with a SparseCore.
-
-    Returns:
-        The token alignment the kernel pads destinations to.
-    """
-    sc = target.sparse_core
-    assert sc is not None
-    num_cores = sc.num_cores * sc.num_subcores
-    num_column_partitions = _v3_num_column_partitions(
-        hidden_size, num_cores, target.num_lanes
+def _tensorcore_fallback(
+    version: GatherReduceVersion, out: GmmOutSpec, target: TpuTarget
+) -> bool:
+    return fallback.takes_tensorcore_path(
+        version=version,
+        size=out.size,
+        hidden=out.hidden,
+        dtype=out.dtype,
+        dtype_bytes=out.dtype_bytes,
+        vmem_capacity_bytes=target.vmem_bytes_per_core,
+        has_sparse_core=target.sparse_core is not None,
+        num_lanes=target.num_lanes,
     )
-    return (num_cores // num_column_partitions) * _V3_TOKEN_BLOCK
 
 
-def _local_v3(
+def _local_v3_alignment(
     op: MoeOpIn, out: GmmOutSpec, target: TpuTarget | None
-) -> tuple[bool, int | None]:
+) -> int | None:
+    """The v3 token alignment when local v3 is worth running, else None."""
     sc = target.sparse_core if target is not None else None
-    # Lane-aligned width, 16-lane SparseCore, and v3's own cutoff (two BF16
-    # buffers use at least 60% of VMEM).
-    if not (
-        target is not None
-        and sc is not None
-        and sc.num_lanes == 16
-        and out.hidden % target.num_lanes == 0
-        and out.size * 4 >= target.vmem_bytes_per_core * 0.6
-    ):
-        return False, None
+    # A 16-lane SparseCore, and v3 would not take its own TensorCore path
+    # (lane-aligned width, two BF16 buffers at least 60% of VMEM).
+    if target is None or sc is None or sc.num_lanes != 16:
+        return None
+    if _tensorcore_fallback("v3", out, target):
+        return None
     # The kernel pads destination tokens to one 64-token block per SparseCore
     # row partition: require at least one full block and padding of at most
     # half the batch.
-    alignment = v3_token_block_alignment(out.hidden, target)
+    alignment = v3.token_block_alignment(
+        out.hidden, sc.num_cores * sc.num_subcores, target.num_lanes
+    )
     padded_tokens = -(-op.num_tokens // alignment) * alignment
-    ok = op.num_tokens >= alignment and padded_tokens * 2 <= op.num_tokens * 3
-    return ok, alignment
-
-
-def _ep_ragged_falls_back(
-    version: GatherReduceVersion, out: GmmOutSpec, target: TpuTarget | None
-) -> bool:
-    """Whether the EP gather-reduce kernel takes its TensorCore fallback.
-
-    With no chip description the kernels raise from `get_tpu_info` instead;
-    that host never runs this path, and it is labelled a fallback here.
-    """
-    if target is None or target.sparse_core is None:
-        return True
-    small = out.size * out.dtype_bytes * 2 < target.vmem_bytes_per_core * 0.6
-    if version == "v3":
-        # DUPLICATE of `ragged_gather_reduce_v3.ragged_gather_reduce`'s two
-        # fallback checks.
-        return out.dtype != "bfloat16" or out.hidden % target.num_lanes != 0 or small
-    # DUPLICATE of v1 `ragged_gather_reduce` and of v2 `Config.should_fallback`
-    # (source_rows * hidden_size * bytes == size * bytes).
-    return small
+    if op.num_tokens >= alignment and padded_tokens * 2 <= op.num_tokens * 3:
+        return alignment
+    return None
 
 
 def owner_onehot_admits(op: MoeOpIn, out: GmmOutSpec, target: TpuTarget | None) -> bool:
     """Whether the blockwise one-hot unpermute kernel accepts this call.
 
-    DUPLICATE of `moe_onehot_unpermute.can_use_blockwise_onehot_unpermute`.
-    `topk_weights_sorted` there is `zeros_like(topk_weights_flat)`, and
-    `valid_count` is always an int32 `(1,)` array, so their checks reduce to
-    the ones below. `fused_moe_gmm` asserts this agrees with the kernel.
+    `topk_weights_sorted` is `zeros_like(topk_weights_flat)` and `valid_count`
+    an int32 `(1,)` array, so their facts come from `out`.
 
     Args:
         op: This call's shapes.
@@ -618,35 +547,30 @@ def owner_onehot_admits(op: MoeOpIn, out: GmmOutSpec, target: TpuTarget | None) 
         The kernel's admission answer.
 
     Raises:
-        ValueError: When the shape checks pass but there is no chip
-            description; the kernel's own `get_tpu_info` call raises there.
+        ValueError: When the shapes pass but there is no chip description,
+            where the kernel's own `get_tpu_info` call used to raise.
     """
-    if out.dtype != "bfloat16":
-        return False
-    route_capacity, hidden_size = out.rows, out.hidden
-    if out.token_indices_shape != (route_capacity,):
-        return False
-    if out.token_indices_dtype != "int32":
-        return False
-    if out.topk_weights_shape != (route_capacity,):
-        return False
-    if out.topk_weights_dtype != "bfloat16":
+    if not owner.shape_admits(
+        route_shape=(out.rows, out.hidden),
+        route_dtype=out.dtype,
+        token_indices_shape=out.token_indices_shape,
+        token_indices_dtype=out.token_indices_dtype,
+        weights_shape=out.topk_weights_shape,
+        weights_dtype=out.topk_weights_dtype,
+        valid_count_shape=(1,),
+        valid_count_dtype="int32",
+    ):
         return False
     if target is None:
         raise ValueError("owner-output admission needs a TPU description")
-    if route_capacity % _OWNER_ROUTE_BLOCK_SIZE:
-        return False
-    if hidden_size % target.mxu_column_size:
-        return False
-    if op.num_tokens % target.sublane_tiling(out.dtype_bits):
-        return False
-    vmem_limit_bytes = int(target.vmem_bytes_per_core * 0.9)
-    explicit = (
-        op.num_tokens * hidden_size * (4 + 2)
-        + 2 * _OWNER_ROUTE_BLOCK_SIZE * hidden_size * 2
-        + route_capacity * (4 + 4)
+    return owner.chip_admits(
+        route_capacity=out.rows,
+        hidden_size=out.hidden,
+        num_tokens=op.num_tokens,
+        mxu_column_size=target.mxu_column_size,
+        sublane_tiling=lambda: target.sublane_tiling(out.dtype_bits),
+        vmem_capacity_bytes=target.vmem_bytes_per_core,
     )
-    return explicit + _OWNER_VMEM_WORKSPACE_MARGIN_BYTES <= vmem_limit_bytes
 
 
 def combine_reads_owner_mode(
@@ -671,13 +595,20 @@ def combine_reads_owner_mode(
     )
 
 
-def combine_needs_target(
-    process: MoeProcessPlan, op: MoeOpIn, out: GmmOutSpec, *, owner_output: bool
-) -> bool:
-    """Whether `plan_combine` reads the chip for this bucket.
+TargetNeed = Literal["none", "optional", "required"]
+"""How `plan_combine` needs the chip: not at all, or None where `get_tpu_info`
+raises ("optional"), or the exception propagates ("required")."""
 
-    True exactly where today's code (or the kernel it calls) asks
-    `get_tpu_info`, so the runtime is not touched on any other path.
+
+def combine_target_need(
+    process: MoeProcessPlan, op: MoeOpIn, out: GmmOutSpec, *, owner_output: bool
+) -> TargetNeed:
+    """How `plan_combine` reads the chip for this bucket.
+
+    The runtime is read exactly where the old code (or the kernel it called)
+    asked `get_tpu_info`, with the same handling of a host JAX has no TPU
+    description for: the local v3 check fell back, the EP gather-reduce
+    kernels raised, and the owner admission raises after its shape checks.
 
     Args:
         process: Process-wide knobs.
@@ -686,13 +617,15 @@ def combine_needs_target(
         owner_output: TPU_MOE_OWNER_OUTPUT_MODE is "on" (False if not read).
 
     Returns:
-        Whether to pass a `TpuTarget` to `plan_combine`.
+        The need.
     """
     if _local_v3_precondition(process, op, out):
-        return True
+        return "optional"
     if op.use_ep and process.use_sparse_core:
-        return out.routes > process.onehot_threshold or owner_output
-    return False
+        if out.routes > process.onehot_threshold:
+            return "required"
+        return "optional" if owner_output else "none"
+    return "none"
 
 
 def plan_combine(
@@ -709,19 +642,15 @@ def plan_combine(
         process: Process-wide knobs.
         op: This call's shapes.
         out: The combine's input facts.
-        target: The chip, or None where it was not needed
-            (`combine_needs_target` False) or `get_tpu_info` raised.
+        target: The chip, read as `combine_target_need` says.
         owner_output: TPU_MOE_OWNER_OUTPUT_MODE is "on" (False if not read).
 
     Returns:
         The combine plan.
     """
     if _local_v3_precondition(process, op, out):
-        ok, alignment = _local_v3(op, out, target)
-        if ok:
-            # The kernel's own fallback checks (no SparseCore, non-BF16, width
-            # not lane-aligned, under 60% of VMEM) all fail here by
-            # construction, so it runs on the SparseCore.
+        alignment = _local_v3_alignment(op, out, target)
+        if alignment is not None:
             return MoeCombinePlan(
                 combine="local_v3", local_v3_token_alignment=alignment
             )
@@ -731,10 +660,11 @@ def plan_combine(
                 return MoeCombinePlan(combine="ep_owner_onehot")
             return MoeCombinePlan(combine="ep_onehot")
         version = process.ep_gather_reduce_version
+        assert target is not None, "the EP gather-reduce choice reads the chip"
         return MoeCombinePlan(
             combine=(
                 "ep_ragged_tc_fallback"
-                if _ep_ragged_falls_back(version, out, target)
+                if _tensorcore_fallback(version, out, target)
                 else "ep_ragged_sc"
             ),
             ep_gather_reduce_version=version,

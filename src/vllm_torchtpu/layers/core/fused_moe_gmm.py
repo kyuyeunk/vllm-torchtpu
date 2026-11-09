@@ -29,7 +29,6 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
-    can_use_blockwise_onehot_unpermute,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import (
     ragged_gather_reduce as ragged_gather_reduce_v1,
@@ -247,7 +246,7 @@ def gmm_wrapper(
 
 def _counting_sort_positions(
     sort_keys: jax.Array, num_buckets: int
-) -> tuple[jax.Array | None, jax.Array | None]:
+) -> tuple[jax.Array, jax.Array]:
     """Stable counting sort: row -> its position in the sorted order.
 
     `jnp.argsort(jnp.argsort(keys))` spends a second comparison sort over M
@@ -256,14 +255,12 @@ def _counting_sort_positions(
     from a triangular matmul on the one-hot block -- MXU work proportional to
     M*block*num_buckets instead of a length-M sort -- and the bucket totals
     fall out of the same histogram, which is exactly `group_sizes`.
+    Callers must hold `moe_plan.counting_sort_accepts` (more buckets than
+    block rows is the region XLA miscompiles).
     """
     m = sort_keys.shape[0]
     block = min(_COUNTING_SORT_BLOCK, m)
-    if num_buckets > block:
-        # XLA miscompiles the rank matmul here on jaxlib 0.10.2 + libtpu
-        # 0.0.44.1: under jit the positions come back not a permutation. Only
-        # num_buckets > block is affected, so that is the excluded region.
-        return None, None
+    assert num_buckets <= block, "moe_plan.counting_sort_accepts must hold"
     pad = -m % block
     if pad:
         # The sentinel bucket sorts after every real one, so padding into it
@@ -398,15 +395,14 @@ def prepare_routed_gmm_inputs(
     # The keys take only `local_num_experts + 1` values, so a counting sort
     # gives the positions and `group_sizes` without a second comparison sort
     # (see moe_plan.SortForm for every form and moe_plan.plan_routing for when
-    # each is chosen). Whether it returned positions is a plan input.
-    argsort_revert_indices, bucket_counts = (
-        _counting_sort_positions(sort_keys, local_num_experts + 1)
-        if moe_plan.counting_sort_attempted(process, op)
-        else (None, None)
-    )
-    routing = moe_plan.plan_routing(
-        process, op, counting_sorted=argsort_revert_indices is not None
-    )
+    # each is chosen).
+    routing = moe_plan.plan_routing(process, op)
+    argsort_revert_indices: jax.Array | None = None
+    bucket_counts: jax.Array | None = None
+    if routing.uses_counting_sort:
+        argsort_revert_indices, bucket_counts = _counting_sort_positions(
+            sort_keys, local_num_experts + 1
+        )
     token_indices_sorted: jax.Array | None = None
     sorted_indices: jax.Array | None = None
     if routing.sort == "counting_scatter":
@@ -585,11 +581,13 @@ def moe_gmm(
         moe_plan.combine_reads_owner_mode(process, op, out)
         and envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() == "on"
     )
-    target = (
-        TpuTarget.runtime_or_none()
-        if moe_plan.combine_needs_target(process, op, out, owner_output=owner_output)
-        else None
-    )
+    match moe_plan.combine_target_need(process, op, out, owner_output=owner_output):
+        case "none":
+            target = None
+        case "optional":
+            target = TpuTarget.runtime_or_none()
+        case "required":
+            target = TpuTarget.from_runtime()
     plan = moe_plan.plan_combine(process, op, out, target, owner_output=owner_output)
 
     match plan.combine:
@@ -600,6 +598,7 @@ def moe_gmm(
                 topk_weights_flat,
                 valid_mask_flat,
                 reduce_group_size=topk,
+                tc_fallback=False,
             ).astype(x.dtype)
         case "ep_owner_onehot" | "ep_onehot":
             # Use onehot + matmul for unpermutation, which can be faster
@@ -612,20 +611,6 @@ def moe_gmm(
                 .set(topk_weights_flat)
             )
             valid_count = group_sizes.sum(dtype=jnp.int32)[None]
-            if owner_output:
-                # DUPLICATE: moe_plan.owner_onehot_admits mirrors this kernel
-                # admission so the plan can name the path; they must agree.
-                admitted = can_use_blockwise_onehot_unpermute(
-                    gmm2_res,
-                    token_indices_sorted,
-                    topk_weights_sorted,
-                    valid_count,
-                    num_tokens=num_tokens,
-                )
-                assert admitted == (plan.combine == "ep_owner_onehot"), (
-                    "moe_plan.owner_onehot_admits disagrees with "
-                    "can_use_blockwise_onehot_unpermute"
-                )
             if plan.combine == "ep_owner_onehot":
                 logger.info_once(
                     "Selected owner_output blockwise one-hot unpermute: "
@@ -657,14 +642,13 @@ def moe_gmm(
             )
             return (combine @ gmm2_res).astype(x.dtype)
         case "ep_ragged_sc" | "ep_ragged_tc_fallback":
-            # One entry point for both: the kernel takes its own TensorCore
-            # fallback, and the plan only names which one it will take.
             return ragged_gather_reduce(
                 gmm2_res,
                 argsort_revert_indices,
                 topk_weights_flat,
                 valid_mask_flat,
                 reduce_group_size=topk,
+                tc_fallback=plan.combine == "ep_ragged_tc_fallback",
             ).astype(x.dtype)
         case "tensorcore":
             token_hidden = gmm2_res[argsort_revert_indices]

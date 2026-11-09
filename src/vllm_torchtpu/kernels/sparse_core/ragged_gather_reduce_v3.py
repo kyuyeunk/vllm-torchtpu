@@ -29,11 +29,15 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu.kernels.sparse_core import core_map_helper
+from vllm_torchtpu.kernels.sparse_core import ragged_gather_reduce_fallback as fallback
+from vllm_torchtpu.kernels.sparse_core import (
+    ragged_gather_reduce_v3_partition as v3_partition,
+)
 
-_TOKEN_SUBCHUNK = 16
-_NUM_TOKEN_SUBCHUNKS = 4
-_TOKEN_BLOCK = _TOKEN_SUBCHUNK * _NUM_TOKEN_SUBCHUNKS
-_ROUTE_INDEX_BITS = 20
+_TOKEN_SUBCHUNK = v3_partition.TOKEN_SUBCHUNK
+_NUM_TOKEN_SUBCHUNKS = v3_partition.NUM_TOKEN_SUBCHUNKS
+_TOKEN_BLOCK = v3_partition.TOKEN_BLOCK
+_ROUTE_INDEX_BITS = v3_partition.ROUTE_INDEX_BITS
 _ROUTE_INDEX_MASK = (1 << _ROUTE_INDEX_BITS) - 1
 
 
@@ -54,43 +58,12 @@ def _fallback_implementation(
     return jnp.sum(out, axis=1).astype(x.dtype)
 
 
-def _calculate_num_column_partitions(
-    hidden_size: int, num_cores: int, num_lanes: int
-) -> int:
-    preferred_num_stages = 4
-    num_column_partitions = 1
-    while (
-        num_cores % (num_column_partitions * 2) == 0
-        and hidden_size % (num_lanes * num_column_partitions * 2) == 0
-        and hidden_size // (num_column_partitions * 2 * num_lanes)
-        >= preferred_num_stages
-    ):
-        num_column_partitions *= 2
-    # Destination-major accumulation keeps a dense FP32 token block in VMEM.
-    # For columns up to 1024, using one fewer column partition amortizes the
-    # per-block metadata, clear, and output-DMA overhead while still leaving
-    # enough room for the double-buffered indirect gather.  Wider columns stay
-    # with the conservative partitioning selected above.
-    if num_column_partitions >= 2 and hidden_size <= 1024 * (
-        num_column_partitions // 2
-    ):
-        num_column_partitions //= 2
-    return num_column_partitions
-
-
 def partition_counts(hidden_size: int, tpu_info) -> tuple[int, int]:
     """Column and row partition counts of the SparseCore subcores for a width."""
     sc_info = tpu_info.sparse_core
-    num_cores = sc_info.num_cores * sc_info.num_subcores
-    num_column_partitions = _calculate_num_column_partitions(
-        hidden_size, num_cores, tpu_info.num_lanes
+    return v3_partition.partition_counts(
+        hidden_size, sc_info.num_cores * sc_info.num_subcores, tpu_info.num_lanes
     )
-    return num_column_partitions, num_cores // num_column_partitions
-
-
-def token_block_alignment(hidden_size: int, tpu_info) -> int:
-    """Destination-token granularity: one 64-token block per row partition."""
-    return partition_counts(hidden_size, tpu_info)[1] * _TOKEN_BLOCK
 
 
 def _main_kernel(
@@ -328,21 +301,33 @@ def _main_kernel(
     )
 
 
-@functools.partial(jax.jit, static_argnames=("reduce_group_size",))
+@functools.partial(jax.jit, static_argnames=("reduce_group_size", "tc_fallback"))
 def ragged_gather_reduce(
     x: jax.Array,
     indices: jax.Array,
     topk_weights: jax.Array,
     valid_rows_mask: jax.Array,
     reduce_group_size: int,
+    tc_fallback: bool | None = None,
 ) -> jax.Array:
-    """Destination-major prototype for MoE output combine."""
-    sc_info = pltpu.get_tpu_info().sparse_core
-    if (
-        sc_info is None
-        or x.dtype != jnp.bfloat16
-        or x.shape[-1] % pltpu.get_tpu_info().num_lanes != 0
-    ):
+    """Destination-major prototype for MoE output combine.
+
+    ``tc_fallback`` is the caller's decision (the MoE plan decides it with
+    ``ragged_gather_reduce_fallback``); None decides here with the same rule.
+    """
+    tpu_info = pltpu.get_tpu_info()
+    if tc_fallback is None:
+        tc_fallback = fallback.takes_tensorcore_path(
+            version="v3",
+            size=x.size,
+            hidden=x.shape[-1],
+            dtype=str(x.dtype),
+            dtype_bytes=jax.dtypes.itemsize_bits(x.dtype) // 8,
+            vmem_capacity_bytes=tpu_info.vmem_capacity_bytes,
+            has_sparse_core=tpu_info.sparse_core is not None,
+            num_lanes=tpu_info.num_lanes,
+        )
+    if tc_fallback:
         return _fallback_implementation(
             x,
             indices,
@@ -350,15 +335,8 @@ def ragged_gather_reduce(
             valid_rows_mask,
             reduce_group_size,
         )
-    dtype_bytes = jax.dtypes.itemsize_bits(x.dtype) // 8
-    if jnp.size(x) * dtype_bytes * 2 < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6:
-        return _fallback_implementation(
-            x,
-            indices,
-            topk_weights,
-            valid_rows_mask,
-            reduce_group_size,
-        )
+    sc_info = tpu_info.sparse_core
+    assert sc_info is not None, "the SparseCore path needs a SparseCore"
 
     input_size = indices.size
     if input_size % reduce_group_size != 0:

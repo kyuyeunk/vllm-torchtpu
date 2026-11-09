@@ -19,6 +19,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.sparse_core import ragged_gather_reduce_fallback as fallback
+
 
 # ceil up to the nearest multiple of b.
 def _align_to(a, b):
@@ -91,14 +93,16 @@ class Config:
 
     @property
     def should_fallback(self) -> bool:
-        # For a small {input + output} both likely fit in TensorCore VMEM, where a
-        # plain TC gather-reduce beats routing through SparseCore and HBM.
-        if self.tpu_info.sparse_core is None:
-            return True
-        vmem_capacity_threshold = self.tpu_info.vmem_capacity_bytes * 0.6
-        source_size = self.source_rows * self.hidden_size * self.in_dtype_bytes
-        # TODO(kyuyeunk): Improve fallback calculation logic.
-        return source_size * 2 < vmem_capacity_threshold
+        return fallback.takes_tensorcore_path(
+            version="v2",
+            size=self.source_rows * self.hidden_size,
+            hidden=self.hidden_size,
+            dtype=str(jnp.dtype(self.in_dtype)),
+            dtype_bytes=self.in_dtype_bytes,
+            vmem_capacity_bytes=self.tpu_info.vmem_capacity_bytes,
+            has_sparse_core=self.tpu_info.sparse_core is not None,
+            num_lanes=self.tpu_info.num_lanes,
+        )
 
     @property
     def row_partition_size(self) -> int:
