@@ -46,6 +46,42 @@ def _reference_unquantized(pipelined, fp8_ag, skip):
     return supports_internal_mk, route, None, skip, quantize_ag
 
 
+def _reference_nvfp4(pipelined, fused, adaptive, fp8_ag, skip):
+    """nvfp4.py:329-337 and :576."""
+    return (
+        pipelined or fused or adaptive,
+        _route(pipelined),
+        None,
+        skip,
+        (pipelined and fp8_ag),
+    )
+
+
+def _reference_pipelined_only(pipelined, fp8_ag, skip):
+    """mxfp4.py:226-229/:359, w4a16.py:134-137/:402 (same as unquantized)."""
+    return pipelined, _route(pipelined), None, skip, pipelined and fp8_ag
+
+
+def _reference_mxfp4_dsv4(pipelined, fused, fp8_ag, skip):
+    """mxfp4.py:378-383; dispatch falls back to the base class (:359)."""
+    return pipelined or fused, _route(pipelined), None, skip, pipelined and fp8_ag
+
+
+def _reference_w4an_mxfp4(pipelined, fp8_ag):
+    """w4an_mxfp4.py:62-65, :272 (prebuild), :292, :318 (zero), :336 (kwargs)."""
+    return (
+        pipelined,
+        _route(pipelined),
+        ("zero", pipelined),
+        True,
+        (pipelined and fp8_ag),
+    )
+
+
+def _route(owns):
+    return "pipelined" if owns else "fused_moe_gmm"
+
+
 def _new(plan: mcp.CollectivePlan):
     zeroed = (
         ("zero", plan.stages_collectives) if plan.zero_padded_routing_weights else None
@@ -144,8 +180,56 @@ class CollectivePlanOracleTest(unittest.TestCase):
                     ),
                     skip or uses_mxfp4,
                 )
+            per_path: tuple[tuple[mcp.MoeQuant, object], ...] = (
+                ("nvfp4", _reference_nvfp4(pipelined, fused, adaptive, fp8_ag, skip)),
+                ("mxfp4", _reference_pipelined_only(pipelined, fp8_ag, skip)),
+                ("w4a16", _reference_pipelined_only(pipelined, fp8_ag, skip)),
+                ("mxfp4_dsv4", _reference_mxfp4_dsv4(pipelined, fused, fp8_ag, skip)),
+                ("w4an_mxfp4", _reference_w4an_mxfp4(pipelined, fp8_ag)),
+            )
+            for quant, expected in per_path:
+                plan = mcp.collective_plan(
+                    mcp.MoeLayerInfo(
+                        quant=quant,
+                        ep_fused_supported=fused,
+                        adaptive_supported=adaptive,
+                    ),
+                    overrides,
+                )
+                self.assertEqual(_new(plan), expected, quant)
+                cases += 1
+            # moe_tp_decode.py:203 mirrors the fp8 dispatch formula.
+            self.assertEqual(fp8.stages_collectives, pipelined or fp8_ag)
+            # moe_runner.py:124-125 and :136-138.
+            self.assertEqual(
+                mcp.fused_kernel_armed(
+                    ep_fused_supported=fused, adaptive_supported=adaptive
+                ),
+                fused or adaptive,
+            )
             cases += 2
         print(f"\n[ownership] {cases} cases")
+
+    def test_all2all_patch(self):
+        # __init__.py:280-289, with the chunk size read from the env.
+        saved = mcp.chunk_size_from_envs
+        cases = 0
+        try:
+            for use_ep, pcp, dp, sp, chunk in itertools.product(
+                (False, True), (1, 2, 4), (1, 2), (False, True), (-1, 0, 1, 4096)
+            ):
+                mcp.chunk_size_from_envs = lambda chunk=chunk: chunk
+                expected = use_ep and pcp > 1 and dp == 1 and not sp and chunk <= 0
+                self.assertEqual(
+                    mcp.disables_all2all_for_explicit_pcp(
+                        use_ep=use_ep, pcp_size=pcp, dp_size=dp, is_sequence_parallel=sp
+                    ),
+                    expected,
+                )
+                cases += 1
+        finally:
+            mcp.chunk_size_from_envs = saved
+        print(f"\n[all2all patch] {cases} cases")
 
     def test_chunking(self):
         seq_lens = (0, 1, 2, 3, 7, 8, 16, 31, 64, 96, 128, 255, 256, 1000, 1024, 4096)

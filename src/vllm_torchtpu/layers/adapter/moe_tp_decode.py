@@ -53,6 +53,7 @@ from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.kernels.router_topk import select as router_select
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.layers.core import moe_collective_plan
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     resolve_onehot_permute_threshold,
@@ -182,6 +183,7 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
 
     from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
     from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+        collective_plan_for,
         enable_pipelined_collective_and_compute,
     )
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
@@ -198,9 +200,10 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         return "a fused EP MoE kernel serves this layer"
     if envs.FUSED_MOE_DECODE_KERNEL:
         return "FUSED_MOE_DECODE_KERNEL is set; moe_tp_decode stands down"
-    # Same test as apply_monolithic's owns_collectives: those paths run their own
-    # collectives, so the layer keeps them.
-    if enable_pipelined_collective_and_compute() or envs.TPU_MOE_FP8_ALL_GATHER:
+    # The fp8 path stages its own collectives there, so the layer keeps them.
+    if collective_plan_for(
+        "fp8", qm, chunk_pipelining=enable_pipelined_collective_and_compute()
+    ).stages_collectives:
         return (
             "the MoE path owns its collectives "
             "(TPU_MOE_COLLECTION_CHUNK_SIZE or TPU_MOE_FP8_ALL_GATHER)"
@@ -541,7 +544,8 @@ def arm(model: torch.nn.Module, draft_model: torch.nn.Module | None = None) -> i
         if isinstance(topo, str):
             res = topo
         elif (
-            not envs.TPU_MOE_SKIP_PADDED_TOKENS or token_padding._padding_state is None
+            not moe_collective_plan.skip_padded_tokens_from_envs()
+            or token_padding._padding_state is None
         ):
             res = "needs TPU_MOE_SKIP_PADDED_TOKENS=1 (n_valid comes from its mask)"
         else:

@@ -41,6 +41,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     prebuild_fused_moe_kernel,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+    collective_plan_for,
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
@@ -134,7 +135,9 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
     def supports_internal_mk(self) -> bool:
         # We need to take control of collective communication (AllGather/ReduceScatter)
         # to pipeline them with MoE computation when chunking is enabled.
-        return enable_pipelined_collective_and_compute()
+        return collective_plan_for(
+            "w4a16", self, chunk_pipelining=enable_pipelined_collective_and_compute()
+        ).claims_collectives
 
     @staticmethod
     def _loaded_data(parameter: torch.nn.Parameter) -> torch.Tensor:
@@ -399,7 +402,9 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
             "activation": activation_str,
             "rhs_quant_dtype": getattr(layer, "_rhs_quant_dtype", jnp.int4),
         }
-        if enable_pipelined_collective_and_compute():
+        if collective_plan_for(
+            "w4a16", self, chunk_pipelining=enable_pipelined_collective_and_compute()
+        ).stages_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)

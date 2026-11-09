@@ -84,6 +84,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
 )
 from vllm_torchtpu.layers.adapter.linear_common import quantized_matmul_fp4
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+    collective_plan_for,
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
@@ -329,13 +330,9 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
     def supports_internal_mk(self) -> bool:
         # We need to take control of collective communication (AllGather/ReduceScatter)
         # to pipeline them with MoE computation when chunking is enabled.
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
-
-        return (
-            enable_pipelined_collective_and_compute()
-            or fused_moe_ep_supported(self)
-            or adaptive_moe.adaptive_fused_moe_supported(self)
-        )
+        return collective_plan_for(
+            "nvfp4", self, chunk_pipelining=enable_pipelined_collective_and_compute()
+        ).claims_collectives
 
     def get_fused_moe_quant_config(self, layer):
         return None
@@ -573,7 +570,9 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
         }
-        if enable_pipelined_collective_and_compute():
+        if collective_plan_for(
+            "nvfp4", self, chunk_pipelining=enable_pipelined_collective_and_compute()
+        ).stages_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)

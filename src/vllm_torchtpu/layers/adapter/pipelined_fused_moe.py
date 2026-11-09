@@ -75,14 +75,43 @@ def collection_chunks(seq_len: int, parallel_size: int) -> tuple[int, int]:
     )
 
 
-def enable_pipelined_collective_and_compute() -> bool:
-    """Check whether collective communication and compute pipelining is enabled.
+# True when TPU_MOE_COLLECTION_CHUNK_SIZE > 0.
+enable_pipelined_collective_and_compute = moe_collective_plan.chunk_pipelining_from_envs
+
+
+def collective_plan_for(
+    quant: moe_collective_plan.MoeQuant, method: object, *, chunk_pipelining: bool
+) -> moe_collective_plan.CollectivePlan:
+    """One MoE quant method's collective plan.
+
+    A function of the method object, not a method on it: `supports_internal_mk`
+    is also asked of stand-in objects. Callers pass their own module's
+    `enable_pipelined_collective_and_compute()` so per-module test patches of
+    that name still steer the plan.
+
+    Args:
+        quant: The method family.
+        method: The layer's quant method (where prebuild records arming).
+        chunk_pipelining: Chunk pipelining is on.
 
     Returns:
-        bool: True if `envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0`, False otherwise.
-
+        The plan.
     """
-    return moe_collective_plan.chunk_size_from_envs() > 0
+    from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
+        adaptive_fused_moe_supported,
+    )
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+
+    return moe_collective_plan.collective_plan(
+        moe_collective_plan.MoeLayerInfo(
+            quant=quant,
+            ep_fused_supported=fused_moe_ep_supported(method),
+            adaptive_supported=adaptive_fused_moe_supported(method),
+        ),
+        moe_collective_plan.collective_overrides_from_envs(
+            chunk_pipelining=chunk_pipelining
+        ),
+    )
 
 
 # Alias for alternative naming convention

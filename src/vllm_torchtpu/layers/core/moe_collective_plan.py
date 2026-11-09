@@ -21,9 +21,10 @@ dispatch's own choice are separate formulas per quantization path; this
 module holds both, side by side, so they are written once and their
 agreement (`stages_collectives` implies `claims_collectives`) is checked.
 
-v1 preserves every path's current formula exactly, including the
-unquantized path never zeroing padded routing weights. Changing that is a
-behavior change, scheduled separately.
+Every path's formula is preserved exactly as a per-path rule, including the
+quirks (the unquantized-style paths never zero padded routing weights; the
+W4AN-MXFP4 path always does and always skips them in the kernel). Changing a
+rule is a behavior change, scheduled separately.
 
 Imports no torch, JAX or TPU runtime. The `*_from_envs` builders are the only
 env reads; they read on every call, as today's call sites do, so a test that
@@ -37,7 +38,10 @@ from typing import Literal
 
 from vllm_torchtpu import envs
 
-MoeQuant = Literal["fp8", "unquantized"]
+MoeQuant = Literal[
+    "fp8", "nvfp4", "unquantized", "mxfp4", "mxfp4_dsv4", "w4a16", "w4an_mxfp4"
+]
+"""The TPU MoE method families, one collective rule each."""
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -102,21 +106,39 @@ class CollectivePlan:
             )
 
 
+def fused_kernel_armed(*, ep_fused_supported: bool, adaptive_supported: bool) -> bool:
+    """Whether a fused EP kernel (plain or adaptive) does this layer's exchange.
+
+    Prebuild arms the kernel per layer, so this is asked per quant method.
+
+    Args:
+        ep_fused_supported: `fused_moe_ep_supported(method)`.
+        adaptive_supported: `adaptive_fused_moe_supported(method)`.
+
+    Returns:
+        True when an armed kernel owns dispatch and combine.
+    """
+    return ep_fused_supported or adaptive_supported
+
+
 def collective_plan(
     layer: MoeLayerInfo, overrides: CollectiveOverrides
 ) -> CollectivePlan:
     """Today's per-path collective formulas, in one place.
 
-    fp8 (`VllmFp8MoEMethodTPU`):
-      - claims = pipelining or fused EP armed or adaptive armed or fp8 AG;
-      - stages = pipelining or fp8 AG (the fused and adaptive kernels return
-        before the GMM dispatch and do the exchange themselves);
-      - zeroes padded routing weights when skip-padded is on.
+    Every path stages the collectives itself when chunk pipelining is on, and
+    an armed fused kernel returns before the GMM dispatch. Per path:
 
-    unquantized (`VllmUnquantizedFusedMoEMethod`):
-      - claims = stages = pipelining (fp8 AG alone does not claim);
-      - never zeroes padded routing weights (quirk kept), while the kernel
-        still reads skip-padded.
+    - fp8: claims = pipelining or a fused kernel armed or fp8 AG; stages =
+      pipelining or fp8 AG; zeroes padded routing weights on skip-padded.
+    - nvfp4: claims = pipelining or a fused kernel armed; stages = pipelining.
+    - mxfp4_dsv4 (DeepSeek-V4 MXFP4): claims = pipelining or fused EP armed
+      (no adaptive kernel); stages = pipelining.
+    - unquantized, mxfp4, w4a16: claims = stages = pipelining (fp8 AG alone
+      does not claim); never zero padded routing weights, while the kernel
+      still reads skip-padded.
+    - w4an_mxfp4: claims = stages = pipelining; always zeroes padded routing
+      weights and always skips them in the kernel, whatever the env says.
 
     Args:
         layer: Per-layer facts.
@@ -125,32 +147,80 @@ def collective_plan(
     Returns:
         The plan.
     """
+    pipelining = overrides.chunk_pipelining
+    stages = pipelining
+    zero_padded = False
+    kernel_skip = overrides.skip_padded_tokens
     match layer.quant:
         case "fp8":
             claims = (
-                overrides.chunk_pipelining
-                or layer.ep_fused_supported
-                or layer.adaptive_supported
+                pipelining
+                or fused_kernel_armed(
+                    ep_fused_supported=layer.ep_fused_supported,
+                    adaptive_supported=layer.adaptive_supported,
+                )
                 or overrides.fp8_all_gather
             )
-            stages = overrides.chunk_pipelining or overrides.fp8_all_gather
+            stages = pipelining or overrides.fp8_all_gather
             zero_padded = overrides.skip_padded_tokens
-        case "unquantized":
-            claims = overrides.chunk_pipelining
-            stages = overrides.chunk_pipelining
-            zero_padded = False
+        case "nvfp4":
+            claims = pipelining or fused_kernel_armed(
+                ep_fused_supported=layer.ep_fused_supported,
+                adaptive_supported=layer.adaptive_supported,
+            )
+        case "mxfp4_dsv4":
+            claims = pipelining or layer.ep_fused_supported
+        case "unquantized" | "mxfp4" | "w4a16":
+            claims = pipelining
+        case "w4an_mxfp4":
+            claims = pipelining
+            zero_padded = True
+            kernel_skip = True
     return CollectivePlan(
         claims_collectives=claims,
         stages_collectives=stages,
         quantize_all_gather=stages and overrides.fp8_all_gather,
         zero_padded_routing_weights=zero_padded,
-        kernel_skip_padded_tokens=overrides.skip_padded_tokens,
+        kernel_skip_padded_tokens=kernel_skip,
     )
 
 
 def chunk_size_from_envs() -> int:
     """TPU_MOE_COLLECTION_CHUNK_SIZE: max post-gather tokens per chunk."""
     return envs.TPU_MOE_COLLECTION_CHUNK_SIZE
+
+
+def chunk_pipelining_from_envs() -> bool:
+    """Chunked collective/compute pipelining is on (chunk size > 0)."""
+    return chunk_size_from_envs() > 0
+
+
+def disables_all2all_for_explicit_pcp(
+    *, use_ep: bool, pcp_size: int, dp_size: int, is_sequence_parallel: bool
+) -> bool:
+    """Whether vLLM's all2all kernels give way to explicit PCP collectives.
+
+    The `FusedMoEParallelConfig.use_all2all_kernels` patch in `__init__.py`:
+    EP over PCP with no DP, no sequence parallelism and no chunk pipelining
+    keeps the plugin's explicit PCP all-gather / reduce-scatter. The chunk
+    size is read last, only when the other conditions hold, as before.
+
+    Args:
+        use_ep: Expert parallelism is on.
+        pcp_size: Prefill context-parallel size.
+        dp_size: Data-parallel size.
+        is_sequence_parallel: MoE sequence parallelism is on.
+
+    Returns:
+        True to answer False for `use_all2all_kernels`.
+    """
+    return (
+        use_ep
+        and pcp_size > 1
+        and dp_size == 1
+        and not is_sequence_parallel
+        and chunk_size_from_envs() <= 0
+    )
 
 
 def fp8_all_gather_from_envs() -> bool:

@@ -67,6 +67,7 @@ from vllm_torchtpu.kernels.experimental.fused_moe_decode import (
     vmem_bytes,
 )
 from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
+from vllm_torchtpu.layers.core import moe_collective_plan
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     resolve_onehot_permute_threshold,
@@ -141,7 +142,7 @@ def _gmm_layer(
         use_sparse_core=envs.USE_MOE_SPARSE_CORE,
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=None,
-        skip_padded_tokens=envs.TPU_MOE_SKIP_PADDED_TOKENS,
+        skip_padded_tokens=moe_collective_plan.skip_padded_tokens_from_envs(),
     )
     if routed_scale != 1.0:
         routed = routed * routed_scale

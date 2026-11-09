@@ -73,6 +73,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     quantize_native_fp4_kmajor,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+    collective_plan_for,
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
@@ -226,7 +227,9 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
     def supports_internal_mk(self) -> bool:
         # We need to take control of collective communication (AllGather/ReduceScatter)
         # to pipeline them with MoE computation when chunking is enabled.
-        return enable_pipelined_collective_and_compute()
+        return collective_plan_for(
+            "mxfp4", self, chunk_pipelining=enable_pipelined_collective_and_compute()
+        ).claims_collectives
 
     def __init__(self, moe: FusedMoEConfig):
         # Skip Mxfp4MoEMethod.__init__ (GPU backend assertion)
@@ -356,7 +359,9 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             "activation": activation_str,
             "rhs_quant_dtype": self.rhs_quant_dtype,
         }
-        if enable_pipelined_collective_and_compute():
+        if collective_plan_for(
+            "mxfp4", self, chunk_pipelining=enable_pipelined_collective_and_compute()
+        ).stages_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)
@@ -378,9 +383,11 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
     def supports_internal_mk(self) -> bool:
         # An armed layer owns its own dispatch and combine, so vLLM must not
         # bracket it with an all-gather/reduce-scatter of its own.
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
-
-        return enable_pipelined_collective_and_compute() or fused_moe_ep_supported(self)
+        return collective_plan_for(
+            "mxfp4_dsv4",
+            self,
+            chunk_pipelining=enable_pipelined_collective_and_compute(),
+        ).claims_collectives
 
     def _prebuild_w4a8(
         self,
