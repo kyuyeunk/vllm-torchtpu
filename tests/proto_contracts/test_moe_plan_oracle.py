@@ -72,12 +72,19 @@ def _reference_prepare(
     onehot_moe_permute_threshold,
     _SINGLE_SORT,
     _COUNTING_SORT,
+    inject_refusal=False,
 ):
-    """prepare_routed_gmm_inputs lines 374-481, arrays replaced by events."""
+    """prepare_routed_gmm_inputs lines 374-481, arrays replaced by events.
+
+    `inject_refusal` stands in for a test that patches
+    `_counting_sort_positions` to return (None, None).
+    """
     events = []
     token_indices_flat_rows = num_tokens_local * topk
 
     def _counting_sort_positions(m, num_buckets):
+        if inject_refusal:
+            return None, None
         block = min(_COUNTING_SORT_BLOCK, m)
         if num_buckets > block:
             return None, None
@@ -358,10 +365,20 @@ def _reference_combine(
 # ---------------------------------------------------------------------------
 def _new_entry(process, op, can_use_dense_expert):
     admitted = moe_plan.dense_expert_candidate(process, op) and can_use_dense_expert()
-    routing = moe_plan.plan_routing(process, op, dense_expert_admitted=admitted)
-    events = ["scrub_nonfinite"] if routing.scrub_nonfinite else []
-    events.append(routing.path)
+    entry = moe_plan.plan_entry(process, op, dense_expert_admitted=admitted)
+    events = ["scrub_nonfinite"] if entry.scrub_nonfinite else []
+    events.append(entry.path)
     return events
+
+
+def _new_routing(process, op, inject_refusal):
+    """Mirrors the prototype: try the counting sort, then plan on its result."""
+    sorted_ok = False
+    if moe_plan.counting_sort_attempted(process, op):
+        # The kernel's own refusal rule (verbatim), or an injected refusal.
+        block = min(_COUNTING_SORT_BLOCK, op.routed_rows)
+        sorted_ok = not inject_refusal and not op.local_num_experts + 1 > block
+    return moe_plan.plan_routing(process, op, counting_sorted=sorted_ok)
 
 
 def _new_prepare(routing):
@@ -487,6 +504,7 @@ class MoeRoutingOracleTest(unittest.TestCase):
             thr,
             single,
             counting,
+            inject,
         ) in itertools.product(
             token_counts,
             _TOPKS,
@@ -494,6 +512,7 @@ class MoeRoutingOracleTest(unittest.TestCase):
             (False, True),
             (False, True),
             _THRESHOLDS,
+            (False, True),
             (False, True),
             (False, True),
         ):
@@ -511,7 +530,10 @@ class MoeRoutingOracleTest(unittest.TestCase):
                 local_num_experts=experts,
                 use_ep=use_ep,
             )
-            routing = moe_plan.plan_routing(process, op, dense_expert_admitted=False)
+            routing = _new_routing(process, op, inject)
+            if not inject:
+                # Without the counting result the plan predicts the same.
+                self.assertEqual(moe_plan.plan_routing(process, op), routing)
             expected = _reference_prepare(
                 num_tokens_local=num_tokens,
                 topk=topk,
@@ -521,6 +543,7 @@ class MoeRoutingOracleTest(unittest.TestCase):
                 onehot_moe_permute_threshold=thr,
                 _SINGLE_SORT=single,
                 _COUNTING_SORT=counting,
+                inject_refusal=inject,
             )
             actual = _new_prepare(routing)
             if actual != expected:
@@ -534,6 +557,73 @@ class MoeRoutingOracleTest(unittest.TestCase):
         )
         self.assertEqual(seen_forms, set(moe_plan.SortForm.__args__))
         self.assertEqual(seen_permutes, set(moe_plan.Permute.__args__))
+
+    def test_patched_row_caps_match_reference(self):
+        # Existing TPU tests patch these module caps; they are plan inputs now.
+        global _SINGLE_SORT_MAX_ROWS, _COUNTING_SORT_SCATTER_MAX_ROWS  # noqa: PLW0603
+        saved = (_SINGLE_SORT_MAX_ROWS, _COUNTING_SORT_SCATTER_MAX_ROWS)
+        cases = 0
+        try:
+            for single_cap, scatter_cap in (
+                (2048, 0),
+                (1024, 512),
+                (4096, 2048),
+                (0, 0),
+            ):
+                _SINGLE_SORT_MAX_ROWS, _COUNTING_SORT_SCATTER_MAX_ROWS = (
+                    single_cap,
+                    scatter_cap,
+                )
+                for (
+                    num_tokens,
+                    topk,
+                    experts,
+                    use_ep,
+                    use_sc,
+                    thr,
+                    inject,
+                ) in itertools.product(
+                    _token_counts(),
+                    (1, 2, 8),
+                    (7, 64, 255),
+                    (False, True),
+                    (False, True),
+                    (0, 511),
+                    (False, True),
+                ):
+                    process = moe_plan.MoeProcessPlan(
+                        use_sparse_core=use_sc,
+                        onehot_threshold=thr,
+                        single_sort=True,
+                        counting_sort=True,
+                        dense_expert_threshold=0,
+                        ep_gather_reduce_version="v2",
+                        single_sort_max_rows=single_cap,
+                        counting_scatter_max_rows=scatter_cap,
+                    )
+                    op = moe_plan.MoeOpIn(
+                        num_tokens=num_tokens,
+                        topk=topk,
+                        local_num_experts=experts,
+                        use_ep=use_ep,
+                    )
+                    expected = _reference_prepare(
+                        num_tokens_local=num_tokens,
+                        topk=topk,
+                        local_num_experts=experts,
+                        use_ep=use_ep,
+                        use_sparse_core=use_sc,
+                        onehot_moe_permute_threshold=thr,
+                        _SINGLE_SORT=True,
+                        _COUNTING_SORT=True,
+                        inject_refusal=inject,
+                    )
+                    actual = _new_prepare(_new_routing(process, op, inject))
+                    self.assertEqual(actual, expected, (op, process))
+                    cases += 1
+        finally:
+            _SINGLE_SORT_MAX_ROWS, _COUNTING_SORT_SCATTER_MAX_ROWS = saved
+        print(f"\n[routing caps] {cases} cases")
 
     def test_entry_matches_reference(self):
         cases = 0

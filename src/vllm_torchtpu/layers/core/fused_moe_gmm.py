@@ -73,8 +73,11 @@ _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
 # non-ragged paths (EP one-hot permute and non-EP TP). Off, those paths run
 # the packed single sort or the three-sort form; ragged permute is unaffected.
 _COUNTING_SORT = envs.TPU_MOE_COUNTING_SORT
-# The row caps that pick among the sort forms live with the rule, in moe_plan.
+# The row caps that pick among the sort forms are documented with the rule in
+# moe_plan; they are plan inputs, named here so tests can patch them.
+_SINGLE_SORT_MAX_ROWS = moe_plan.SINGLE_SORT_MAX_ROWS
 _COUNTING_SORT_BLOCK = moe_plan.COUNTING_SORT_BLOCK
+_COUNTING_SORT_SCATTER_MAX_ROWS = moe_plan.COUNTING_SORT_SCATTER_MAX_ROWS
 
 
 def _moe_process_plan(
@@ -93,6 +96,8 @@ def _moe_process_plan(
         counting_sort=_COUNTING_SORT,
         dense_expert_threshold=_DENSE_EXPERT_THRESHOLD,
         ep_gather_reduce_version=_EP_GATHER_REDUCE_VERSION,
+        single_sort_max_rows=_SINGLE_SORT_MAX_ROWS,
+        counting_scatter_max_rows=_COUNTING_SORT_SCATTER_MAX_ROWS,
     )
 
 
@@ -357,7 +362,6 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
-    routing: moe_plan.MoeRoutingPlan | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
@@ -367,29 +371,21 @@ def prepare_routed_gmm_inputs(
     (inside this JIT) and marks non-local entries with a negative id which
     the mask filters out. Always running the masked branch keeps a single
     code path.
-
-    `routing` is the plan `fused_moe_func` already resolved for these
-    arguments; direct callers leave it None and it is resolved here from the
-    same arguments.
     """
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
     topk_weights_flat = topk_weights_local.flatten()
     token_indices_flat = jnp.arange(num_tokens_local, dtype=jnp.int32).repeat(topk)
-    if routing is None:
-        routing = moe_plan.plan_routing(
-            _moe_process_plan(
-                use_sparse_core=use_sparse_core,
-                onehot_moe_permute_threshold=onehot_moe_permute_threshold,
-            ),
-            moe_plan.MoeOpIn(
-                num_tokens=num_tokens_local,
-                topk=topk,
-                local_num_experts=local_num_experts,
-                use_ep=use_ep,
-            ),
-            dense_expert_admitted=False,
-        )
+    process = _moe_process_plan(
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+    )
+    op = moe_plan.MoeOpIn(
+        num_tokens=num_tokens_local,
+        topk=topk,
+        local_num_experts=local_num_experts,
+        use_ep=use_ep,
+    )
 
     if skip_padded_tokens:
         # Padded tokens keep their selected expert ids, but carry zero
@@ -401,20 +397,18 @@ def prepare_routed_gmm_inputs(
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
     # The keys take only `local_num_experts + 1` values, so a counting sort
     # gives the positions and `group_sizes` without a second comparison sort
-    # (see moe_plan.SortForm for every form and moe_plan._sort_form for when
-    # each is chosen).
-    argsort_revert_indices: jax.Array | None = None
-    bucket_counts: jax.Array | None = None
+    # (see moe_plan.SortForm for every form and moe_plan.plan_routing for when
+    # each is chosen). Whether it returned positions is a plan input.
+    argsort_revert_indices, bucket_counts = (
+        _counting_sort_positions(sort_keys, local_num_experts + 1)
+        if moe_plan.counting_sort_attempted(process, op)
+        else (None, None)
+    )
+    routing = moe_plan.plan_routing(
+        process, op, counting_sorted=argsort_revert_indices is not None
+    )
     token_indices_sorted: jax.Array | None = None
     sorted_indices: jax.Array | None = None
-    if routing.uses_counting_sort:
-        argsort_revert_indices, bucket_counts = _counting_sort_positions(
-            sort_keys, local_num_experts + 1
-        )
-        # DUPLICATE: moe_plan._sort_form predicts the counting sort's refusal.
-        assert argsort_revert_indices is not None and bucket_counts is not None, (
-            "moe_plan chose a counting sort that _counting_sort_positions refused"
-        )
     if routing.sort == "counting_scatter":
         token_indices_sorted = (
             jnp.zeros_like(token_indices_flat)
@@ -783,11 +777,11 @@ def fused_moe_func(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
     )
-    routing = moe_plan.plan_routing(
+    entry = moe_plan.plan_entry(
         process, op, dense_expert_admitted=dense_expert_admitted
     )
 
-    if routing.scrub_nonfinite:
+    if entry.scrub_nonfinite:
         # The one-hot permute and unpermute are matmuls across all tokens, and
         # 0 * NaN == NaN: one token with a non-finite hidden state or routing
         # weight would turn every token's output into NaN. Zero those values
@@ -801,7 +795,7 @@ def fused_moe_func(
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
-    if routing.path == "dense_expert":
+    if entry.path == "dense_expert":
         logger.info_once("Selected experimental dense-expert decode MoE")
         return dense_expert_moe(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
@@ -824,7 +818,6 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
-        routing=routing,
     )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(

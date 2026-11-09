@@ -29,10 +29,12 @@ predicate so the plan names the path that actually runs. The kernels are
 untouched, so each such predicate is a duplicate; each is marked
 "DUPLICATE of" with the kernel line it mirrors.
 
-The decision resolves in two stages because the combine depends on the
-second GMM's output width, which `gmm_v2` derives internally (it pads N to a
-lane multiple): `plan_routing` runs before the GMMs, `plan_combine` after the
-second GMM, reading that output's static shape.
+The decision resolves in three stages, each where its inputs first exist:
+`plan_entry` (non-finite scrub, dense expert) at the top of `fused_moe_func`;
+`plan_routing` in `prepare_routed_gmm_inputs`, because the sort form depends
+on whether the counting sort returned positions; and `plan_combine` after the
+second GMM, because the combine depends on that output's width, which
+`gmm_v2` derives internally (it pads N to a lane multiple).
 
 Imports no JAX or TPU runtime, so every rule here runs on CPU.
 """
@@ -141,6 +143,9 @@ class MoeProcessPlan:
         counting_sort: TPU_MOE_COUNTING_SORT, read at import.
         dense_expert_threshold: TPU_MOE_DENSE_EXPERT_THRESHOLD, read at import.
         ep_gather_reduce_version: RAGGED_GATHER_REDUCE_VERSION, read at import.
+        single_sort_max_rows: Routed-row cap of the counting and single
+            sorts on non-ragged paths.
+        counting_scatter_max_rows: Routed-row cap of the token-id scatter.
     """
 
     use_sparse_core: bool
@@ -149,6 +154,8 @@ class MoeProcessPlan:
     counting_sort: bool
     dense_expert_threshold: int
     ep_gather_reduce_version: GatherReduceVersion
+    single_sort_max_rows: int = SINGLE_SORT_MAX_ROWS
+    counting_scatter_max_rows: int = COUNTING_SORT_SCATTER_MAX_ROWS
 
     def __post_init__(self) -> None:
         if self.ep_gather_reduce_version not in ("v1", "v2", "v3"):
@@ -219,21 +226,30 @@ class GmmOutSpec:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
-class MoeRoutingPlan:
-    """Decisions made before the GMMs.
+class MoeEntryPlan:
+    """Decisions `fused_moe_func` makes before routing.
 
     Attributes:
         path: Dense-expert kernel or routed GMM.
         scrub_nonfinite: Zero non-finite hidden states and routing weights
             before a one-hot permute (one bad token must not poison all).
+    """
+
+    path: MoePath
+    scrub_nonfinite: bool
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
+class MoeRoutingPlan:
+    """How `prepare_routed_gmm_inputs` builds the routed layout.
+
+    Attributes:
         sort: How the permutation and group sizes are built.
         permute: How routed rows are gathered.
         token_bits: Bits for a token id in the packed (key, token) sort.
         flat_bits: Bits for a flat route index in the packed single sort.
     """
 
-    path: MoePath
-    scrub_nonfinite: bool
     sort: SortForm
     permute: Permute
     token_bits: int
@@ -241,7 +257,7 @@ class MoeRoutingPlan:
 
     @property
     def uses_counting_sort(self) -> bool:
-        """Whether `_counting_sort_positions` runs (and must succeed)."""
+        """Whether the counting sort's positions and counts are used."""
         return self.sort in ("counting_scatter", "counting_packed", "counting_argsort")
 
     @property
@@ -271,11 +287,13 @@ class MoeBucketPlan:
     """Every MoE path decision for one compiled bucket.
 
     Attributes:
-        routing: The pre-GMM decisions.
+        entry: The pre-routing decisions.
+        routing: The routing layout; None on the dense-expert path.
         combine: The post-GMM decisions; None on the dense-expert path.
     """
 
-    routing: MoeRoutingPlan
+    entry: MoeEntryPlan
+    routing: MoeRoutingPlan | None
     combine: MoeCombinePlan | None
 
 
@@ -343,50 +361,10 @@ def _onehot_permute(process: MoeProcessPlan, op: MoeOpIn) -> bool:
     )
 
 
-def _sort_form(process: MoeProcessPlan, op: MoeOpIn) -> tuple[SortForm, int, int]:
-    rows = op.routed_rows
-    num_buckets = op.local_num_experts + 1
-    ragged_permute = (
-        op.use_ep and process.use_sparse_core and rows > process.onehot_threshold
-    )
-    counting_attempted = ragged_permute or (
-        process.counting_sort and rows <= SINGLE_SORT_MAX_ROWS
-    )
-    # DUPLICATE of `_counting_sort_positions`' refusal: it returns
-    # (None, None), emitting nothing, when num_buckets > min(block, rows).
-    counting = counting_attempted and not num_buckets > min(COUNTING_SORT_BLOCK, rows)
-    token_bits = max(1, (op.num_tokens - 1).bit_length())
-    packable = num_buckets.bit_length() + token_bits < _PACKED_SORT_BITS
-    flat_bits = max(1, (rows - 1).bit_length())
-    single_sort = (
-        process.single_sort
-        and not counting
-        and not ragged_permute
-        and rows <= SINGLE_SORT_MAX_ROWS
-        and num_buckets.bit_length() + flat_bits < _PACKED_SORT_BITS
-    )
-    scatter = counting and not ragged_permute and rows <= COUNTING_SORT_SCATTER_MAX_ROWS
-    form: SortForm
-    if counting:
-        if scatter:
-            form = "counting_scatter"
-        elif packable:
-            form = "counting_packed"
-        else:
-            form = "counting_argsort"
-    elif single_sort:
-        form = "single_sort"
-    elif packable:
-        form = "argsort_packed"
-    else:
-        form = "argsort_gather"
-    return form, token_bits, flat_bits
-
-
-def plan_routing(
+def plan_entry(
     process: MoeProcessPlan, op: MoeOpIn, *, dense_expert_admitted: bool
-) -> MoeRoutingPlan:
-    """The pre-GMM decisions for one bucket.
+) -> MoeEntryPlan:
+    """The decisions `fused_moe_func` makes before routing.
 
     Args:
         process: Process-wide knobs.
@@ -397,29 +375,127 @@ def plan_routing(
             does.
 
     Returns:
-        The routing plan.
+        The entry plan.
     """
-    sort, token_bits, flat_bits = _sort_form(process, op)
-    onehot = _onehot_permute(process, op)
+    return MoeEntryPlan(
+        path="dense_expert" if dense_expert_admitted else "routed",
+        scrub_nonfinite=_onehot_permute(process, op),
+    )
+
+
+def _ragged_permute(process: MoeProcessPlan, op: MoeOpIn) -> bool:
+    return (
+        op.use_ep
+        and process.use_sparse_core
+        and op.routed_rows > process.onehot_threshold
+    )
+
+
+def counting_sort_attempted(process: MoeProcessPlan, op: MoeOpIn) -> bool:
+    """Whether `_counting_sort_positions` is called.
+
+    Always on the ragged permute; elsewhere when TPU_MOE_COUNTING_SORT is on
+    and the routed rows are within the single-sort cap.
+
+    Args:
+        process: Process-wide knobs.
+        op: This call's shapes.
+
+    Returns:
+        True when the counting sort should be tried.
+    """
+    return _ragged_permute(process, op) or (
+        process.counting_sort and op.routed_rows <= process.single_sort_max_rows
+    )
+
+
+def counting_sort_accepts(op: MoeOpIn) -> bool:
+    """Predicts whether `_counting_sort_positions` returns positions.
+
+    DUPLICATE of its refusal: it returns (None, None), emitting nothing, when
+    `local_num_experts + 1 > min(COUNTING_SORT_BLOCK, routed_rows)`. Used by
+    `plan_bucket` (logs, tests); `prepare_routed_gmm_inputs` passes the
+    actual result instead.
+
+    Args:
+        op: This call's shapes.
+
+    Returns:
+        True when the counting sort would produce positions.
+    """
+    return not op.local_num_experts + 1 > min(COUNTING_SORT_BLOCK, op.routed_rows)
+
+
+def plan_routing(
+    process: MoeProcessPlan, op: MoeOpIn, *, counting_sorted: bool | None = None
+) -> MoeRoutingPlan:
+    """How the routed layout is built for one bucket.
+
+    The sort form depends on whether the counting sort produced positions, a
+    value computed while tracing. `prepare_routed_gmm_inputs` calls the
+    counting sort when `counting_sort_attempted` holds and passes whether it
+    returned positions; callers without that result (logs, tests) leave it
+    None and get `counting_sort_accepts`' prediction.
+
+    Args:
+        process: Process-wide knobs.
+        op: This call's shapes.
+        counting_sorted: The counting sort ran and returned positions, or
+            None to predict it.
+
+    Returns:
+        The routing plan.
+
+    Raises:
+        ValueError: If `counting_sorted` is True but the counting sort would
+            not have been attempted.
+    """
+    rows = op.routed_rows
+    num_buckets = op.local_num_experts + 1
+    ragged_permute = _ragged_permute(process, op)
+    attempted = counting_sort_attempted(process, op)
+    if counting_sorted is None:
+        counting_sorted = attempted and counting_sort_accepts(op)
+    elif counting_sorted and not attempted:
+        raise ValueError(f"counting sort reported for a bucket that skips it: {op}")
+    counting = counting_sorted
+    token_bits = max(1, (op.num_tokens - 1).bit_length())
+    packable = num_buckets.bit_length() + token_bits < _PACKED_SORT_BITS
+    flat_bits = max(1, (rows - 1).bit_length())
+    single_sort = (
+        process.single_sort
+        and not counting
+        and not ragged_permute
+        and rows <= process.single_sort_max_rows
+        and num_buckets.bit_length() + flat_bits < _PACKED_SORT_BITS
+    )
+    scatter = (
+        counting and not ragged_permute and rows <= process.counting_scatter_max_rows
+    )
+    sort: SortForm
+    if counting:
+        if scatter:
+            sort = "counting_scatter"
+        elif packable:
+            sort = "counting_packed"
+        else:
+            sort = "counting_argsort"
+    elif single_sort:
+        sort = "single_sort"
+    elif packable:
+        sort = "argsort_packed"
+    else:
+        sort = "argsort_gather"
     permute: Permute
     if op.use_ep and process.use_sparse_core:
-        if onehot:
-            permute = (
-                "onehot_from_positions"
-                if sort in ("counting_scatter", "counting_packed", "counting_argsort")
-                else "onehot_from_tokens"
-            )
+        if _onehot_permute(process, op):
+            permute = "onehot_from_positions" if counting else "onehot_from_tokens"
         else:
             permute = "ragged_sc"
     else:
         permute = "gather"
     return MoeRoutingPlan(
-        path="dense_expert" if dense_expert_admitted else "routed",
-        scrub_nonfinite=onehot,
-        sort=sort,
-        permute=permute,
-        token_bits=token_bits,
-        flat_bits=flat_bits,
+        sort=sort, permute=permute, token_bits=token_bits, flat_bits=flat_bits
     )
 
 
@@ -675,23 +751,24 @@ def plan_bucket(
     dense_expert_admitted: bool,
     owner_output: bool,
 ) -> MoeBucketPlan:
-    """Both stages at once, for tests and logs.
+    """All stages at once, for tests and logs (counting sort predicted).
 
     Args:
         process: Process-wide knobs.
         op: This call's shapes.
         out: The combine's input facts.
         target: The chip.
-        dense_expert_admitted: See `plan_routing`.
+        dense_expert_admitted: See `plan_entry`.
         owner_output: See `plan_combine`.
 
     Returns:
         The whole bucket plan.
     """
-    routing = plan_routing(process, op, dense_expert_admitted=dense_expert_admitted)
-    if routing.path == "dense_expert":
-        return MoeBucketPlan(routing=routing, combine=None)
+    entry = plan_entry(process, op, dense_expert_admitted=dense_expert_admitted)
+    if entry.path == "dense_expert":
+        return MoeBucketPlan(entry=entry, routing=None, combine=None)
     return MoeBucketPlan(
-        routing=routing,
+        entry=entry,
+        routing=plan_routing(process, op),
         combine=plan_combine(process, op, out, target, owner_output=owner_output),
     )
