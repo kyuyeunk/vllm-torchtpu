@@ -152,6 +152,33 @@ repos:
     additional_dependencies: [pyrefly==1.3.0]
     pass_filenames: false
     always_run: true
+  - id: import-linter
+    name: Import-graph contracts hold
+    # Contracts and their ratchets (`ignore_imports` with unmatched alerting)
+    # are in .importlinter. PYTHONPATH lets grimp find the package without
+    # installing it; grimp parses files and imports none of them.
+    entry: bash -c 'PYTHONPATH=src exec lint-imports --no-cache'
+    language: python
+    additional_dependencies: [import-linter==2.16]
+    always_run: true
+    pass_filenames: false
+  - id: check-envs-use-sites
+    name: envs.X is read only in producer modules
+    # Ratchet against tools/envs_use_sites_baseline.txt; the companion of
+    # check-env-reads for reads through the registry.
+    # `script`, not `system`, for the same reason as check-env-reads.
+    entry: tools/check_envs_use_sites.py
+    language: script
+    always_run: true
+    pass_filenames: false
+  - id: check-semgrep-baseline
+    name: Kernel rules are not restated against VMEM capacity
+    # Ratchet against tools/semgrep_baseline.txt; rules in tools/semgrep/.
+    entry: tools/check_semgrep_baseline.py
+    language: python
+    additional_dependencies: [semgrep==1.184.0]
+    always_run: true
+    pass_filenames: false
   - id: suggestion
     name: Suggestion
     entry: bash -c 'echo "To bypass pre-commit hooks, add --no-verify to git commit."'

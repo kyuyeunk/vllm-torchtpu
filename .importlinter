@@ -1,0 +1,86 @@
+# Import-graph contracts, checked by `lint-imports` (import-linter).
+#
+# Each contract is a ratchet. `ignore_imports` lists the edges that existed
+# when the contract landed, one edge per line so each can be retired on its
+# own. `unmatched_ignore_imports_alerting = error` fails the run when a listed
+# edge no longer exists, so the list can only shrink.
+#
+# grimp, import-linter's graph builder, records every import statement in a
+# file, including those inside a function body. A function-level import is an
+# edge like any other here; when one is deliberate, list it in
+# `ignore_imports` with the reason next to it.
+
+[importlinter]
+root_package = vllm_torchtpu
+# Needed so the pure-contract check can name torch and jax.
+include_external_packages = True
+
+[importlinter:contract:kernels-below-layers]
+name = Kernels do not import layers or the runner
+type = forbidden
+source_modules =
+    vllm_torchtpu.kernels
+    vllm_torchtpu.megakernel
+forbidden_modules =
+    vllm_torchtpu.layers
+    vllm_torchtpu.runner
+ignore_imports =
+    vllm_torchtpu.kernels.deepseek_v4.rope -> vllm_torchtpu.layers.core.quantization
+    vllm_torchtpu.kernels.deepseek_v4.o_projection -> vllm_torchtpu.layers.core.quantization
+    vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter -> vllm_torchtpu.layers.adapter.moe_routing
+    vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter -> vllm_torchtpu.layers.adapter.quantization.configs
+unmatched_ignore_imports_alerting = error
+
+[importlinter:contract:moe-kernels-protected]
+name = Only the MoE decision module and the MoE layer files import MoE kernels
+type = protected
+protected_modules =
+    vllm_torchtpu.kernels.fused_moe
+    vllm_torchtpu.kernels.megablox
+    vllm_torchtpu.kernels.experimental.adaptive_fused_moe
+    vllm_torchtpu.kernels.experimental.fused_moe_decode
+    vllm_torchtpu.kernels.experimental.moe_tp_decode
+    vllm_torchtpu.kernels.experimental.moe_dense_expert
+allowed_importers =
+    # Kernels share helpers with each other.
+    vllm_torchtpu.kernels
+    # The decision module and its siblings.
+    vllm_torchtpu.layers.core.moe_plan
+    vllm_torchtpu.layers.core.moe_collective_plan
+    vllm_torchtpu.layers.core.tpu_target
+    # The MoE layer files that run what the plan chose.
+    vllm_torchtpu.layers.core.fused_moe_gmm
+    vllm_torchtpu.layers.adapter.fused_moe_ep
+    vllm_torchtpu.layers.adapter.fused_moe_decode
+    vllm_torchtpu.layers.adapter.pipelined_fused_moe
+    vllm_torchtpu.layers.adapter.moe_tp_decode
+    vllm_torchtpu.layers.adapter.custom_ops.moe_runner
+# Baseline: importers that are not MoE layer files.
+ignore_imports =
+    # Dense linear layers reuse the grouped matmul.
+    vllm_torchtpu.layers.adapter.linear_common -> vllm_torchtpu.kernels.megablox.gmm_v2
+    # Quantization methods reach into kernel weight formats.
+    vllm_torchtpu.layers.adapter.quantization.fp8 -> vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter
+    vllm_torchtpu.layers.adapter.quantization.nvfp4 -> vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter
+    vllm_torchtpu.layers.adapter.quantization.nvfp4 -> vllm_torchtpu.kernels.fused_moe.v2.host
+unmatched_ignore_imports_alerting = error
+
+[importlinter:contract:contract-modules-pure]
+name = Contract modules do not import a TPU runtime
+type = forbidden
+source_modules =
+    vllm_torchtpu.layers.core.moe_plan
+    vllm_torchtpu.layers.core.tpu_target
+    vllm_torchtpu.layers.core.moe_collective_plan
+forbidden_modules =
+    torch
+    torch_tpu
+    jax
+    jaxlib
+ignore_imports =
+    # Function-level and deliberate: `TpuTarget.from_runtime` reads the chip
+    # from the initialized JAX runtime. Importing tpu_target does not import
+    # JAX; tests/proto_contracts checks that at run time. External packages
+    # are graph nodes by top-level name only, hence `jax`.
+    vllm_torchtpu.layers.core.tpu_target -> jax
+unmatched_ignore_imports_alerting = error

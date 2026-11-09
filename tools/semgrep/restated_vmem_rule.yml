@@ -1,0 +1,48 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Checked by tools/check_semgrep_baseline.py against
+# tools/semgrep_baseline.txt.
+rules:
+  - id: restated-vmem-rule
+    languages: [python]
+    severity: ERROR
+    message: >-
+      An integer literal sized against vmem_capacity_bytes restates a kernel
+      rule (often an element size, such as 4 for f32). Call the kernel's own
+      admission predicate, or read the size from the dtype.
+    patterns:
+      - pattern-either:
+          - pattern: $SIZE < $CAP
+          - pattern: $SIZE <= $CAP
+          - pattern: $SIZE > $CAP
+          - pattern: $SIZE >= $CAP
+          - pattern: $CAP < $SIZE
+          - pattern: $CAP <= $SIZE
+          - pattern: $CAP > $SIZE
+          - pattern: $CAP >= $SIZE
+      - metavariable-pattern:
+          metavariable: $CAP
+          pattern-either:
+            - pattern: <... $OBJ.vmem_capacity_bytes ...>
+            - pattern: <... vmem_capacity_bytes ...>
+      - metavariable-pattern:
+          metavariable: $SIZE
+          patterns:
+            - pattern-either:
+                - pattern: <... $E * $N ...>
+                - pattern: <... $N * $E ...>
+            - metavariable-regex:
+                metavariable: $N
+                regex: ^\d+$
