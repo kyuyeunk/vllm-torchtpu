@@ -41,6 +41,8 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
     token_block_alignment,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+from vllm_torchtpu.layers.core.moe_plan import auto_onehot_permute_threshold
+from vllm_torchtpu.layers.core.tpu_target import TpuTarget
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -60,7 +62,6 @@ def _select_ragged_gather_reduce(version: str):
 # The non-EP combine in moe_gmm selects that kernel directly.
 ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VERSION)
 
-_ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 # Fixed at import: build the MoE permutation from one packed sort.
@@ -86,29 +87,25 @@ _COUNTING_SORT_BLOCK = 512
 _COUNTING_SORT_SCATTER_MAX_ROWS = _COUNTING_SORT_BLOCK
 
 
-def resolve_onehot_permute_threshold() -> int:
+def resolve_onehot_permute_threshold(target: TpuTarget | None = None) -> int:
     """Routed-row count at/below which MoE permute+combine run as TensorCore
     one-hot matmuls instead of the SparseCore gather/reduce kernels.
 
     Auto (env unset/empty/negative) resolves to ``min(SC block rows - 1,
-    _ONEHOT_AUTO_CAP)`` on SparseCore TPUs and 0 elsewhere. An explicit
+    moe_plan.ONEHOT_AUTO_CAP)`` on SparseCore TPUs and 0 elsewhere. An explicit
     ``ONEHOT_MOE_PERMUTE_THRESHOLD`` wins: 0 disables the one-hot path, a
     positive value forces that threshold.
+
+    ``target`` is the chip; None reads it from the runtime, and only once the
+    env override has been ruled out, so an explicit override never touches
+    the runtime.
     """
     explicit = envs.ONEHOT_MOE_PERMUTE_THRESHOLD
     if explicit is not None and explicit >= 0:
         return explicit
-    try:
-        sc_info = pltpu.get_tpu_info().sparse_core
-    except ValueError:
-        # get_tpu_info raises for unsupported device kinds (e.g. CPU hosts).
-        return 0
-    if sc_info is None:
-        return 0
-    block_rows = sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores
-    threshold = min(block_rows - 1, _ONEHOT_AUTO_CAP)
-
-    return threshold
+    if target is None:
+        target = TpuTarget.runtime_or_none()
+    return auto_onehot_permute_threshold(target)
 
 
 def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
