@@ -19,7 +19,6 @@ sequence lengths. Masked, causal, or non-bf16 calls fall back with a
 one-time warning to ``TpuSDPAImpl`` (PyTorch SDPA).
 """
 
-from functools import cache as run_once
 from typing import Any
 
 import jax
@@ -60,18 +59,23 @@ class TpuSDPABackend(SDPABackend):
         return TpuSDPAImpl
 
 
-@run_once
-def _flash_attention_op():
-    """Builds the torch custom op wrapping the Pallas kernel (once, eagerly)."""
+def diffusion_flash_attention(
+    q: jax.Array, k: jax.Array, v: jax.Array, scale: float
+) -> jax.Array:
+    """Computes flash attention on ``(B, S, H, D)`` inputs.
 
-    def diffusion_flash_attention(
-        q: jax.Array, k: jax.Array, v: jax.Array, scale: float
-    ) -> jax.Array:
-        return flash_attention_bshd(q, k, v, scale=scale)
+    This is the JAX body of the ``pallas::diffusion_flash_attention`` op. See
+    ``flash_attention_bshd`` for shapes and the meaning of ``scale``.
+    """
+    return flash_attention_bshd(q, k, v, scale=scale)
 
-    op = pallas.jax_op("pallas::diffusion_flash_attention", diffusion_flash_attention)
-    op.register_fake(lambda q, k, v, scale: q.new_empty((*q.shape[:3], v.shape[-1])))
-    return op
+
+_flash_attention_op = pallas.jax_op(
+    "pallas::diffusion_flash_attention", diffusion_flash_attention
+)
+_flash_attention_op.register_fake(
+    lambda q, k, v, scale: q.new_empty((*q.shape[:3], v.shape[-1]))
+)
 
 
 class TpuFlashAttentionImpl(TpuSDPAImpl):
@@ -79,8 +83,7 @@ class TpuFlashAttentionImpl(TpuSDPAImpl):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        # Build the op outside any compiled region.
-        self._op = _flash_attention_op()
+        self._op = _flash_attention_op
 
     def _needs_sdpa_fallback(
         self,

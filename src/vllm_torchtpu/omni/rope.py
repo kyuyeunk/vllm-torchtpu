@@ -33,7 +33,6 @@ tokens) this cuts ~7 ms per transformer layer (80.8 -> 73.9 ms).
 """
 
 import functools
-from functools import cache as run_once
 
 import jax
 import torch
@@ -139,29 +138,31 @@ def apply_split_rotary_half_swap(
     return out.to(x.dtype)
 
 
-@run_once
-def _qk_norm_rope_op():
-    """Builds the torch custom op wrapping the fused Pallas kernel (once)."""
+def wan_qk_norm_rope(
+    qkv: jax.Array,
+    wq: jax.Array,
+    wk: jax.Array,
+    cos: jax.Array,
+    sin: jax.Array,
+    eps: float,
+    head_dim: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Computes RMSNorm and RoPE of q and k from a fused QKV output.
 
-    def wan_qk_norm_rope(
-        qkv: jax.Array,
-        wq: jax.Array,
-        wk: jax.Array,
-        cos: jax.Array,
-        sin: jax.Array,
-        eps: float,
-        head_dim: int,
-    ) -> tuple[jax.Array, jax.Array]:
-        return qk_norm_rope(qkv, wq, wk, cos, sin, eps=eps, head_dim=head_dim)
+    This is the JAX body of the ``pallas::wan_qk_norm_rope`` op. See
+    ``qk_norm_rope`` for shapes and arguments.
+    """
+    return qk_norm_rope(qkv, wq, wk, cos, sin, eps=eps, head_dim=head_dim)
 
-    op = pallas.jax_op("pallas::wan_qk_norm_rope", wan_qk_norm_rope)
 
-    def fake(qkv, wq, wk, cos, sin, eps, head_dim):
-        shape = (qkv.shape[0], qkv.shape[1] // 3)
-        return qkv.new_empty(shape), qkv.new_empty(shape)
+def _fake_qk_norm_rope(qkv, wq, wk, cos, sin, eps, head_dim):
+    del wq, wk, cos, sin, eps, head_dim
+    shape = (qkv.shape[0], qkv.shape[1] // 3)
+    return qkv.new_empty(shape), qkv.new_empty(shape)
 
-    op.register_fake(fake)
-    return op
+
+_qk_norm_rope_op = pallas.jax_op("pallas::wan_qk_norm_rope", wan_qk_norm_rope)
+_qk_norm_rope_op.register_fake(_fake_qk_norm_rope)
 
 
 def can_fuse_qk_norm_rope(
@@ -199,7 +200,7 @@ def wan_self_attention_fused(
         t = _repeat_pairs(t.reshape(t.shape[0], seq, -1))
         return t.expand(batch, seq, attn.head_dim).reshape(batch * seq, -1)
 
-    query, key = _qk_norm_rope_op()(
+    query, key = _qk_norm_rope_op(
         qkv.reshape(batch * seq, width),
         attn.norm_q.weight,
         attn.norm_k.weight,

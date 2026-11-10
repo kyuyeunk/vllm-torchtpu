@@ -182,7 +182,7 @@ def test_fp8_linear_method_takes_w8a16_max_rows_from_linear_config(monkeypatch):
 
 @pytest.mark.cpu_test
 def test_quantized_matmul_op_accepts_w8a16_max_rows():
-    op = linear_common._get_quantized_matmul_op()
+    op = linear_common._quantized_matmul_op
     with torch.device("meta"):
         x = torch.empty((16, _K), dtype=torch.bfloat16)
         w_q = torch.empty((_K, _N), dtype=torch.float8_e4m3fn)

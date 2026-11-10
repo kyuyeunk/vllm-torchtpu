@@ -11,9 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections.abc import Callable
-from threading import Lock
-
 import jax
 import jax.numpy as jnp
 import torch
@@ -128,35 +125,22 @@ def _quantized_matmul_jax(
     return xla_quantized_matmul(x, w_q, w_s, quantize_activation=not use_w8a16)
 
 
-_quantized_matmul_kernel_op: Callable | None = None
-_quantized_matmul_kernel_op_lock = Lock()
+_quantized_matmul_op = pallas.jax_op(
+    "pallas::quantized_matmul_kernel", _quantized_matmul_jax
+)
 
 
-def _get_quantized_matmul_op() -> Callable:
-    global _quantized_matmul_kernel_op
-    if _quantized_matmul_kernel_op is not None:
-        return _quantized_matmul_kernel_op
+def _fake_quantized_matmul(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    w8a16_max_rows: int = 0,
+) -> torch.Tensor:
+    del w_s, w8a16_max_rows
+    return torch.empty(x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device)
 
-    with _quantized_matmul_kernel_op_lock:
-        if _quantized_matmul_kernel_op is not None:
-            return _quantized_matmul_kernel_op
 
-        op = pallas.jax_op("pallas::quantized_matmul_kernel", _quantized_matmul_jax)
-
-        def _fake_quantized_matmul(
-            x: torch.Tensor,
-            w_q: torch.Tensor,
-            w_s: torch.Tensor,
-            w8a16_max_rows: int = 0,
-        ):
-            del w_s, w8a16_max_rows
-            return torch.empty(
-                x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device
-            )
-
-        op.register_fake(_fake_quantized_matmul)
-        _quantized_matmul_kernel_op = op
-        return op
+_quantized_matmul_op.register_fake(_fake_quantized_matmul)
 
 
 def quantized_matmul(
@@ -167,7 +151,7 @@ def quantized_matmul(
 ) -> torch.Tensor:
     """Torch entry point for the runtime FP8 dense-linear matmul.
 
-    Reshapes `x` to 2-D, dispatches through a cached `pallas.jax_op`, and
+    Reshapes `x` to 2-D, calls the `pallas::quantized_matmul_kernel` op, and
     reshapes the output back. `w_q` is the canonical (k, n) layout
     `[n_in, n_out]`. The underlying JAX function picks `gmm_v2` when `w_s` is
     rank-4 `[1, n_in_blocks, 1, n_out]`, and the per-channel dot_general path
@@ -181,7 +165,7 @@ def quantized_matmul(
 
     orig_out_shape = (*x.shape[:-1], w_q.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
-    out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s, w8a16_max_rows)
+    out_2d = _quantized_matmul_op(x_2d, w_q, w_s, w8a16_max_rows)
     return out_2d.reshape(orig_out_shape)
 
 
@@ -209,34 +193,19 @@ def _quantized_matmul_fp4_jax(
     )
 
 
-_quantized_matmul_fp4_op: Callable | None = None
-_quantized_matmul_fp4_op_lock = Lock()
+_quantized_matmul_fp4_op = pallas.jax_op(
+    "pallas::quantized_matmul_fp4_kernel", _quantized_matmul_fp4_jax
+)
 
 
-def _get_quantized_matmul_fp4_op() -> Callable:
-    global _quantized_matmul_fp4_op
-    if _quantized_matmul_fp4_op is not None:
-        return _quantized_matmul_fp4_op
+def _fake_quantized_matmul_fp4(
+    x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
+) -> torch.Tensor:
+    del w_q  # output width is the logical n_out carried by the scale
+    return torch.empty(x.shape[0], w_s.shape[-1], dtype=x.dtype, device=x.device)
 
-    with _quantized_matmul_fp4_op_lock:
-        if _quantized_matmul_fp4_op is not None:
-            return _quantized_matmul_fp4_op
 
-        op = pallas.jax_op(
-            "pallas::quantized_matmul_fp4_kernel", _quantized_matmul_fp4_jax
-        )
-
-        def _fake_quantized_matmul_fp4(
-            x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
-        ):
-            del w_q  # output width is the logical n_out carried by the scale
-            return torch.empty(
-                x.shape[0], w_s.shape[-1], dtype=x.dtype, device=x.device
-            )
-
-        op.register_fake(_fake_quantized_matmul_fp4)
-        _quantized_matmul_fp4_op = op
-        return op
+_quantized_matmul_fp4_op.register_fake(_fake_quantized_matmul_fp4)
 
 
 def quantized_matmul_fp4(
@@ -251,7 +220,7 @@ def quantized_matmul_fp4(
     """
     orig_out_shape = (*x.shape[:-1], w_s.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
-    out_2d = _get_quantized_matmul_fp4_op()(x_2d, w_q, w_s)
+    out_2d = _quantized_matmul_fp4_op(x_2d, w_q, w_s)
     return out_2d.reshape(orig_out_shape)
 
 

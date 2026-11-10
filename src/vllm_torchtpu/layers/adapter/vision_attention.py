@@ -69,20 +69,17 @@ def _vision_flash_core(
     )
 
 
+# Registered at import, so no registration happens inside a traced forward.
+_VISION_OP = pallas.jax_op("pallas::vision_flash_attention", _vision_flash_core)
+_VISION_OP.register_fake(lambda q, k, v, q_seg, kv_seg: torch.empty_like(q))
+
+
 @CustomOp.register_oot(name="MMEncoderAttention")
 class TpuMMEncoderAttention(MMEncoderAttention):
     """MMEncoderAttention whose TPU path uses the Pallas flash kernel."""
 
-    # One shared jax op (sm_scale folded into q -> scale-agnostic), built once,
-    # eagerly -- never inside a compiled region.
-    _vision_op = None
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if TpuMMEncoderAttention._vision_op is None:
-            op = pallas.jax_op("pallas::vision_flash_attention", _vision_flash_core)
-            op.register_fake(lambda q, k, v, q_seg, kv_seg: torch.empty_like(q))
-            TpuMMEncoderAttention._vision_op = op
+    # Tests monkeypatch this attribute to stub out the kernel.
+    _vision_op = _VISION_OP
 
     def forward_oot(
         self,
@@ -143,11 +140,10 @@ class TpuMMEncoderAttention(MMEncoderAttention):
                 x = F.pad(x, (0, 0, 0, 0, 0, pad))
             return x.permute(0, 2, 1, 3).contiguous()
 
-        op = TpuMMEncoderAttention._vision_op
-        # __init__ builds the shared op before any forward runs.
-        assert op is not None
         # Fold sm_scale into q so the op stays scale-agnostic.
-        out = op(_prep(q * self.scale), _prep(k), _prep(v), seg, seg)
+        out = TpuMMEncoderAttention._vision_op(
+            _prep(q * self.scale), _prep(k), _prep(v), seg, seg
+        )
         out = out.permute(0, 2, 1, 3)  # [b, s_pad, h, d]
         return out[:, :seq_len].contiguous()
 

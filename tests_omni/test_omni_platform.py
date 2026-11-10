@@ -193,9 +193,7 @@ def test_tpu_flash_attention_backend(monkeypatch):
     assert TpuFlashAttentionBackend.get_impl_cls() is TpuFlashAttentionImpl
 
     mock_op = MagicMock(side_effect=lambda q, k, v, scale: q.clone())
-    monkeypatch.setattr(
-        "vllm_torchtpu.omni.attention._flash_attention_op", lambda: mock_op
-    )
+    monkeypatch.setattr("vllm_torchtpu.omni.attention._flash_attention_op", mock_op)
     mock_warn = MagicMock()
     monkeypatch.setattr("vllm_torchtpu.omni.attention.logger.warning_once", mock_warn)
 
@@ -531,7 +529,7 @@ def test_wan_self_attention_fused_matches_native(monkeypatch):
     batch, seq, half = 2, 5, attn.head_dim // 2
     x = torch.randn(batch, seq, 64)
     cos, sin = torch.randn(1, seq, 1, half), torch.randn(1, seq, 1, half)
-    monkeypatch.setattr(omni_rope, "_qk_norm_rope_op", lambda: _reference_qk_norm_rope)
+    monkeypatch.setattr(omni_rope, "_qk_norm_rope_op", _reference_qk_norm_rope)
     out = wan_self_attention_fused(attn, x, (cos, sin))
     want = WanSelfAttention._tpu_orig_forward(attn, x, (cos, sin))
     torch.testing.assert_close(out, want)
