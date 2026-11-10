@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for DCP layout propagation and kernel registry isolation.
+"""CPU tests for DCP layout propagation into the DCP op's static arguments.
 
 Real TPU pass correctness is covered by test_attention_dcp_hnd.py. Here the
-kernel builder and collectives are replaced so both adapter entry points and
-the registry can be checked together, including reuse across layers/layouts.
+DCP op and collectives are replaced so the static arguments that both adapter
+entry points bind can be checked across layers and layouts.
 """
 
 from types import SimpleNamespace
@@ -77,18 +77,13 @@ def _config():
 def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
     monkeypatch, rank, compiled, cpu_vllm_config_context
 ):
-    built, calls = [], []
+    calls = []
 
-    def build_op(_name, fn):
-        built.append(fn)
-
-        def kernel(_cache, query, *args):
-            scope = fn.keywords["attention_scope"]
-            calls.append((fn.keywords["kv_layout"], scope, query.shape))
-            value = 1 if scope == AttentionScope.CACHE_ONLY else 3
-            return torch.full_like(query, value), torch.zeros(query.shape[:2])
-
-        return kernel
+    def fake_op(cache, query, *args, **static_kwargs):
+        scope = static_kwargs["attention_scope"]
+        calls.append((static_kwargs["kv_layout"], scope, query.shape))
+        value = 1 if scope == AttentionScope.CACHE_ONLY else 3
+        return cache, torch.full_like(query, value), torch.zeros(query.shape[:2])
 
     group = SimpleNamespace(
         world_size=2,
@@ -98,12 +93,11 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
     )
     monkeypatch.setattr(attention, "_get_dcp_group", lambda: group)
     monkeypatch.setattr(cp_attention, "get_dcp_group", lambda: group)
-    monkeypatch.setattr(cp_attention, "_DCP_KERNEL_REGISTRY", {})
-    monkeypatch.setattr(cp_attention, "_build_dcp_kernel_op", build_op)
+    monkeypatch.setattr(cp_attention, "_DCP_KERNEL_OP", fake_op)
     monkeypatch.setattr(cp_attention, "synchronize_tensors", lambda *a, **k: None)
     layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=0.25)
     implementations = []
-    # The third layer must reuse NHD's ops after HND has populated the registry.
+    # The third, NHD layer must not inherit the HND layer's static arguments.
     for layout in ("LBNHC", "LBHNC", "LBNHC"):
         get_current_vllm_config().cache_config.kv_cache_layout = layout
         impl = _impl()
@@ -111,22 +105,15 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
             impl.initialize_kernel(layer)
         implementations.append(impl)
 
-    assert len(built) == 4  # Two layouts, two scopes; shared by matching layers.
-    assert (
-        implementations[0].rpa_dcp_cache_kernel
-        is implementations[2].rpa_dcp_cache_kernel
-    )
-    assert (
-        implementations[0].rpa_dcp_new_kernel is implementations[2].rpa_dcp_new_kernel
-    )
-    assert (
-        implementations[0].rpa_dcp_cache_kernel
-        is not implementations[1].rpa_dcp_cache_kernel
-    )
-    assert (
-        implementations[0].rpa_dcp_new_kernel
-        is not implementations[1].rpa_dcp_new_kernel
-    )
+    def statics(impl):
+        return (
+            impl.rpa_dcp_cache_kernel.keywords,
+            impl.rpa_dcp_new_kernel.keywords,
+        )
+
+    # Layers with the same layout bind the same static arguments.
+    assert statics(implementations[0]) == statics(implementations[2])
+    assert statics(implementations[0]) != statics(implementations[1])
 
     metadata = SimpleNamespace(
         seq_lens=torch.tensor([2, 3, 4], dtype=torch.int32),
@@ -157,13 +144,15 @@ def test_dcp_layout_survives_prebuild_forward_and_registry_reuse(
         # Two cached partials (value=1, weight=1 each) and one new partial
         # (value=3, weight=1), including both production LSE merges.
         torch.testing.assert_close(output, torch.full_like(query, 5 / 3))
-    assert len(built) == 4  # Forward must reuse the prebuilt ops for each layout.
-    assert all(type(fn.keywords["kv_layout"]) is KVLayout for fn in built)
+    assert all(
+        type(keywords["kv_layout"]) is KVLayout
+        for impl in implementations
+        for keywords in statics(impl)
+    )
+    assert all(type(layout) is KVLayout for layout, _, _ in calls)
 
 
-def test_dcp_kernel_default_layout_reuses_explicit_nhd(monkeypatch):
-    monkeypatch.setattr(cp_attention, "_DCP_KERNEL_REGISTRY", {})
-    monkeypatch.setattr(cp_attention, "_build_dcp_kernel_op", lambda name, fn: fn)
+def test_dcp_kernel_default_layout_reuses_explicit_nhd():
     kwargs = dict(
         sliding_window=None,
         sm_scale=0.0625,
@@ -178,7 +167,7 @@ def test_dcp_kernel_default_layout_reuses_explicit_nhd(monkeypatch):
     explicit = cp_attention.build_dcp_kernels(
         **kwargs, kv_layout=KVLayout.HEAD_ALONG_SUBLANE
     )
-    assert all(a is b for a, b in zip(implicit, explicit))
+    assert all(a.keywords == b.keywords for a, b in zip(implicit, explicit))
 
 
 @pytest.mark.parametrize(

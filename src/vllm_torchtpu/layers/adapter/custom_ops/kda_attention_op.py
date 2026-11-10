@@ -13,9 +13,10 @@
 # limitations under the License.
 """Torch custom-op bridge for Kimi KDA on the fused conv1d + GDN v3 kernel."""
 
+import functools
 import math
 from collections.abc import Callable
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -319,7 +320,28 @@ def _check_kda_abi(
     return num_tokens, num_sequences, num_heads, head_dim
 
 
-def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: int = 0):
+def _fused_core(
+    mixed_qkv: jax.Array,  # [T, 3 * H * D], pre-convolution
+    raw_gate: jax.Array,  # [T, H * D]
+    beta: jax.Array,  # [T, H]
+    output_gate: jax.Array,  # [T, H * D]
+    conv_state: jax.Array,  # [num_slots, K - 1, 1, 3 * H * D] or flat 3-D
+    recurrent_state: jax.Array,  # [num_slots, H, K, V]
+    conv_weight: jax.Array,  # [kernel_size, 3, H, D], fused at load time
+    a_log: jax.Array,  # [H]
+    dt_bias: jax.Array,  # [H * D]
+    norm_weight: jax.Array,  # [D]
+    query_start_loc: jax.Array,  # [N + 1]
+    state_indices: jax.Array,  # [N]
+    seq_lens: jax.Array,  # [N]
+    distribution: jax.Array,  # [3] int32: [decode_end, _, mixed_end]
+    window_distribution: jax.Array | None = None,
+    slot_read_offsets: jax.Array | None = None,
+    *,
+    lower_bound: float | None,
+    eps: float,
+    num_spec_tokens: int = 0,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The same op, on the fused conv1d + GDN v3 kernel.
 
     The fused kernel replaces the four-stage manual pipeline and
@@ -331,120 +353,132 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
     Only `_gated_output_norm` stays outside, since the fused kernel has no
     notion of the output gate.
     """
+    num_tokens, _, num_heads, head_dim = _check_kda_abi(
+        mixed_qkv,
+        raw_gate,
+        beta,
+        output_gate,
+        recurrent_state,
+        a_log,
+        dt_bias,
+        norm_weight,
+        query_start_loc,
+        state_indices,
+        seq_lens,
+    )
+    kernel_size = conv_weight.shape[0]
+    if window_distribution is None:
+        window_distribution = distribution
 
-    def fused_core(
-        mixed_qkv: jax.Array,  # [T, 3 * H * D], pre-convolution
-        raw_gate: jax.Array,  # [T, H * D]
-        beta: jax.Array,  # [T, H]
-        output_gate: jax.Array,  # [T, H * D]
-        conv_state: jax.Array,  # [num_slots, K - 1, 1, 3 * H * D] or flat 3-D
-        recurrent_state: jax.Array,  # [num_slots, H, K, V]
-        conv_weight: jax.Array,  # [kernel_size, 3, H, D], fused at load time
-        a_log: jax.Array,  # [H]
-        dt_bias: jax.Array,  # [H * D]
-        norm_weight: jax.Array,  # [D]
-        query_start_loc: jax.Array,  # [N + 1]
-        state_indices: jax.Array,  # [N]
-        seq_lens: jax.Array,  # [N]
-        distribution: jax.Array,  # [3] int32: [decode_end, _, mixed_end]
-        window_distribution: jax.Array | None = None,
-        slot_read_offsets: jax.Array | None = None,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        num_tokens, _, num_heads, head_dim = _check_kda_abi(
-            mixed_qkv,
-            raw_gate,
-            beta,
-            output_gate,
-            recurrent_state,
-            a_log,
-            dt_bias,
-            norm_weight,
-            query_start_loc,
-            state_indices,
-            seq_lens,
+    # `mixed_qkv` and `conv_weight` lay their channels out as (3, H, D) in
+    # row-major order, which is exactly the flat `dim` axis the fused
+    # kernel indexes -- the reshapes are free. The dense `conv_state`
+    # cache is declared in the kernel's (K - 1, 1, dim) slot layout so it
+    # is read in place; the pooled path hands in its gathered slots flat.
+    # The kernel wants the weight transposed to [dim, 1, kernel_size].
+    conv_weight_flat = conv_weight.reshape(kernel_size, -1)
+    conv_weight_flat = jnp.transpose(conv_weight_flat, (1, 0))[:, None]
+    read_offsets = None
+    if num_spec_tokens > 0:
+        if slot_read_offsets is None:
+            raise ValueError("slot_read_offsets are required for KDA verify")
+        read_offsets = slot_read_offsets[state_indices]
+
+    def run_kernel(conv_in, rec_in, *, batched_only=False, prefill_only=False):
+        return gdn_wrapper.fused_conv1d_gdn(
+            qkv=mixed_qkv,
+            # Raw: the kernel applies sigmoid to `b` and the gate activation
+            # to `a` itself.
+            b=beta,
+            a=raw_gate,
+            states=(conv_in, rec_in),
+            conv_weight=conv_weight_flat,
+            # Kimi's short convolution is bias-free.
+            conv_bias=None,
+            a_log=a_log,
+            # Per-channel under KDA, and Mosaic rejects the flat form.
+            dt_bias=dt_bias.reshape(num_heads, head_dim),
+            query_start_loc=query_start_loc,
+            state_indices=state_indices,
+            # The batched segment contains both ordinary one-token decodes and
+            # K+1 target-verify windows.  Ragged query lengths distinguish the
+            # two while the recurrent kernel uses one static window shape.
+            distribution=window_distribution,
+            seq_lens=seq_lens,
+            read_offsets=read_offsets,
+            n_kq=num_heads,
+            n_v=num_heads,
+            d_k=head_dim,
+            d_v=head_dim,
+            kernel_size=kernel_size,
+            attention_mode=gdn_config.AttentionMode.KDA,
+            gate_lower_bound=lower_bound,
+            num_spec_tokens=num_spec_tokens,
+            batched_only=batched_only,
+            prefill_only=prefill_only,
         )
-        kernel_size = conv_weight.shape[0]
-        if window_distribution is None:
-            window_distribution = distribution
 
-        # `mixed_qkv` and `conv_weight` lay their channels out as (3, H, D) in
-        # row-major order, which is exactly the flat `dim` axis the fused
-        # kernel indexes -- the reshapes are free. The dense `conv_state`
-        # cache is declared in the kernel's (K - 1, 1, dim) slot layout so it
-        # is read in place; the pooled path hands in its gathered slots flat.
-        # The kernel wants the weight transposed to [dim, 1, kernel_size].
-        conv_weight_flat = conv_weight.reshape(kernel_size, -1)
-        conv_weight_flat = jnp.transpose(conv_weight_flat, (1, 0))[:, None]
-        read_offsets = None
-        if num_spec_tokens > 0:
-            if slot_read_offsets is None:
-                raise ValueError("slot_read_offsets are required for KDA verify")
-            read_offsets = slot_read_offsets[state_indices]
-
-        def run_kernel(conv_in, rec_in, *, batched_only=False, prefill_only=False):
-            return gdn_wrapper.fused_conv1d_gdn(
-                qkv=mixed_qkv,
-                # Raw: the kernel applies sigmoid to `b` and the gate activation
-                # to `a` itself.
-                b=beta,
-                a=raw_gate,
-                states=(conv_in, rec_in),
-                conv_weight=conv_weight_flat,
-                # Kimi's short convolution is bias-free.
-                conv_bias=None,
-                a_log=a_log,
-                # Per-channel under KDA, and Mosaic rejects the flat form.
-                dt_bias=dt_bias.reshape(num_heads, head_dim),
-                query_start_loc=query_start_loc,
-                state_indices=state_indices,
-                # The batched segment contains both ordinary one-token decodes and
-                # K+1 target-verify windows.  Ragged query lengths distinguish the
-                # two while the recurrent kernel uses one static window shape.
-                distribution=window_distribution,
-                seq_lens=seq_lens,
-                read_offsets=read_offsets,
-                n_kq=num_heads,
-                n_v=num_heads,
-                d_k=head_dim,
-                d_v=head_dim,
-                kernel_size=kernel_size,
-                attention_mode=gdn_config.AttentionMode.KDA,
-                gate_lower_bound=lower_bound,
-                num_spec_tokens=num_spec_tokens,
-                batched_only=batched_only,
-                prefill_only=prefill_only,
-            )
-
-        if num_spec_tokens > 0:
-            window_end = window_distribution[0]
-            empty_out = jnp.zeros((num_tokens, num_heads * head_dim), mixed_qkv.dtype)
-            (verify_states, verify_out) = _guard_kda_verify_window(
-                window_end,
-                lambda: run_kernel(conv_state, recurrent_state, batched_only=True),
-                lambda: ((conv_state, recurrent_state), empty_out),
-            )
-            first_prefill_token = query_start_loc[window_end]
-            total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
-            ((new_conv_state, new_pool), prefill_out) = jax.lax.cond(
-                first_prefill_token < total_tokens,
-                lambda: run_kernel(*verify_states, prefill_only=True),
-                lambda: (verify_states, empty_out),
-            )
-            out = jnp.where(
-                (jnp.arange(num_tokens) < first_prefill_token)[:, None],
-                verify_out,
-                prefill_out,
-            )
-        else:
-            (new_conv_state, new_pool), out = run_kernel(conv_state, recurrent_state)
-
-        output = out.reshape(num_tokens, num_heads, head_dim)
-        output = _gated_output_norm(
-            output, output_gate, norm_weight, eps, mixed_qkv.dtype
+    if num_spec_tokens > 0:
+        window_end = window_distribution[0]
+        empty_out = jnp.zeros((num_tokens, num_heads * head_dim), mixed_qkv.dtype)
+        (verify_states, verify_out) = _guard_kda_verify_window(
+            window_end,
+            lambda: run_kernel(conv_state, recurrent_state, batched_only=True),
+            lambda: ((conv_state, recurrent_state), empty_out),
         )
-        return output, new_conv_state, new_pool
+        first_prefill_token = query_start_loc[window_end]
+        total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
+        ((new_conv_state, new_pool), prefill_out) = jax.lax.cond(
+            first_prefill_token < total_tokens,
+            lambda: run_kernel(*verify_states, prefill_only=True),
+            lambda: (verify_states, empty_out),
+        )
+        out = jnp.where(
+            (jnp.arange(num_tokens) < first_prefill_token)[:, None],
+            verify_out,
+            prefill_out,
+        )
+    else:
+        (new_conv_state, new_pool), out = run_kernel(conv_state, recurrent_state)
 
-    return fused_core
+    output = out.reshape(num_tokens, num_heads, head_dim)
+    output = _gated_output_norm(output, output_gate, norm_weight, eps, mixed_qkv.dtype)
+    return output, new_conv_state, new_pool
+
+
+def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: int = 0):
+    """Returns `_fused_core` with its static configuration bound."""
+    return functools.partial(
+        _fused_core,
+        lower_bound=lower_bound,
+        eps=eps,
+        num_spec_tokens=num_spec_tokens,
+    )
+
+
+def _fake_dispatched(
+    mixed_qkv,
+    _raw_gate,
+    _beta,
+    _output_gate,
+    conv_state,
+    recurrent_state,
+    *args,
+    **kwargs,
+):
+    num_heads, head_dim = recurrent_state.shape[1:3]
+    output = torch.empty(
+        (mixed_qkv.size(0), num_heads, head_dim),
+        dtype=mixed_qkv.dtype,
+        device=mixed_qkv.device,
+    )
+    return (output, torch.empty_like(conv_state), torch.empty_like(recurrent_state))
+
+
+_dispatched_kda_op = pallas.jax_op(
+    "pallas::kimi_dispatched_kda_fused", _fused_core, donate_argnums=(4, 5)
+)
+_dispatched_kda_op.register_fake(_fake_dispatched)
 
 
 def build_kimi_dispatched_kda_op(
@@ -456,31 +490,8 @@ def build_kimi_dispatched_kda_op(
     num_spec_tokens: int = 0,
 ):
     """Build fused KDA with separately guarded speculative and prefill segments."""
-    core = _build_fused_core(lower_bound, eps, num_spec_tokens)
     variant = "fused_window" if num_spec_tokens else "fused"
     logger.info("KDA op %s: using the %s GDN v3 path.", prefix, variant)
-    op_name = f"pallas::kimi_dispatched_kda_{variant}_{prefix.replace('.', '_')}"
-    dispatched_op = pallas.jax_op(op_name, core, donate_argnums=(4, 5))
-
-    def _fake_dispatched(
-        mixed_qkv,
-        _raw_gate,
-        _beta,
-        _output_gate,
-        conv_state,
-        recurrent_state,
-        *args,
-        **kwargs,
-    ):
-        num_heads, head_dim = recurrent_state.shape[1:3]
-        output = torch.empty(
-            (mixed_qkv.size(0), num_heads, head_dim),
-            dtype=mixed_qkv.dtype,
-            device=mixed_qkv.device,
-        )
-        return (output, torch.empty_like(conv_state), torch.empty_like(recurrent_state))
-
-    dispatched_op.register_fake(_fake_dispatched)
 
     def dispatched_impl(
         mixed_qkv: torch.Tensor,
@@ -500,7 +511,7 @@ def build_kimi_dispatched_kda_op(
         window_distribution: torch.Tensor,
         slot_read_offsets: torch.Tensor,
     ) -> torch.Tensor:
-        output, new_conv_state, new_pool = dispatched_op(
+        output, new_conv_state, new_pool = _dispatched_kda_op(
             mixed_qkv,
             raw_gate,
             beta,
@@ -517,6 +528,9 @@ def build_kimi_dispatched_kda_op(
             distribution,
             window_distribution,
             slot_read_offsets,
+            lower_bound=lower_bound,
+            eps=eps,
+            num_spec_tokens=num_spec_tokens,
         )
         conv_state.copy_(new_conv_state)
         recurrent_state.copy_(new_pool)
@@ -733,6 +747,13 @@ def _pooled_kda_core(
     return output, pool
 
 
+# Pooled ops, keyed by every value `pooled_core` captures. The block size cannot
+# be a static argument: it must be read at trace time, after the platform
+# finalizes it. vllm_config is keyed by id() because pydantic configs are
+# unhashable; each cached op keeps its config alive, so the id is not reused.
+_pooled_kda_ops: dict[tuple, Any] = {}
+
+
 def build_kimi_pooled_kda_op(
     prefix: str,
     *,
@@ -816,20 +837,6 @@ def build_kimi_pooled_kda_op(
             num_spec_tokens=num_spec_tokens,
         )
 
-    # vLLM's compile cache is keyed on the model config and not on the op
-    # body, so the kernel variant goes in the op name (see
-    # build_kimi_dispatched_kda_op). A pooled program cached from the unfused
-    # era would otherwise be served stale.
-    op_name = f"pallas::kimi_pooled_kda_fused_{prefix.replace('.', '_')}"
-    op_name += f"_conv_{DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix('torch.')}"
-    if num_spec_tokens:
-        op_name += f"_window{num_spec_tokens + 1}"
-    if conv_shard_heads is not None:
-        # Stored state order is part of the compiled program, including for
-        # decode-local requests and prefix-cache seeds, not just PD loads.
-        op_name += f"_conv_rank_blocks_v1_h{conv_shard_heads}"
-    pooled_op = pallas.jax_op(op_name, pooled_core, donate_argnums=(4,))
-
     def _fake_pooled(
         mixed_qkv,
         _raw_gate,
@@ -850,7 +857,26 @@ def build_kimi_pooled_kda_op(
         )
         return output, torch.empty_like(pool)
 
-    pooled_op.register_fake(_fake_pooled)
+    key = (id(vllm_config), lower_bound, eps, conv_shard_heads, num_spec_tokens)
+    pooled_op = _pooled_kda_ops.get(key)
+    if pooled_op is None:
+        # vLLM's compile cache is keyed on the model config and not on the op
+        # body, so the kernel variant goes in the op name. A pooled program
+        # cached from the unfused era would otherwise be served stale. The
+        # counter keeps names unique for keys that differ only in values the
+        # name omits.
+        op_name = "pallas::kimi_pooled_kda_fused"
+        op_name += f"_conv_{DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix('torch.')}"
+        if num_spec_tokens:
+            op_name += f"_window{num_spec_tokens + 1}"
+        if conv_shard_heads is not None:
+            # Stored state order is part of the compiled program, including for
+            # decode-local requests and prefix-cache seeds, not just PD loads.
+            op_name += f"_conv_rank_blocks_v1_h{conv_shard_heads}"
+        op_name += f"_{len(_pooled_kda_ops)}"
+        pooled_op = pallas.jax_op(op_name, pooled_core, donate_argnums=(4,))
+        pooled_op.register_fake(_fake_pooled)
+        _pooled_kda_ops[key] = pooled_op
 
     def pooled_impl(
         mixed_qkv: torch.Tensor,

@@ -14,6 +14,7 @@
 """Out-of-tree (OOT) custom operator layers and wrappers for
 Multi-Head Latent Attention (MLA)."""
 
+import functools
 from typing import Any, cast
 
 import jax
@@ -409,6 +410,125 @@ def _cp_scatter_indexer_k(
     )(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens)
 
 
+def _streamidx_topk_jax(
+    q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
+    weights: jax.Array,  # [num_tokens, H]
+    # uint8 [num_blocks, block_size_per_kv_packing, kv_packing, lkv_dim]
+    # where lkv_dim = D + 1 padded to a 128 multiple
+    cache_kv: jax.Array,
+    k_packed: jax.Array,  # uint8 [num_tokens, D + 1] fp8 k + e8m0 scale
+    seq_lens: jax.Array,  # i32 [num_seqs]
+    page_indices: jax.Array,  # i32 [num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
+    distribution: jax.Array,  # i32 [3]
+    topk: int,
+    chunk_tokens: int | None,
+    small_bucket_bq: int | None,
+    small_bucket_bkvp: int | None,
+    small_bucket_tokens: int,
+    kv_cache_mode: str | None,
+) -> tuple[jax.Array, jax.Array]:
+    """Appends this step's indexer K rows and scores the top-k cache entries.
+
+    Arguments after `distribution` are static configuration.
+
+    Returns:
+        The updated `cache_kv` and the int32 top-k indices, [num_tokens, topk].
+    """
+    writer, kv_layout = _resolve_indexer_kv_cache_mode(
+        cache_kv, k_packed, mode=kv_cache_mode
+    )
+    if writer == "xla":
+        _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
+        block_size = block_size_per_kv_packing * kv_packing
+        # Cache rows are padded to the 128-lane HBM width; pad the packed
+        # fp8+scale rows to match before scattering.
+        k_packed = jnp.pad(k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
+
+        # Insert this step's K rows into the KV cache.
+        tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
+        seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(jnp.int32)
+        q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
+        pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
+        page = jnp.where(
+            tok < cu_q_lens[-1],
+            page_indices.reshape(seq_lens.shape[0], -1)[seq_id, pos // block_size],
+            jnp.int32(2**30),
+        )
+        slot = pos % block_size
+        cache_kv = cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(
+            k_packed
+        )
+    else:
+        cache_kv = coalesced_kv_append(
+            cache_kv,
+            k_packed,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            kv_layout=kv_layout,
+        )
+
+    q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+    kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
+        q.shape[0], small_bucket_bq, small_bucket_bkvp, small_bucket_tokens
+    )
+    topk_indices = streamindex_topk(
+        q,
+        weights,
+        cache_kv,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        k=topk,
+        compression_ratio=1,
+        num_kv_pages_per_block=kv_pages_per_block,
+        num_queries_per_block=queries_per_block,
+        enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
+        kv_layout=kv_layout,
+        chunk_tokens=chunk_tokens,
+    )
+    return cache_kv, topk_indices
+
+
+def _fake_streamidx_topk(
+    q_bytes: torch.Tensor,
+    weights: torch.Tensor,
+    cache_kv: torch.Tensor,
+    k_packed: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_indices: torch.Tensor,
+    cu_q_lens: torch.Tensor,
+    distribution: torch.Tensor,
+    topk: int,
+    *args,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del weights, k_packed, seq_lens, page_indices, cu_q_lens, distribution
+    del args, kwargs
+    return torch.empty_like(cache_kv), torch.empty(
+        (q_bytes.shape[0], topk), dtype=torch.int32, device=q_bytes.device
+    )
+
+
+# Built at import, so no registration happens inside a traced forward.
+_STREAMIDX_TOPK_OP = pallas.jax_op(
+    "pallas::streamidx_topk", _streamidx_topk_jax, donate_argnums=(2,)
+)
+_STREAMIDX_TOPK_OP.register_fake(_fake_streamidx_topk)
+
+
+def _run_streamidx_topk(
+    statics: tuple[int, int | None, int | None, int | None, int, str | None],
+    *args: torch.Tensor,
+) -> torch.Tensor:
+    """Calls the indexer top-k op and writes the cache back into `args[2]`."""
+    new_cache, topk_indices = _STREAMIDX_TOPK_OP(*args, *statics)
+    args[2].copy_(new_cache)
+    return topk_indices
+
+
 @SparseAttnIndexer.register_oot
 class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
     def __init__(self, *args, **kwargs):
@@ -440,110 +560,22 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             )
 
     def _build_streamidx_op(self):
-        topk = self.topk_tokens
-        # None means unchunked. The kernel falls back to a single unpipelined
-        # pass when `max_num_tokens` is not a multiple of the chunk.
-        chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
-        small_bucket = (
+        statics = (
+            self.topk_tokens,
+            # None means unchunked. The kernel falls back to a single
+            # unpipelined pass when `max_num_tokens` is not a multiple of the
+            # chunk.
+            envs.TPU_STREAMIDX_CHUNK_TOKENS,
             envs.TPU_STREAMIDX_SMALL_BUCKET_BQ,
             envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP,
             envs.TPU_STREAMIDX_SMALL_BUCKET_TOKENS,
+            (
+                envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
+                if envs.is_indexer_kv_cache_mode_explicit()
+                else None
+            ),
         )
-        kv_cache_mode = (
-            envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
-            if envs.is_indexer_kv_cache_mode_explicit()
-            else None
-        )
-
-        def _streamidx_topk_jax(
-            q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
-            weights: jax.Array,  # [num_tokens, H]
-            # uint8 [num_blocks, block_size_per_kv_packing, kv_packing, lkv_dim]
-            # where lkv_dim = D + 1 padded to a 128 multiple
-            cache_kv: jax.Array,
-            k_packed: jax.Array,  # uint8 [num_tokens, D + 1] fp8 k + e8m0 scale
-            seq_lens: jax.Array,  # i32 [num_seqs]
-            page_indices: jax.Array,  # i32 [num_seqs * pages_per_seq]
-            cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
-            distribution: jax.Array,  # i32 [3]
-        ) -> tuple[jax.Array, jax.Array]:
-            writer, kv_layout = _resolve_indexer_kv_cache_mode(
-                cache_kv, k_packed, mode=kv_cache_mode
-            )
-            if writer == "xla":
-                _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
-                block_size = block_size_per_kv_packing * kv_packing
-                # Cache rows are padded to the 128-lane HBM width; pad the packed
-                # fp8+scale rows to match before scattering.
-                k_packed = jnp.pad(
-                    k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1]))
-                )
-
-                # Insert this step's K rows into the KV cache.
-                tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
-                seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(
-                    jnp.int32
-                )
-                q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
-                pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
-                page = jnp.where(
-                    tok < cu_q_lens[-1],
-                    page_indices.reshape(seq_lens.shape[0], -1)[
-                        seq_id, pos // block_size
-                    ],
-                    jnp.int32(2**30),
-                )
-                slot = pos % block_size
-                cache_kv = cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(
-                    k_packed
-                )
-            else:
-                cache_kv = coalesced_kv_append(
-                    cache_kv,
-                    k_packed,
-                    seq_lens,
-                    page_indices,
-                    cu_q_lens,
-                    kv_layout=kv_layout,
-                )
-
-            q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
-            kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
-                q.shape[0], *small_bucket
-            )
-            topk_indices = streamindex_topk(
-                q,
-                weights,
-                cache_kv,
-                seq_lens,
-                page_indices,
-                cu_q_lens,
-                distribution,
-                k=topk,
-                compression_ratio=1,
-                num_kv_pages_per_block=kv_pages_per_block,
-                num_queries_per_block=queries_per_block,
-                enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
-                kv_layout=kv_layout,
-                chunk_tokens=chunk_tokens,
-            )
-            return cache_kv, topk_indices
-
-        op_name = f"pallas::streamidx_topk_{self.k_cache.prefix.replace('.', '_')}"
-        jax_op = pallas.jax_op(op_name, _streamidx_topk_jax, donate_argnums=(2,))
-
-        def _fake(q_bytes, weights, cache_kv, *args, **kwargs):
-            return torch.empty_like(cache_kv), torch.empty(
-                (q_bytes.shape[0], topk), dtype=torch.int32, device=q_bytes.device
-            )
-
-        jax_op.register_fake(_fake)
-
-        def op(*args):
-            new_cache, topk_indices = jax_op(*args)
-            args[2].copy_(new_cache)
-            return topk_indices
-
+        op = functools.partial(_run_streamidx_topk, statics)
         self._streamidx_op = op
         return op
 

@@ -43,7 +43,7 @@ import torch
 from vllm.config import get_current_vllm_config
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
-from vllm_torchtpu.layers.adapter import attention, cp_attention
+from vllm_torchtpu.layers.adapter import attention
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -196,7 +196,6 @@ def _run_adapter(args, rank, scope, monkeypatch, *, dcp_size, own_q_heads):
         "_get_dcp_group",
         lambda: SimpleNamespace(world_size=dcp_size, rank_in_group=rank),
     )
-    monkeypatch.setattr(cp_attention, "_DCP_KERNEL_REGISTRY", {})
     impl = attention.PallasBatchedRPAAttentionBackendImpl(
         num_heads=own_q_heads,
         head_size=_HEAD_DIM,

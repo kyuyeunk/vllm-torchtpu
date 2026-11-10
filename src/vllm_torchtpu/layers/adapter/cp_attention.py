@@ -142,19 +142,6 @@ def _pallas_rpa_kernel_dcp(
 # Kernel op builder
 # ---------------------------------------------------------------------------
 
-# Class-level registry shared across all PallasAttentionBackendImpl instances.
-# Keyed by config tuple; values are the (cache_kernel_impl, new_kernel_impl)
-# pair so layers with identical configs share one set of compiled ops.
-_DCP_KERNEL_REGISTRY: dict = {}
-_DCP_KERNEL_INSTANCE_COUNTER = 0
-
-
-def _alloc_instance_id() -> int:
-    global _DCP_KERNEL_INSTANCE_COUNTER
-    _id = _DCP_KERNEL_INSTANCE_COUNTER
-    _DCP_KERNEL_INSTANCE_COUNTER += 1
-    return _id
-
 
 def _fake_dcp(kv_cache: torch.Tensor, query: torch.Tensor, *args, **kwargs):
     lse = torch.empty(
@@ -163,27 +150,29 @@ def _fake_dcp(kv_cache: torch.Tensor, query: torch.Tensor, *args, **kwargs):
     return torch.empty_like(kv_cache), torch.empty_like(query), lse
 
 
-def _build_dcp_kernel_op(op_name: str, fn):
-    """Wrap fn (a _pallas_rpa_kernel_dcp partial) as a callable kernel.
+# kv_cache (arg 0) is donated so XLA aliases the returned cache onto the input
+# pool instead of materializing a full-sized copy. CACHE_ONLY returns it
+# unchanged; NEW_TOKENS_ONLY writes the new tokens into it. The op is built at
+# import, so no registration happens inside a traced forward.
+_DCP_KERNEL_OP = pallas.jax_op(
+    "pallas::rpa_dcp",
+    _pallas_rpa_kernel_dcp,
+    donate_argnums=(0,),
+    mesh=None,
+    input_partition_specs=None,
+)
+_DCP_KERNEL_OP.register_fake(_fake_dcp)
 
-    kv_cache (arg 0) is donated: CACHE_ONLY never mutates it, so its
-    returned new_kv_cache is identical to the input; NEW_TOKENS_ONLY writes
-    the new tokens into it. Either way donation lets XLA alias the output
-    onto the input pool instead of materializing a second, full-sized copy.
-    The kv_cache.copy_ below keeps the caller's tensor validly bound to
-    that (possibly aliased) result and compiles to a no-op for CACHE_ONLY.
+
+def _dcp_kernel_impl(kv_cache, *args, **static_kwargs):
+    """Runs one DCP pass and writes the returned cache back into `kv_cache`.
+
+    The copy keeps the caller's tensor bound to the possibly aliased result and
+    compiles to a no-op for CACHE_ONLY.
     """
-    op = pallas.jax_op(
-        op_name, fn, donate_argnums=(0,), mesh=None, input_partition_specs=None
-    )
-    op.register_fake(_fake_dcp)
-
-    def kernel_impl(kv_cache, *args, **kwargs):
-        new_kv_cache, output, lse = op(kv_cache, *args, **kwargs)
-        kv_cache.copy_(new_kv_cache)
-        return output, lse
-
-    return kernel_impl
+    new_kv_cache, output, lse = _DCP_KERNEL_OP(kv_cache, *args, **static_kwargs)
+    kv_cache.copy_(new_kv_cache)
+    return output, lse
 
 
 def build_dcp_kernels(
@@ -200,7 +189,10 @@ def build_dcp_kernels(
     ),
     decode_query_size: int = 1,
 ) -> tuple:
-    """Build and cache the CACHE_ONLY and NEW_TOKENS_ONLY jax_ops.
+    """Binds the CACHE_ONLY and NEW_TOKENS_ONLY passes of the DCP op.
+
+    `q_scale`, `k_scale` and `v_scale` are ignored; the returned kernels take
+    them per call. `cp_rank` is static, so each rank compiles its own program.
 
     Returns:
         (cache_kernel, new_kernel) where each is callable as
@@ -208,62 +200,30 @@ def build_dcp_kernels(
                  query_start_loc, request_distribution, q_scale, k_scale,
                  v_scale) -> (output [T,H,D], lse [T,H])``
     """
+    del q_scale, k_scale, v_scale
     # The adapter uses batched_rpa's equivalent enum. Normalize here so both
-    # entry points bind LONGCTX's enum and share ops for the same layout.
+    # entry points pass LONGCTX's enum and hit the same compiled program.
     kv_layout = _batched_rpa_configs.KVLayout(kv_layout)
-    base_key = (
-        sliding_window,
-        sm_scale,
-        logits_soft_cap,
-        q_scale,
-        k_scale,
-        v_scale,
-        cp_group_size,
-        cp_rank,
-        kv_layout,
-        decode_query_size,
+    static_kwargs = dict(
+        sliding_window=sliding_window,
+        sm_scale=sm_scale,
+        soft_cap=logits_soft_cap,
+        cp_group_size=cp_group_size,
+        cp_rank_val=cp_rank,
+        kv_layout=kv_layout,
+        decode_query_size=decode_query_size,
     )
-    cache_key = ("dcp_cache", *base_key)
-    new_key = ("dcp_new", *base_key)
-
-    cached_cache = _DCP_KERNEL_REGISTRY.get(cache_key)
-    cached_new = _DCP_KERNEL_REGISTRY.get(new_key)
-    if cached_cache is not None and cached_new is not None:
-        return cached_cache, cached_new
-
-    if cached_cache is None:
-        fn = functools.partial(
-            _pallas_rpa_kernel_dcp,
-            sliding_window=sliding_window,
-            sm_scale=sm_scale,
-            soft_cap=logits_soft_cap,
-            cp_group_size=cp_group_size,
-            cp_rank_val=cp_rank,
-            attention_scope=_batched_rpa_configs.AttentionScope.CACHE_ONLY,
-            kv_layout=kv_layout,
-            decode_query_size=decode_query_size,
-        )
-        cached_cache = _DCP_KERNEL_REGISTRY[cache_key] = _build_dcp_kernel_op(
-            f"pallas::rpa_dcp_cache_{_alloc_instance_id()}", fn
-        )
-
-    if cached_new is None:
-        fn = functools.partial(
-            _pallas_rpa_kernel_dcp,
-            sliding_window=sliding_window,
-            sm_scale=sm_scale,
-            soft_cap=logits_soft_cap,
-            cp_group_size=cp_group_size,
-            cp_rank_val=cp_rank,
-            attention_scope=_batched_rpa_configs.AttentionScope.NEW_TOKENS_ONLY,
-            kv_layout=kv_layout,
-            decode_query_size=decode_query_size,
-        )
-        cached_new = _DCP_KERNEL_REGISTRY[new_key] = _build_dcp_kernel_op(
-            f"pallas::rpa_dcp_new_{_alloc_instance_id()}", fn
-        )
-
-    return cached_cache, cached_new
+    cache_kernel = functools.partial(
+        _dcp_kernel_impl,
+        attention_scope=_batched_rpa_configs.AttentionScope.CACHE_ONLY,
+        **static_kwargs,
+    )
+    new_kernel = functools.partial(
+        _dcp_kernel_impl,
+        attention_scope=_batched_rpa_configs.AttentionScope.NEW_TOKENS_ONLY,
+        **static_kwargs,
+    )
+    return cache_kernel, new_kernel
 
 
 # ---------------------------------------------------------------------------

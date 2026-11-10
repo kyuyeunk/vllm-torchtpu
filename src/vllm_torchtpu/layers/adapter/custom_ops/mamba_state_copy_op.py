@@ -74,12 +74,13 @@ def copy_mamba_state_blocks(
 copy_pool_blocks = copy_mamba_state_blocks
 
 
+@functools.cache
 def _copy_step_budget_bytes() -> int:
     """Returns the per-step VMEM byte budget for `copy_blocks`.
 
     Half of the core's VMEM is left to the compiler and the rest is divided
-    across four block buffers (double-buffered input and output). Evaluated at
-    trace time: `get_tpu_info()` initializes the PJRT runtime.
+    across four block buffers (double-buffered input and output). Evaluated
+    lazily because `get_tpu_info()` initializes the PJRT runtime.
     """
     return pltpu.get_tpu_info().vmem_capacity_bytes // 2 // 4
 
@@ -99,9 +100,15 @@ def _row_copy_step_rows(rows: int, kernel_block_bytes: int, budget_bytes: int) -
     return max(fitting)
 
 
-@functools.cache
-def _row_copy_fn(num_pools: int, split: int, step_rows: int):
-    """Compiles the whole-row copy `pool[dst[i]] = pool[src[i]]` for one geometry.
+def _row_copy(
+    pool: jax.Array,
+    src: jax.Array,
+    dst: jax.Array,
+    num_pools: int,
+    split: int,
+    step_rows: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Copies whole rows, `pool[dst[i]] = pool[src[i]]`, for one geometry.
 
     A manager row of the `(num_blocks, num_pools * split, *page)` pool packs
     `split` kernel blocks for each of the `num_pools` regions. Each
@@ -111,27 +118,27 @@ def _row_copy_fn(num_pools: int, split: int, step_rows: int):
     rows = num_pools * split
     assert rows % step_rows == 0, (rows, step_rows)
     steps = rows // step_rows
+    assert pool.shape[1] == rows, (pool.shape, rows)
+    view = pool.reshape(pool.shape[0] * steps, step_rows, *pool.shape[2:])
+    offsets = jnp.arange(steps, dtype=src.dtype)
+    src_steps = (src[:, None] * steps + offsets).reshape(-1)
+    dst_steps = (dst[:, None] * steps + offsets).reshape(-1)
+    new_pool = pool_adapters.copy_blocks(view, src_steps, dst_steps)
+    return new_pool.reshape(pool.shape), src[0]
 
-    def _rows_fn(
-        pool: jax.Array, src: jax.Array, dst: jax.Array
-    ) -> tuple[jax.Array, jax.Array]:
-        assert pool.shape[1] == rows, (pool.shape, rows)
-        view = pool.reshape(pool.shape[0] * steps, step_rows, *pool.shape[2:])
-        offsets = jnp.arange(steps, dtype=src.dtype)
-        src_steps = (src[:, None] * steps + offsets).reshape(-1)
-        dst_steps = (dst[:, None] * steps + offsets).reshape(-1)
-        new_pool = pool_adapters.copy_blocks(view, src_steps, dst_steps)
-        return new_pool.reshape(pool.shape), src[0]
 
-    op = pallas.jax_op(
-        f"pallas::mamba_state_row_copy_{num_pools}x{split}s{step_rows}",
-        _rows_fn,
-        donate_argnums=(0,),
-    )
+_row_copy_op = pallas.jax_op(
+    "pallas::mamba_state_row_copy", _row_copy, donate_argnums=(0,)
+)
+
+
+@functools.cache
+def _row_copy_fn(num_pools: int, split: int, step_rows: int):
+    """Returns the compiled whole-row copy for one geometry."""
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def run(pool: torch.Tensor, src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-        new_pool, marker = op(pool, src, dst)
+        new_pool, marker = _row_copy_op(pool, src, dst, num_pools, split, step_rows)
         pool.copy_(new_pool)
         return marker
 

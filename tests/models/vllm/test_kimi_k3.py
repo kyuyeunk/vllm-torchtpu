@@ -1465,43 +1465,46 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     group = SimpleNamespace(all_reduce=lambda x: x)
     monkeypatch.setattr(kimi_attention, "get_tp_group", lambda: group)
 
-    def jax_op(name, function, donate_argnums=()):
-        del function, donate_argnums
-        assert "dispatched" in name
+    def implementation(
+        mixed_qkv: torch.Tensor,
+        raw_gate: torch.Tensor,
+        beta: torch.Tensor,
+        output_gate: torch.Tensor,
+        conv_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        conv_weight: torch.Tensor,
+        a_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        norm_weight: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        state_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        window_distribution: torch.Tensor,
+        slot_read_offsets: torch.Tensor,
+        *,
+        lower_bound: float | None,
+        eps: float,
+        num_spec_tokens: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del raw_gate, beta, output_gate, a_log, dt_bias, norm_weight
+        del conv_weight, distribution, window_distribution
+        del slot_read_offsets, lower_bound, eps, num_spec_tokens
+        del query_start_loc, state_indices, seq_lens
+        num_heads, head_dim = recurrent_state.shape[1:3]
+        output = mixed_qkv[:, : num_heads * head_dim]
+        return (
+            output.view(-1, num_heads, head_dim).clone(),
+            conv_state + 1,
+            recurrent_state + 1,
+        )
 
-        def implementation(
-            mixed_qkv: torch.Tensor,
-            raw_gate: torch.Tensor,
-            beta: torch.Tensor,
-            output_gate: torch.Tensor,
-            conv_state: torch.Tensor,
-            recurrent_state: torch.Tensor,
-            conv_weight: torch.Tensor,
-            a_log: torch.Tensor,
-            dt_bias: torch.Tensor,
-            norm_weight: torch.Tensor,
-            query_start_loc: torch.Tensor,
-            state_indices: torch.Tensor,
-            seq_lens: torch.Tensor,
-            distribution: torch.Tensor,
-            window_distribution: torch.Tensor,
-            slot_read_offsets: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            del raw_gate, beta, output_gate, a_log, dt_bias, norm_weight
-            del conv_weight, distribution, window_distribution
-            del slot_read_offsets
-            del query_start_loc, state_indices, seq_lens
-            num_heads, head_dim = recurrent_state.shape[1:3]
-            output = mixed_qkv[:, : num_heads * head_dim]
-            return (
-                output.view(-1, num_heads, head_dim).clone(),
-                conv_state + 1,
-                recurrent_state + 1,
-            )
-
-        return torch.library.custom_op(name, mutates_args=())(implementation)
-
-    monkeypatch.setattr(kimi_custom_ops.pallas, "jax_op", jax_op)
+    # The real op is registered at import, so patch the module-level op itself.
+    fake_op = torch.library.custom_op(
+        "pallas::kimi_dispatched_kda_fused_test", mutates_args=()
+    )(implementation)
+    fake_op.register_fake(kimi_custom_ops._fake_dispatched)
+    monkeypatch.setattr(kimi_custom_ops, "_dispatched_kda_op", fake_op)
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
     nn.Module.__init__(layer)
     layer.fused_qkvb_proj = _Projection(14)

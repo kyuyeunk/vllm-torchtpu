@@ -1375,8 +1375,11 @@ def test_resolve_indexer_kv_cache_mode_and_fallback_warning(monkeypatch, caplog)
 
 
 def test_sparse_attn_indexer_streamidx_op_xla_has_sal_equivalence(monkeypatch):
-    """_build_streamidx_op produces bit-identical cache updates and top-k args
-    across xla, has, and sal."""
+    """Checks the indexer top-k op is bit-identical across xla, has and sal.
+
+    The op's JAX function runs with the static arguments `_build_streamidx_op`
+    binds and must produce the same cache updates and top-k indices per mode.
+    """
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -1388,19 +1391,7 @@ def test_sparse_attn_indexer_streamidx_op_xla_has_sal_equivalence(monkeypatch):
     )
     from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
 
-    # Capture the inner JAX function passed to pallas.jax_op and run the writer
-    # in interpret mode when executing on CPU so the full HAS/SAL paths run.
-    captured = {}
-
-    def _fake_jax_op(name, fn, donate_argnums=()):
-        captured["name"] = name
-        captured["fn"] = fn
-        captured["donate_argnums"] = donate_argnums
-        op = MagicMock(side_effect=fn)
-        op.register_fake = MagicMock()
-        return op
-
-    monkeypatch.setattr(mla_attention_op.pallas, "jax_op", _fake_jax_op)
+    # Run the writer in interpret mode on CPU so the full HAS/SAL paths run.
     monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
     orig_append = kv_cache_append.coalesced_kv_append
     monkeypatch.setattr(
@@ -1470,9 +1461,8 @@ def test_sparse_attn_indexer_streamidx_op_xla_has_sal_equivalence(monkeypatch):
         )
         indexer.topk_tokens = topk
         indexer.k_cache = SimpleNamespace(prefix="model.layers.0.indexer")
-        indexer._build_streamidx_op()
-        assert captured["donate_argnums"] == (2,)
-        new_cache, topk_out = captured["fn"](
+        statics = indexer._build_streamidx_op().args[0]
+        new_cache, topk_out = mla_attention_op._streamidx_topk_jax(
             q_bytes,
             weights,
             jnp.copy(init_cache),
@@ -1481,6 +1471,7 @@ def test_sparse_attn_indexer_streamidx_op_xla_has_sal_equivalence(monkeypatch):
             page_indices,
             cu_q_lens,
             distribution,
+            *statics,
         )
         results[mode] = (new_cache, np.asarray(topk_out))
 

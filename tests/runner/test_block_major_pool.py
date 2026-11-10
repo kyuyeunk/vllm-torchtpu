@@ -18,6 +18,7 @@ for both layer-outermost and block-outermost vLLM placements, merged pool
 materialization, and Raiden transfer/offload contract registration.
 """
 
+import functools
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -647,18 +648,15 @@ def test_register_kv_caches_canonicalizes_the_merged_pool():
 
 
 def _row_copy_rows_fn(num_pools, split, step_rows):
-    """Build `_rows_fn` for the geometry without registering a torch op."""
+    """Returns `_row_copy` bound to one geometry, bypassing the torch op."""
     from vllm_torchtpu.layers.adapter.custom_ops import mamba_state_copy_op
 
-    captured = {}
-
-    def fake_jax_op(_name, fn, **_kwargs):
-        captured["rows_fn"] = fn
-        return fn
-
-    with patch.object(mamba_state_copy_op.pallas, "jax_op", fake_jax_op):
-        mamba_state_copy_op._row_copy_fn.__wrapped__(num_pools, split, step_rows)
-    return captured["rows_fn"]
+    return functools.partial(
+        mamba_state_copy_op._row_copy,
+        num_pools=num_pools,
+        split=split,
+        step_rows=step_rows,
+    )
 
 
 def _gather_copy_blocks(pool, src, dst):
