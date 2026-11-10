@@ -49,7 +49,7 @@ from torch_tpu._internal.batch_transfer import (
     batch_transfer_h2d,
     batch_transfer_h2d_sync,
 )
-from vllm.config import VllmConfig
+from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorRole,
@@ -70,6 +70,7 @@ from vllm.distributed.parallel_state import (
 from vllm.utils.math_utils import round_down
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
 from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
@@ -110,6 +111,7 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     derive_gdn_head_geometry,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.pool_layout import pool_layout
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -627,13 +629,15 @@ def _reshard_store_mode() -> bool:
     return str(tpu_envs.TPU_RAIDEN_RESHARD_IMPL).strip().lower() == "store"
 
 
-def _raiden_seq_on_lane_layout() -> bool:
+def _raiden_seq_on_lane_layout(cache_config: CacheConfig) -> bool:
     """Decision D1: the batched-RPA seq-along-lane FA pool (either kernel
     flag) is declared and lowered by the stand-alone ``raiden/seq_on_lane.py``
-    module; the token-major path is untouched."""
-    from vllm import envs as vllm_envs
+    module; the token-major path is untouched.
 
-    return vllm_envs.VLLM_KV_CACHE_LAYOUT == "HND"
+    Reads the layout vLLM resolved once (``LBHNC``, the legacy ``HND``), which
+    raises before it is resolved; not the environment variable, which is only
+    one input to that resolution."""
+    return cache_config.get_resolved_kv_cache_layout() is KVCacheLayout.LBHNC
 
 
 def _raiden_dst_shards() -> int:
@@ -2950,7 +2954,7 @@ class TPURaidenConnectorWorker:
                 ),
                 conv_kernel_size=self._model_config_int("linear_conv_kernel_dim", 4),
             )
-            if _raiden_seq_on_lane_layout():
+            if _raiden_seq_on_lane_layout(self.vllm_config.cache_config):
                 if runner.bm_pool_layout is not None:
                     raise NotImplementedError(
                         "VLLM_TPU_BLOCK_MAJOR_KV=1: the seq-on-lane pool "
@@ -3487,19 +3491,20 @@ class TPURaidenConnectorWorker:
 
     def _measure_stage3_layout(self, manifest: Any) -> tuple[str, dict[str, Any], int]:
         """Layout identity and page geometry of the admitted model."""
+        pool = pool_layout(self.vllm_config.cache_config)
         if _use_raiden_dsv4_admission():
             fingerprint, payload = self._measure_raiden_dsv4_layout(manifest)
             # DSv4's roles page at different sizes, so the page_tokens the
             # controller registers is nominal. The real per-tag geometry
             # travels in the fingerprint and in each span registration.
-            page_tokens = int(self.vllm_config.cache_config.block_size)
+            page_tokens = pool.block_size
             return fingerprint, payload, page_tokens
         if self._stage3_kimi:
             from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (  # noqa: E501
                 measured_kimi_k3_layout_fingerprint,
             )
 
-            page_tokens = int(self.vllm_config.cache_config.block_size)
+            page_tokens = pool.block_size
             config = self.vllm_config.model_config.hf_text_config
             total_heads = int(config.linear_attn_config.get("num_heads", 0))
             source_tp = int(tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM)
@@ -3522,12 +3527,12 @@ class TPURaidenConnectorWorker:
             )
             return fingerprint, payload, page_tokens
         if _use_raiden_glm_admission():
-            page_tokens = int(self.vllm_config.cache_config.block_size)
+            page_tokens = pool.block_size
             fingerprint, payload = self._measure_raiden_glm_layout(
                 manifest, page_tokens
             )
             return fingerprint, payload, page_tokens
-        if _raiden_seq_on_lane_layout():
+        if _raiden_seq_on_lane_layout(self.vllm_config.cache_config):
             from vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane import (  # noqa: E501
                 measured_sol_layout_fingerprint,
                 sol_fa_page_tokens,
@@ -3961,7 +3966,10 @@ class TPURaidenConnectorWorker:
         tp_size = int(parallel_config.tensor_parallel_size or self.tp_size)
         dp_size = int(parallel_config.data_parallel_size or 1)
         pp_size = _pipeline_parallel_size(self.vllm_config)
-        if _raiden_seq_on_lane_layout() and dp_size == pp_size == 1:
+        if (
+            _raiden_seq_on_lane_layout(self.vllm_config.cache_config)
+            and dp_size == pp_size == 1
+        ):
             dcp_size = int(parallel_config.decode_context_parallel_size)
             if dcp_size <= 0 or tp_size % dcp_size:
                 raise ValueError("DCP size must divide TP size")
@@ -3978,7 +3986,7 @@ class TPURaidenConnectorWorker:
             # (google-pytorch/torch_tpu#4387, for a group made standalone).
             dcp_size = int(parallel_config.decode_context_parallel_size)
             if (
-                _raiden_seq_on_lane_layout()
+                _raiden_seq_on_lane_layout(self.vllm_config.cache_config)
                 and tp_size == 1
                 and dp_size == 1
                 and dcp_size == 1
@@ -4374,7 +4382,7 @@ class TPURaidenConnectorWorker:
             local_ids = scheduler_ids[:owned_blocks]
             fa_pool_spans = []
             dst_shards = _raiden_dst_shards()
-            if _raiden_seq_on_lane_layout():
+            if _raiden_seq_on_lane_layout(self.vllm_config.cache_config):
                 from vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane import (  # noqa: E501
                     lower_fa_spans_sol,
                     sol_fa_geometry_from_manifest,
@@ -5210,7 +5218,10 @@ class TPURaidenConnectorWorker:
                 )
 
         physical_granule = 1024
-        if _raiden_seq_on_lane_layout() and not self._stage3_kimi:
+        if (
+            _raiden_seq_on_lane_layout(self.vllm_config.cache_config)
+            and not self._stage3_kimi
+        ):
             if aliased_raw and payload.get("fa_kv_layout") != SOL_LAYOUT_TOKEN:
                 raise RuntimeError("HND GDN spans require an HND layout fingerprint")
             geometry = sol_fa_geometry_from_manifest(self._raiden_manifest)
@@ -5786,7 +5797,7 @@ class TPURaidenConnectorWorker:
 
     def _stage3_fa_skip_bytes(self, skip_tokens: int) -> int:
         """Use the same destination byte space for inline and queued submits."""
-        if _raiden_seq_on_lane_layout():
+        if _raiden_seq_on_lane_layout(self.vllm_config.cache_config):
             from vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane import (  # noqa: E501
                 sol_fa_geometry_from_manifest,
                 sol_fa_skip_bytes,

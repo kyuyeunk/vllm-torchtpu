@@ -33,7 +33,7 @@ from .test_tpu_connector import (
 
 
 def _environment(monkeypatch, pcp=4, tp=2, dtp=8):
-    monkeypatch.setattr(tc, "_raiden_seq_on_lane_layout", lambda: True)
+    monkeypatch.setattr(tc, "_raiden_seq_on_lane_layout", lambda _cache_config: True)
     monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
     monkeypatch.setenv("TPU_RAIDEN_TRANSFER_PARALLELISM", str(pcp * tp))
     monkeypatch.setenv("TPU_RAIDEN_DST_SHARDS", str(dtp))
@@ -316,10 +316,12 @@ def test_hnd_pd_topology_admission(monkeypatch, producer, pcp, tp, dcp, name):
     assert len(ranks) == pcp * tp
 
 
-@pytest.mark.parametrize("layout,dcp", [("NHD", 8), ("HND", 3)])
-def test_pd_topology_rejects_invalid_layout_or_dcp(monkeypatch, layout, dcp):
+@pytest.mark.parametrize("seq_on_lane,dcp", [(False, 8), (True, 3)])
+def test_pd_topology_rejects_invalid_layout_or_dcp(monkeypatch, seq_on_lane, dcp):
     _environment(monkeypatch)
-    monkeypatch.setattr(tc, "_raiden_seq_on_lane_layout", lambda: layout == "HND")
+    monkeypatch.setattr(
+        tc, "_raiden_seq_on_lane_layout", lambda _cache_config: seq_on_lane
+    )
     worker = _make_raiden_worker(is_producer=False, tp_size=8, tp_rank=0, dp_size=1)
     worker.vllm_config.parallel_config.decode_context_parallel_size = dcp
     with pytest.raises(ValueError):
@@ -443,7 +445,7 @@ def test_pp_pcp_producer_topology_rejects_unsupported_shapes(
     monkeypatch, pp, pcp, tp, hnd
 ):
     worker = _pp_pcp_worker(monkeypatch, pp=pp, pcp=pcp, tp=tp)
-    monkeypatch.setattr(tc, "_raiden_seq_on_lane_layout", lambda: hnd)
+    monkeypatch.setattr(tc, "_raiden_seq_on_lane_layout", lambda _cache_config: hnd)
     with pytest.raises(ValueError, match=r"pp\{2,4,8\}pcp\{N\}_prefill"):
         worker._raiden_qwen35_admission_topology()
 

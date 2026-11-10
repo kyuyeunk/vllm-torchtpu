@@ -159,6 +159,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
+from vllm_torchtpu.pool_layout import pool_layout
 from vllm_torchtpu.runner import greedy_top_tokens, spec_boundary_state
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
@@ -953,7 +954,11 @@ class TPUModelRunner(GPUModelRunner):
 
         # Compile bucket + padding (TPU AOT compile rounds inputs up).
         self.sliding_window = self.model_config.get_sliding_window()
-        self.block_size = cache_config.block_size
+        # Not final yet: the worker sets the pool's block size after
+        # load_model (`TpuPlatform.update_block_size_for_backend`). This
+        # placeholder sizes only the placeholder block table below; the
+        # pool's value is `self.block_size`, which raises until then.
+        placeholder_block_size = cache_config.block_size
         self.most_model_len = envs.VLLM_TPU_MOST_MODEL_LEN
         self._fast_token_substitution: bool = bool(
             envs.VLLM_TPU_FAST_TOKEN_SUBSTITUTION
@@ -964,7 +969,7 @@ class TPUModelRunner(GPUModelRunner):
         # (such as spec-decode warmup block count `nblk`) strictly respect the
         # actual BlockTable allocation limits, preventing bounds mismatch errors
         # (e.g., broadcasting shape (8,) into capacity (5,)).
-        self.max_num_blocks_per_req = cdiv(self.max_model_len, self.block_size)
+        self.max_num_blocks_per_req = cdiv(self.max_model_len, placeholder_block_size)
         if (
             hasattr(self, "input_batch")
             and self.input_batch is not None
@@ -977,7 +982,7 @@ class TPUModelRunner(GPUModelRunner):
             except (IndexError, TypeError, AttributeError, KeyError):
                 pass
         self.num_blocks_per_most_len_req = (
-            cdiv(self.most_model_len, self.block_size)
+            cdiv(self.most_model_len, placeholder_block_size)
             if self.most_model_len is not None
             else None
         )
@@ -1069,7 +1074,8 @@ class TPUModelRunner(GPUModelRunner):
         self._attention_capacity: dict[
             tuple[int, int], dict[str, tuple[int, int, int]]
         ] = {}
-        self._refresh_smem_request_caps()
+        self._caps_block_size: int = placeholder_block_size
+        self._refresh_smem_request_caps(block_size=placeholder_block_size)
 
         self.sample_from_logits_func = self.sample_from_logits
 
@@ -8584,23 +8590,28 @@ class TPUModelRunner(GPUModelRunner):
             return cast(type[Any], PallasAttentionBackend)
         raise NotImplementedError(f"Unsupported KV cache spec: {type(kv_cache_spec)!r}")
 
+    @property
+    def block_size(self) -> int:
+        """The pool's manager block size; raises until the worker finalizes it."""
+        return pool_layout(self.cache_config).block_size
+
     def _refresh_smem_request_caps(
-        self, kv_cache_config: KVCacheConfig | None = None
+        self,
+        kv_cache_config: KVCacheConfig | None = None,
+        *,
+        block_size: int | None = None,
     ) -> None:
         """Use the widest attention table each kernel invocation will prefetch.
 
         Startup initially has a placeholder table. Refresh after vLLM installs
         the final cache groups so DCP and kernel block splitting are reflected.
         """
-        # `TpuPlatform.update_block_size_for_backend` may raise
-        # `cache_config.block_size` after `__init__` captured it (e.g. hybrid
-        # attention+SSM models); re-sync so the caps below use the finalized
-        # value. It is unset until the platform finalizes it.
-        cache_config = getattr(self, "cache_config", None)
-        block_size = getattr(cache_config, "block_size", None)
-        block_size_changed = block_size is not None and block_size != self.block_size
-        if block_size_changed:
-            self.block_size = block_size
+        # `__init__` passes its placeholder `block_size`; every later caller
+        # runs after the worker finalized the pool and reads the record.
+        if block_size is None:
+            block_size = self.block_size
+        block_size_changed = block_size != self._caps_block_size
+        self._caps_block_size = block_size
         groups = (
             kv_cache_config
             if kv_cache_config is not None
@@ -8625,7 +8636,7 @@ class TPUModelRunner(GPUModelRunner):
         # only when the block size moved, so an unchanged size keeps the width
         # the table and `block_table_cpu` were actually allocated with.
         if not attention_groups and block_size_changed:
-            self.max_num_blocks_per_req = cdiv(self.max_model_len, self.block_size)
+            self.max_num_blocks_per_req = cdiv(self.max_model_len, block_size)
 
         def widest_table(model_len: int | None) -> int:
             if attention_groups:
@@ -8641,7 +8652,7 @@ class TPUModelRunner(GPUModelRunner):
             # Before final specs are available, retain the conservative budget.
             if model_len is None:
                 return self.max_num_blocks_per_req
-            return cdiv(model_len, self.block_size)
+            return cdiv(model_len, block_size)
 
         self.num_reqs_max_model_len = min(
             PallasAttentionBackend.get_max_num_seqs_for_pages(widest_table(None)),

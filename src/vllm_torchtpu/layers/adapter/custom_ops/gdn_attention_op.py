@@ -70,6 +70,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.pool_layout import pool_layout
 from vllm_torchtpu.utils import fresh_buffer
 
 _GDN_PCP_AXIS_NAME = "pcp"
@@ -820,11 +821,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 kernel_size=kernel_size,
                 # Manager block size: the pool may be born at a smaller
                 # kernel granularity for backends with a fixed kernel
-                # block. Read lazily at first call: the executor finalizes
-                # cache_config.block_size only AFTER load_model, and hybrid
-                # models construct GDN layers before the first
-                # full-attention layer would ever see the adjusted value.
-                pool_block_tokens=vllm_config.cache_config.block_size,
+                # block. Final only after load_model; read at call time.
+                pool_block_tokens=pool_layout(vllm_config.cache_config).block_size,
                 recurrent_state_dtype=recurrent_state_dtype,
                 num_spec_tokens=num_spec_tokens,
             )
@@ -985,7 +983,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 d_k=d_k,
                 d_v=d_v,
                 kernel_size=kernel_size,
-                pool_block_tokens=vllm_config.cache_config.block_size,
+                pool_block_tokens=pool_layout(vllm_config.cache_config).block_size,
                 pcp_size=pcp_size,
                 interleave_size=interleave_size,
                 recurrent_state_dtype=recurrent_state_dtype,

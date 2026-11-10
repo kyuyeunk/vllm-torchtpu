@@ -40,6 +40,7 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import (
     unified_kv_layout_enabled,
     update_tpu_block_size_and_slot_config,
 )
+from vllm_torchtpu.pool_layout import mark_page_final
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -1315,6 +1316,7 @@ class TpuPlatform(Platform):
         )
 
         if backend_cls is None:
+            mark_page_final(cache_config)
             return
 
         # `get_supported_kernel_block_sizes` and
@@ -1365,6 +1367,9 @@ class TpuPlatform(Platform):
                 )
                 cache_config.block_size = min_page_size  # type: ignore[assignment]
             logger.info("Using KV cache block size: %s", cache_config.block_size)
+        # The page is final here: `pool_layout(cache_config).block_size`
+        # raises until this line and reads `cache_config.block_size` after it.
+        mark_page_final(cache_config)
 
     @classmethod
     def is_pin_memory_available(cls):
