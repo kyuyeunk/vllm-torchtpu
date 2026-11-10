@@ -21,6 +21,12 @@ from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+from vllm_torchtpu.layers.adapter.jax_op_spec import (
+    dim,
+    jax_op_with_fake,
+    like_dtype,
+    spec,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -125,22 +131,11 @@ def _quantized_matmul_jax(
     return xla_quantized_matmul(x, w_q, w_s, quantize_activation=not use_w8a16)
 
 
-_quantized_matmul_op = pallas.jax_op(
-    "pallas::quantized_matmul_kernel", _quantized_matmul_jax
+_quantized_matmul_op = jax_op_with_fake(
+    "pallas::quantized_matmul_kernel",
+    _quantized_matmul_jax,
+    out=spec(shape=(dim("x", 0), dim("w_q", -1)), dtype=like_dtype("x")),
 )
-
-
-def _fake_quantized_matmul(
-    x: torch.Tensor,
-    w_q: torch.Tensor,
-    w_s: torch.Tensor,
-    w8a16_max_rows: int = 0,
-) -> torch.Tensor:
-    del w_s, w8a16_max_rows
-    return torch.empty(x.shape[0], w_q.shape[-1], dtype=x.dtype, device=x.device)
-
-
-_quantized_matmul_op.register_fake(_fake_quantized_matmul)
 
 
 def quantized_matmul(

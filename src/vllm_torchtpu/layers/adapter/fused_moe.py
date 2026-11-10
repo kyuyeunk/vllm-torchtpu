@@ -20,6 +20,7 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.layers.adapter.jax_op_spec import jax_op_with_fake, like
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_op_fn,
     quantize_to_native_fp4_kmajor,
@@ -36,16 +37,9 @@ _requant_kmajor_fp4_op = pallas.jax_op(
 _quantize_native_fp4_kmajor_op = pallas.jax_op(
     "pallas::nvfp4_quantize_native_kmajor", quantize_to_native_fp4_kmajor
 )
-
-
-def _fake_fused_moe(hidden_states, *args, **kwargs):
-    # vLLM traces hidden_states with a dynamic token dimension, which the
-    # default fake rejects.
-    return torch.empty_like(hidden_states)
-
-
-_fused_moe_op = pallas.jax_op("pallas::fused_moe_gmm", fused_moe_op_fn)
-_fused_moe_op.register_fake(_fake_fused_moe)
+_fused_moe_op = jax_op_with_fake(
+    "pallas::fused_moe_gmm", fused_moe_op_fn, out=like("hidden_states")
+)
 
 
 def _resolve_activation_name(activation: Any) -> str:

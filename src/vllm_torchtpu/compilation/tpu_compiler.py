@@ -272,6 +272,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/cp_attention.py",
     "vllm_torchtpu/layers/adapter/custom_ops",
     "vllm_torchtpu/layers/adapter/fused_moe.py",
+    # Registers jax_op custom ops and their fakes from declared output specs.
+    "vllm_torchtpu/layers/adapter/jax_op_spec.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a
     # torch custom-op boundary Dynamo cannot see through, and the kernel they
     # export is chosen from their source, so an edit here has to invalidate

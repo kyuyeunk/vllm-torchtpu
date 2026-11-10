@@ -19,24 +19,21 @@ elsewhere as the identical plain-torch algorithm in
 """
 
 import torch
-from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.router_topk import router_topk
+from vllm_torchtpu.layers.adapter.jax_op_spec import dim, jax_op_with_fake, spec
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
-
-
-def _fake_router_topk(scores: torch.Tensor, topk: int):
-    rows = scores.shape[0]
-    return (
-        torch.empty((rows, topk), dtype=torch.float32, device=scores.device),
-        torch.empty((rows, topk), dtype=torch.int32, device=scores.device),
-    )
-
 
 # Registered at import, not lazily: this op is called from inside the MoE
 # forward, and Dynamo cannot trace a lock-guarded registration there.
-_op = pallas.jax_op("pallas::moe_router_topk", router_topk)
-_op.register_fake(_fake_router_topk)
+_op = jax_op_with_fake(
+    "pallas::moe_router_topk",
+    router_topk,
+    out=(
+        spec(shape=(dim("scores", 0), "topk"), dtype=torch.float32),
+        spec(shape=(dim("scores", 0), "topk"), dtype=torch.int32),
+    ),
+)
 
 
 def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
