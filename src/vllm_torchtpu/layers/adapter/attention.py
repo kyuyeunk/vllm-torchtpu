@@ -839,8 +839,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
     layer_idx: int
     _kernel_instance_counter = 0
     # Registry of shared custom ops keyed to avoid registering duplicate Pallas
-    # kernels for layers with identical configs.
-    # Mapping of (sliding_window, mesh, q_scale, k_scale, v_scale) -> custom op
+    # kernels for layers with identical configs. A key holds every value that
+    # `_build_rpa_kernel` binds into the op, including the mesh.
     _kernel_registry: dict = {}
 
     # Each Impl subclass points at its own RPA kernel entry function. Wrapped
@@ -984,16 +984,19 @@ class PallasAttentionBackendImpl(AttentionImpl):
             if use_pcp_streaming
             else batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
         )
+        # Forward looks this key up while Dynamo traces, so it holds only plain
+        # values and leaves the mesh to `registry_key`.
         config_key = (
             self._kernel_op_prefix,
             self.sliding_window,
             q_scale,
             k_scale,
             v_scale,
+            skip_kv_update,
             use_pcp_streaming,
             cp_kv_cache_interleave_size,
             max_model_len,
-            pcp_kv_layout,
+            self.kv_layout,
             self.decode_query_size,
             block_major,
         )
@@ -1021,12 +1024,20 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 *cast(tuple[P, ...], input_partition_specs)[1:],
             )
             output_partition_specs = (cache_spec, output_partition_specs[1])
+        # Kernel-iteration mode runs the op eagerly between compiled pieces
+        # (splitting_ops); donating kv_cache there kills the buffer that
+        # rpa_kernel_impl's copy_ writes back into. Inside a compiled full
+        # graph XLA rewires the alias, so donation is only safe when the op
+        # is compiled.
+        rpa_donate_argnums = None if envs.TPU_KERNEL_ITER_MODE else (0,)
+        # `self.kv_layout` also covers `pcp_kv_layout`, which derives from it.
         registry_key = (
             self._kernel_op_prefix,
+            self._kernel_entry,
             self.sliding_window,
             self.scale,
             self.logits_soft_cap,
-            id(mesh),
+            mesh,
             q_scale,
             k_scale,
             v_scale,
@@ -1035,9 +1046,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
             cp_kv_cache_interleave_size,
             max_model_len,
             self.use_causal_mask,
-            pcp_kv_layout,
+            self.kv_layout,
             self.decode_query_size,
             block_major,
+            rpa_donate_argnums,
         )
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
@@ -1103,13 +1115,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         # Register as a custom op to mark it as an op boundary in Dynamo.
         # This prevents torch.compile from tracing into the Pallas kernel internals.
-        #
-        # Kernel-iteration mode runs the op eagerly between compiled pieces
-        # (splitting_ops); donating kv_cache there kills the buffer that
-        # rpa_kernel_impl's copy_ writes back into. Inside a compiled full
-        # graph XLA rewires the alias, so donation is only safe when the op
-        # is compiled.
-        rpa_donate_argnums = None if envs.TPU_KERNEL_ITER_MODE else (0,)
         if use_pcp_streaming:
             rpa_kernel_op = pcp_streaming_jax_op(
                 op_name,
@@ -1273,16 +1278,21 @@ class PallasAttentionBackendImpl(AttentionImpl):
             )
         ctx = get_vllm_model_wrapper_context()
         mesh = ctx.mesh
+        # Eager kernel iteration mode runs without JAX tracing; omit donation
+        # to prevent prematurely releasing the buffer needed for copy_ writeback.
+        bundled_donate_argnums = None if envs.TPU_KERNEL_ITER_MODE else (0,)
         registry_key = (
             self._kernel_op_prefix_bundled,
+            self._kernel_entry_bundled,
             self.sliding_window,
             self.scale,
             self.logits_soft_cap,
-            id(mesh),
+            mesh,
             q_scale,
             k_scale,
             v_scale,
             self.use_causal_mask,
+            bundled_donate_argnums,
         )
         existing = self._bundled_kernel_registry.get(registry_key)
         if existing is not None:
@@ -1302,9 +1312,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
             use_causal_mask=self.use_causal_mask,
         )
 
-        # Eager kernel iteration mode runs without JAX tracing; omit donation
-        # to prevent prematurely releasing the buffer needed for copy_ writeback.
-        bundled_donate_argnums = None if envs.TPU_KERNEL_ITER_MODE else (0,)
         rpa_kernel_op = pallas.jax_op(
             op_name,
             wrapped_fn,

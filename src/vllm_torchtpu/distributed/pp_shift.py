@@ -20,6 +20,7 @@ closed cycle. Every stage must call it at the same point in its launch
 sequence; ``pp_wave`` arranges that.
 """
 
+import functools
 import inspect
 
 import jax
@@ -38,20 +39,15 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 AXIS = "pp"
-_MESH: Mesh | None = None
-_POS_OF_RANK: tuple[int, ...] = ()
 _OPS: dict[tuple, object] = {}
 
 
-def get_or_create_pp_mesh() -> Mesh:
-    """A JAX mesh over the pipeline group's devices in device-id order.
+@functools.cache
+def _pp_mesh_and_positions() -> tuple[Mesh, tuple[int, ...]]:
+    """The pipeline mesh and the mesh position of each pipeline rank.
 
-    The runtime addresses collective peers by device order, so mesh positions
-    follow device ids; ``pp_positions()`` maps pipeline ranks onto them.
+    Cached per process because the rank-to-device gather is a collective.
     """
-    global _MESH, _POS_OF_RANK
-    if _MESH is not None:
-        return _MESH
     from vllm.distributed.parallel_state import get_pp_group
 
     group = get_pp_group()
@@ -61,22 +57,30 @@ def get_or_create_pp_mesh() -> Mesh:
     )
     devices_by_id = {int(device.id): device for device in jax.devices()}
     device_ids = sorted(rank_to_device[rank] for rank in ranks)
-    _MESH = Mesh(np.asarray([devices_by_id[d] for d in device_ids]), axis_names=(AXIS,))
-    _POS_OF_RANK = tuple(device_ids.index(rank_to_device[rank]) for rank in ranks)
+    mesh = Mesh(np.asarray([devices_by_id[d] for d in device_ids]), axis_names=(AXIS,))
+    pos_of_rank = tuple(device_ids.index(rank_to_device[rank]) for rank in ranks)
     logger.info(
         "PP hand-off mesh (device order): %s",
         ", ".join(
-            f"rank{r}->pos{_POS_OF_RANK[i]}/dev{rank_to_device[r]}"
+            f"rank{r}->pos{pos_of_rank[i]}/dev{rank_to_device[r]}"
             for i, r in enumerate(ranks)
         ),
     )
-    return _MESH
+    return mesh, pos_of_rank
+
+
+def get_or_create_pp_mesh() -> Mesh:
+    """A JAX mesh over the pipeline group's devices in device-id order.
+
+    The runtime addresses collective peers by device order, so mesh positions
+    follow device ids; ``pp_positions()`` maps pipeline ranks onto them.
+    """
+    return _pp_mesh_and_positions()[0]
 
 
 def pp_positions() -> tuple[int, ...]:
     """Mesh position of each pipeline rank, in rank order."""
-    get_or_create_pp_mesh()
-    return _POS_OF_RANK
+    return _pp_mesh_and_positions()[1]
 
 
 def pp_permute_op(mesh: Mesh, num_tensors: int = 1):
@@ -92,12 +96,12 @@ def pp_permute_op(mesh: Mesh, num_tensors: int = 1):
     """
     if num_tensors < 1:
         raise ValueError(f"a hand-off carries at least one tensor; got {num_tensors}")
-    key = ("permute", int(num_tensors)) + tuple(int(d.id) for d in mesh.devices)
+    pos = pp_positions()
+    perm = [(pos[r], pos[(r + 1) % len(pos)]) for r in range(len(pos))]
+    key = (int(num_tensors), mesh, tuple(perm))
     op = _OPS.get(key)
     if op is not None:
         return op
-    pos = pp_positions()
-    perm = [(pos[r], pos[(r + 1) % len(pos)]) for r in range(len(pos))]
     spec = PartitionSpec(AXIS)
 
     if num_tensors == 1:

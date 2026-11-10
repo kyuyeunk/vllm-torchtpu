@@ -79,7 +79,7 @@ SELFTEST_TIMEOUT_S = 300
 _SUM_FLOOR = 1e-20
 
 _OPS: dict[tuple, Any] = {}
-_SELFTEST_OPS: dict[all_reduce.AllReduceSpec, Any] = {}
+_SELFTEST_OPS: dict[tuple, Any] = {}
 _RANK_BUFFER: torch.Tensor | None = None
 _SELFTEST_DONE = False
 
@@ -420,7 +420,8 @@ def _get_op(mesh, statics: _OpStatics):
 
 
 def _selftest_op(mesh, spec: all_reduce.AllReduceSpec):
-    op = _SELFTEST_OPS.get(spec)
+    key = (mesh, spec)
+    op = _SELFTEST_OPS.get(key)
     if op is not None:
         return op
     axis = mesh.axis_names[0]
@@ -451,7 +452,7 @@ def _selftest_op(mesh, spec: all_reduce.AllReduceSpec):
         output_partition_specs=P(axis),
     )
     op.register_fake(lambda x, *args, **kwargs: torch.empty_like(x))
-    _SELFTEST_OPS[spec] = op
+    _SELFTEST_OPS[key] = op
     return op
 
 

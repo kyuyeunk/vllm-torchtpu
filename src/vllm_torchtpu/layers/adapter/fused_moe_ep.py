@@ -189,7 +189,10 @@ def _build_op(
     """
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
+    # The mesh and gather group are built once per process, so keying on the
+    # objects themselves does not split the cache.
     key = (
+        mesh,
         topk,
         renormalize,
         activation,
@@ -202,7 +205,7 @@ def _build_op(
         routed_scaling_factor,
         has_hash_ids,
         token_replica_groups,
-        None if sorted_gather is None else sorted_gather[1],
+        sorted_gather,
     )
     cached = _OPS.get(key)
     if cached is not None:

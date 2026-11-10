@@ -582,7 +582,7 @@ class TestVllmGatedDeltaNetAttention:
         assert len(set(names)) == 2
         assert all(re.fullmatch(r"pallas::gdn_attention_pooled_\d+", n) for n in names)
 
-    def test_build_gdn_op_keeps_regular_jax_op_per_layer(self):
+    def test_build_gdn_op_is_shared_by_layers_with_one_kernel_config(self):
         attn0 = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
         attn1 = _qwen35_397b_gdn_attn("language_model.model.layers.30.linear_attn")
         fake_jax_op = MagicMock()
@@ -598,14 +598,9 @@ class TestVllmGatedDeltaNetAttention:
             attn0._build_gdn_op()
             attn1._build_gdn_op()
 
-        assert mock_jax_op.call_count == 2
-        assert mock_jax_op.call_args_list[0].args[0] == (
-            "pallas::gdn_attention_language_model_model_layers_0_linear_attn"
-        )
-        assert mock_jax_op.call_args_list[1].args[0] == (
-            "pallas::gdn_attention_language_model_model_layers_30_linear_attn"
-        )
-        assert fake_jax_op.register_fake.call_count == 2
+        assert mock_jax_op.call_count == 1
+        assert re.fullmatch(r"pallas::gdn_attention_\d+", mock_jax_op.call_args.args[0])
+        assert fake_jax_op.register_fake.call_count == 1
 
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_pcp_world_size",
@@ -614,7 +609,7 @@ class TestVllmGatedDeltaNetAttention:
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
     )
-    def test_build_gdn_op_keeps_pcp_jax_op_per_layer(
+    def test_build_gdn_op_shares_pcp_jax_op_across_layers(
         self, mock_get_pcp_mesh, _mock_get_pcp_world_size
     ):
         attn0 = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
@@ -636,15 +631,11 @@ class TestVllmGatedDeltaNetAttention:
             attn0._build_gdn_op(pcp_streaming=True)
             attn1._build_gdn_op(pcp_streaming=True)
 
-        assert mock_pcp_jax_op.call_count == 2
-        assert mock_pcp_jax_op.call_args_list[0].args[0] == (
-            "pallas::gdn_attention_pcp_language_model_model_layers_0_linear_attn"
-        )
-        assert mock_pcp_jax_op.call_args_list[1].args[0] == (
-            "pallas::gdn_attention_pcp_language_model_model_layers_30_linear_attn"
+        assert mock_pcp_jax_op.call_count == 1
+        assert re.fullmatch(
+            r"pallas::gdn_attention_pcp_\d+", mock_pcp_jax_op.call_args.args[0]
         )
         assert mock_pcp_jax_op.call_args_list[0].kwargs["mesh"] is pcp_mesh
-        assert mock_pcp_jax_op.call_args_list[1].kwargs["mesh"] is pcp_mesh
         assert mock_pcp_jax_op.call_args_list[0].kwargs["input_partition_specs"][
             3
         ] == PartitionSpec(None, None, ("tp", "pcp"))
@@ -663,7 +654,7 @@ class TestVllmGatedDeltaNetAttention:
                 call(axis_name="pcp", tp_axis_name="tp"),
             ]
         )
-        assert fake_jax_op.register_fake.call_count == 2
+        assert fake_jax_op.register_fake.call_count == 1
 
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_pcp_world_size",

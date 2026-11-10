@@ -353,6 +353,9 @@ def _localize_gdn_mamba_spec_for_pcp(
 # GDN custom ops shared by every layer with the same kernel config. A
 # JaxCallable caches its jax.export per instance, so one op per layer re-exported
 # (and re-lowered) the identical kernel for every layer at every compile bucket.
+# Keys use id() for the mesh and VllmConfig, which are not reliably hashable
+# (pydantic config, SimpleNamespace test meshes). The cached op holds both
+# objects, so their ids stay unique while the entry lives.
 _shared_gdn_ops: dict[tuple, Any] = {}
 _shared_gdn_op_ids = itertools.count()
 
@@ -610,6 +613,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         local_num_kq_heads = self.tp_head_geometry.local_num_kq_heads
         has_conv_bias = self.conv1d.bias is not None
         vllm_context = get_vllm_model_wrapper_context()
+        d_k = self.head_k_dim
+        d_v = self.head_v_dim
+        kernel_size = self.conv_kernel_size
         # The non-PCP op uses num_spec_tokens for verify/rollback. PCP is a
         # prefill-only path admitted at the platform boundary; its widened
         # conv-state tail is preserved by gdn_attention_core_tpu_pcp_prefill.
@@ -617,7 +623,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         def _fake_gdn(mixed_qkv, _b, _a, conv_state, recurrent_state, *args, **kwargs):
             num_tokens = mixed_qkv.size(0)
-            out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
+            out_shape = (num_tokens, local_num_v_heads, d_v)
             return (
                 torch.empty_like(conv_state),
                 torch.empty_like(recurrent_state),
@@ -647,15 +653,14 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     f"{pcp_mesh.shape[_GDN_TP_AXIS_NAME]}."
                 )
             derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads, pcp_size)
-            op_name = f"pallas::gdn_attention_pcp_{self.prefix.replace('.', '_')}"
             wrapped_fn = functools.partial(
                 gdn_attention_core_tpu_pcp_prefill,
                 mesh=pcp_mesh,
                 n_kq=local_num_kq_heads,
                 n_v=local_num_v_heads,
-                d_k=self.head_k_dim,
-                d_v=self.head_v_dim,
-                kernel_size=self.conv_kernel_size,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
                 pcp_size=pcp_size,
                 interleave_size=interleave_size,
             )
@@ -685,31 +690,68 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 ),  # new_recurrent_state
                 PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME, None),  # output
             )
-            # Torchtpu native jax_op. The pcp_streaming wrapper adds only
-            # kernel_reload's dispatcher, which GDN does not use.
-            gdn_jax_op = pallas.jax_op(
-                op_name,
-                wrapped_fn,
-                donate_argnums=(3, 4),
-                mesh=pcp_mesh,
-                input_partition_specs=input_partition_specs,
-                output_partition_specs=output_partition_specs,
+
+            def build_op(op_name: str):
+                # Torchtpu native jax_op. The pcp_streaming wrapper adds only
+                # kernel_reload's dispatcher, which GDN does not use.
+                op = pallas.jax_op(
+                    op_name,
+                    wrapped_fn,
+                    donate_argnums=(3, 4),
+                    mesh=pcp_mesh,
+                    input_partition_specs=input_partition_specs,
+                    output_partition_specs=output_partition_specs,
+                )
+                op.register_fake(_fake_gdn)
+                return op
+
+            # has_conv_bias selects the conv_bias partition spec, so it is keyed.
+            gdn_jax_op = _get_shared_gdn_op(
+                "gdn_attention_pcp",
+                (
+                    id(pcp_mesh),
+                    local_num_kq_heads,
+                    local_num_v_heads,
+                    d_k,
+                    d_v,
+                    kernel_size,
+                    pcp_size,
+                    interleave_size,
+                    has_conv_bias,
+                ),
+                build_op,
             )
         else:
-            op_name = f"pallas::gdn_attention_{self.prefix.replace('.', '_')}"
+            mesh = vllm_context.mesh
             wrapped_fn = functools.partial(
                 gdn_attention_core_tpu,
-                mesh=vllm_context.mesh,
+                mesh=mesh,
                 n_kq=local_num_kq_heads,
                 n_v=local_num_v_heads,
-                d_k=self.head_k_dim,
-                d_v=self.head_v_dim,
-                kernel_size=self.conv_kernel_size,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
                 num_spec_tokens=num_spec_tokens,
             )
-            gdn_jax_op = pallas.jax_op(op_name, wrapped_fn, donate_argnums=(3, 4))
 
-        gdn_jax_op.register_fake(_fake_gdn)
+            def build_op(op_name: str):
+                op = pallas.jax_op(op_name, wrapped_fn, donate_argnums=(3, 4))
+                op.register_fake(_fake_gdn)
+                return op
+
+            gdn_jax_op = _get_shared_gdn_op(
+                "gdn_attention",
+                (
+                    id(mesh),
+                    local_num_kq_heads,
+                    local_num_v_heads,
+                    d_k,
+                    d_v,
+                    kernel_size,
+                    num_spec_tokens,
+                ),
+                build_op,
+            )
 
         def gdn_impl(
             mixed_qkv: torch.Tensor,
@@ -997,11 +1039,6 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             new_pool, output, z = result
             return new_pool.reshape(recurrent_state.shape), output, z
 
-        op_name = (
-            "pallas::gdn_attention_pooled_pcp_fused_"
-            f"{self.prefix.replace('.', '_')}"
-            f"{'_bm' if block_major else ''}"
-        )
         input_partition_specs = (
             PartitionSpec(_GDN_PCP_AXIS_NAME, None),  # hidden states
             PartitionSpec(_GDN_TP_AXIS_NAME),  # QKVZ weight
@@ -1025,28 +1062,51 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME, None),  # output
             PartitionSpec(_GDN_PCP_AXIS_NAME, _GDN_TP_AXIS_NAME, None),  # z
         )
-        # Torchtpu native jax_op. The pcp_streaming wrapper adds only
-        # kernel_reload's dispatcher, which GDN does not use.
-        gdn_jax_op = pallas.jax_op(
-            op_name,
-            wrapped_fn,
-            # Keep optional operands after the pool so filtering None at the
-            # TorchTPU boundary cannot change the donated tensor's index.
-            donate_argnums=(4,),
-            mesh=pcp_mesh,
-            input_partition_specs=cast(Any, input_partition_specs),
-            output_partition_specs=cast(Any, output_partition_specs),
-        )
 
         def _fake_gdn(hidden_states, _weight, _b, _a, recurrent_state, *args, **kwargs):
             num_tokens = hidden_states.size(0)
-            out_shape = (num_tokens, local_num_v_heads, self.head_v_dim)
+            out_shape = (num_tokens, local_num_v_heads, d_v)
             output = torch.empty(
                 out_shape, dtype=hidden_states.dtype, device=hidden_states.device
             )
             return torch.empty_like(recurrent_state), output, torch.empty_like(output)
 
-        gdn_jax_op.register_fake(_fake_gdn)
+        def build_op(op_name: str):
+            # Torchtpu native jax_op. The pcp_streaming wrapper adds only
+            # kernel_reload's dispatcher, which GDN does not use.
+            op = pallas.jax_op(
+                op_name,
+                wrapped_fn,
+                # Keep optional operands after the pool so filtering None at the
+                # TorchTPU boundary cannot change the donated tensor's index.
+                donate_argnums=(4,),
+                mesh=pcp_mesh,
+                input_partition_specs=cast(Any, input_partition_specs),
+                output_partition_specs=cast(Any, output_partition_specs),
+            )
+            op.register_fake(_fake_gdn)
+            return op
+
+        # has_conv_bias selects the conv_bias partition spec, so it is keyed.
+        gdn_jax_op = _get_shared_gdn_op(
+            "gdn_attention_pooled_pcp_fused_bm"
+            if block_major
+            else "gdn_attention_pooled_pcp_fused",
+            (
+                id(pcp_mesh),
+                id(vllm_config),
+                local_num_kq_heads,
+                local_num_v_heads,
+                d_k,
+                d_v,
+                kernel_size,
+                pcp_size,
+                interleave_size,
+                recurrent_state_dtype,
+                has_conv_bias,
+            ),
+            build_op,
+        )
 
         def gdn_impl(
             hidden_states: torch.Tensor,

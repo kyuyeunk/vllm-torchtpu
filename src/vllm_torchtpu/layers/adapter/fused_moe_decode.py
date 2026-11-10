@@ -256,7 +256,7 @@ def _build_op(
     routed_scale: float = 1.0,
 ):
     key = (
-        id(mesh),
+        mesh,
         n_ranks,
         topk,
         expert_parallel,
