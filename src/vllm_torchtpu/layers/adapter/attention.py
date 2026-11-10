@@ -85,6 +85,9 @@ from vllm_torchtpu.layers.adapter.cp_attention import (
 from vllm_torchtpu.layers.adapter.cp_attention import (
     forward_with_dcp as _forward_with_dcp,
 )
+from vllm_torchtpu.layers.adapter.cp_attention import (
+    make_cp_rank_tensor as _make_cp_rank_tensor,
+)
 from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_heads,
     all_gather_q_nope_pe_heads,
@@ -936,7 +939,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # DCP (Decode Context Parallelism) state. Populated by initialize_kernel()
         # when decode_context_parallel_size > 1.
         self.dcp_world_size = 1
-        self.dcp_rank = 0
+        # [1] int32 device tensor from make_cp_rank_tensor().
+        self.dcp_rank: torch.Tensor | None = None
         self.rpa_dcp_cache_kernel = None  # CACHE_ONLY pass, returns (out, lse)
         self.rpa_dcp_new_kernel = None  # NEW_TOKENS_ONLY pass, returns (out, lse)
         # Block-major bundled kernel and pre-allocated layer index. Initialized by
@@ -1200,6 +1204,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
+        assert self.dcp_rank is not None, "initialize_kernel() sets the DCP rank"
         return _forward_with_dcp(
             layer=layer,
             query=query,
@@ -1427,7 +1432,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             dcp_group = _get_dcp_group()
             if dcp_group is not None:
                 self.dcp_world_size = int(dcp_group.world_size)
-                self.dcp_rank = int(dcp_group.rank_in_group)
+                self.dcp_rank = _make_cp_rank_tensor(
+                    int(dcp_group.rank_in_group), vllm_config.device_config.device
+                )
                 self.rpa_dcp_cache_kernel, self.rpa_dcp_new_kernel = _build_dcp_kernels(
                     sliding_window=self.sliding_window,
                     sm_scale=self.scale,

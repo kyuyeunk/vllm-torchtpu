@@ -27,6 +27,8 @@ def cp_lse_ag_out_rs(
     group: Any | None,
     return_lse: Literal[False] = False,
     rs_dtype: torch.dtype | None = None,
+    *,
+    cp_rank: None = None,
 ) -> torch.Tensor: ...
 
 
@@ -37,6 +39,8 @@ def cp_lse_ag_out_rs(
     group: Any | None,
     return_lse: Literal[True],
     rs_dtype: torch.dtype | None = None,
+    *,
+    cp_rank: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -46,6 +50,8 @@ def cp_lse_ag_out_rs(
     group: Any | None,
     return_lse: bool = False,
     rs_dtype: torch.dtype | None = None,
+    *,
+    cp_rank: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Mirror vllm.v1.attention.ops.dcp.cp_lse_ag_out_rs.
 
@@ -55,6 +61,9 @@ def cp_lse_ag_out_rs(
       return_lse: also return the merged LSE.
       rs_dtype: dtype the weighted terms cross the reduce-scatter in; None
         keeps f32.
+      cp_rank: [1] int32 tensor holding this rank's index in `group`; required
+        with return_lse. It selects this rank's heads of the merged LSE as
+        data, so every rank traces the same graph.
 
     Returns:
       merged_output [T, H, D] in output.dtype, plus merged_lse [T, H] in f32
@@ -83,6 +92,9 @@ def cp_lse_ag_out_rs(
     if not return_lse:
         return merged
 
-    heads = merged.shape[1]
-    start = int(group.rank_in_group) * heads
-    return merged, merged_lse[:, start : start + heads]
+    if cp_rank is None:
+        raise ValueError("return_lse needs the cp_rank tensor")
+    # A Python-int slice would bake this rank's heads into the graph; the
+    # gather keeps the program rank-independent and selects the same values.
+    own_lse = merged_lse.unflatten(1, (-1, merged.shape[1]))
+    return merged, own_lse.index_select(1, cp_rank).squeeze(1)

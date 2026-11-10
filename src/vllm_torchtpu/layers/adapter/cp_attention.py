@@ -89,12 +89,12 @@ def _pallas_rpa_kernel_dcp(
     q_scale: float | None,
     k_scale: float | None,
     v_scale: float | None,
+    cp_rank: jax.Array,
     *,
     sliding_window: int | None,
     sm_scale: float | None = None,
     soft_cap: float | None = None,
     cp_group_size: int,
-    cp_rank_val: int,
     attention_scope: _batched_rpa_configs.AttentionScope,
     kv_layout: _batched_rpa_configs.KVLayout = (
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
@@ -109,10 +109,9 @@ def _pallas_rpa_kernel_dcp(
     compute this rank's local cache length, NEW_TOKENS_ONLY to land the
     write on the right physical page of this rank's DCP-interleaved
     kv_cache (its own write offset is otherwise global, not rank-local).
+    cp_rank is a [1] int32 operand that the schedule reads through scalar
+    prefetch.
     """
-    import jax.numpy as jnp
-
-    cp_rank_arr = jnp.array([cp_rank_val], dtype=jnp.int32)
     output, new_kv_cache, lse = _batched_rpa_wrapper.ragged_paged_attention(
         queries=query,
         keys=key,
@@ -129,7 +128,7 @@ def _pallas_rpa_kernel_dcp(
         k_scale=k_scale,
         v_scale=v_scale,
         cp_group_size=cp_group_size,
-        cp_rank=cp_rank_arr,
+        cp_rank=cp_rank,
         attention_scope=attention_scope,
         decode_query_size=decode_query_size,
         return_lse=True,
@@ -164,15 +163,26 @@ _DCP_KERNEL_OP = pallas.jax_op(
 _DCP_KERNEL_OP.register_fake(_fake_dcp)
 
 
-def _dcp_kernel_impl(kv_cache, *args, **static_kwargs):
+def _dcp_kernel_impl(cp_rank, kv_cache, *args, **static_kwargs):
     """Runs one DCP pass and writes the returned cache back into `kv_cache`.
 
     The copy keeps the caller's tensor bound to the possibly aliased result and
     compiles to a no-op for CACHE_ONLY.
     """
-    new_kv_cache, output, lse = _DCP_KERNEL_OP(kv_cache, *args, **static_kwargs)
+    new_kv_cache, output, lse = _DCP_KERNEL_OP(
+        kv_cache, *args, cp_rank, **static_kwargs
+    )
     kv_cache.copy_(new_kv_cache)
     return output, lse
+
+
+def make_cp_rank_tensor(cp_rank: int, device: torch.device | str) -> torch.Tensor:
+    """Returns `cp_rank` as the [1] int32 operand `build_dcp_kernels` expects.
+
+    Create it once, before compilation: a tensor created inside a compiled
+    forward becomes a per-rank constant in the graph.
+    """
+    return torch.tensor([cp_rank], dtype=torch.int32, device=device)
 
 
 def build_dcp_kernels(
@@ -183,7 +193,7 @@ def build_dcp_kernels(
     k_scale: float | None,
     v_scale: float | None,
     cp_group_size: int,
-    cp_rank: int,
+    cp_rank: torch.Tensor,
     kv_layout: _batched_rpa_configs.KVLayout = (
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
@@ -192,7 +202,10 @@ def build_dcp_kernels(
     """Binds the CACHE_ONLY and NEW_TOKENS_ONLY passes of the DCP op.
 
     `q_scale`, `k_scale` and `v_scale` are ignored; the returned kernels take
-    them per call. `cp_rank` is static, so each rank compiles its own program.
+    them per call. `cp_rank` is a [1] int32 device tensor (see
+    `make_cp_rank_tensor`) passed to the op as data rather than as a static
+    argument: ranks that compile different programs under one op name can
+    desynchronize the in-graph collectives and multiply compile time.
 
     Returns:
         (cache_kernel, new_kernel) where each is callable as
@@ -209,17 +222,18 @@ def build_dcp_kernels(
         sm_scale=sm_scale,
         soft_cap=logits_soft_cap,
         cp_group_size=cp_group_size,
-        cp_rank_val=cp_rank,
         kv_layout=kv_layout,
         decode_query_size=decode_query_size,
     )
     cache_kernel = functools.partial(
         _dcp_kernel_impl,
+        cp_rank,
         attention_scope=_batched_rpa_configs.AttentionScope.CACHE_ONLY,
         **static_kwargs,
     )
     new_kernel = functools.partial(
         _dcp_kernel_impl,
+        cp_rank,
         attention_scope=_batched_rpa_configs.AttentionScope.NEW_TOKENS_ONLY,
         **static_kwargs,
     )
@@ -244,7 +258,7 @@ def forward_with_dcp(
     logits_soft_cap: float | None,
     kv_cache_quantized_dtype,
     dcp_world_size: int,
-    dcp_rank: int,
+    dcp_rank: torch.Tensor,
     kv_layout: _batched_rpa_configs.KVLayout = (
         _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE
     ),
@@ -296,7 +310,7 @@ def forward_with_dcp(
     ctx_output, ctx_lse = cache_kernel(kv_cache, query_across_dcp, *shared_args)
 
     ctx_output, ctx_lse = cp_lse_ag_out_rs(
-        ctx_output, ctx_lse, dcp_group, return_lse=True
+        ctx_output, ctx_lse, dcp_group, return_lse=True, cp_rank=dcp_rank
     )
 
     new_output, new_lse = new_kernel(kv_cache, query, *shared_args)

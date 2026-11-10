@@ -210,7 +210,8 @@ def _run_adapter(args, rank, scope, monkeypatch, *, dcp_size, own_q_heads):
             tensor_parallel_size=_TP_SIZE,
             prefill_context_parallel_size=1,
             decode_context_parallel_size=dcp_size,
-        )
+        ),
+        device_config=SimpleNamespace(device=torch.device("tpu")),
     )
     layer = SimpleNamespace(_k_scale_float=_K_SCALE, _v_scale_float=_V_SCALE)
     with set_vllm_model_wrapper_context(mesh=None, vllm_config=config):
