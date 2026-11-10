@@ -41,6 +41,8 @@ import operator
 from collections.abc import Callable, Mapping
 from typing import Any, overload
 
+import jax
+import jax.numpy as jnp
 import torch
 from torch._library.custom_ops import CustomOpDef
 from torch_tpu._internal import pallas
@@ -301,3 +303,92 @@ def jax_op_with_fake(
         return op
 
     return register if fn is None else register(fn)
+
+
+# Torch dtypes by JAX dtype name. Keyed by name because a dtype can cross the
+# op schema as a string (torch has no int4, so such statics travel as a
+# `jax.numpy` type name); dtypes absent here have no torch equivalent a fake
+# could produce.
+_TORCH_DTYPE_BY_JAX_NAME: dict[str, torch.dtype] = {
+    "bool": torch.bool,
+    "int8": torch.int8,
+    "int16": torch.int16,
+    "int32": torch.int32,
+    "int64": torch.int64,
+    "uint8": torch.uint8,
+    "uint32": torch.uint32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+    "float8_e4m3fn": torch.float8_e4m3fn,
+    "float8_e5m2": torch.float8_e5m2,
+    "float8_e8m0fnu": torch.float8_e8m0fnu,
+}
+_JAX_NAME_BY_TORCH_DTYPE = {v: k for k, v in _TORCH_DTYPE_BY_JAX_NAME.items()}
+
+
+def torch_dtype_of(jax_dtype: Any) -> torch.dtype:
+    """Returns the torch dtype for a JAX dtype or a JAX dtype name."""
+    name = jax_dtype if isinstance(jax_dtype, str) else jnp.dtype(jax_dtype).name
+    try:
+        return _TORCH_DTYPE_BY_JAX_NAME[name]
+    except KeyError:
+        raise ValueError(f"No torch dtype for JAX dtype {name!r}.") from None
+
+
+def jax_dtype_of(torch_dtype: torch.dtype) -> jnp.dtype:
+    """Returns the JAX dtype for a torch dtype."""
+    try:
+        return jnp.dtype(_JAX_NAME_BY_TORCH_DTYPE[torch_dtype])
+    except KeyError:
+        raise ValueError(f"No JAX dtype for torch dtype {torch_dtype}.") from None
+
+
+def _jax_static(value: Any) -> Any:
+    # Mirrors the conversions pallas.jax_op applies to static arguments before
+    # calling the kernel.
+    if isinstance(value, torch.dtype):
+        return jax_dtype_of(value)
+    if isinstance(value, list | tuple):
+        return tuple(_jax_static(v) for v in value)
+    return value
+
+
+def check_fake_matches_kernel(op: CustomOpDef, *args: Any, **kwargs: Any) -> None:
+    """Asserts that `op`'s fake and its JAX kernel agree on one call.
+
+    Evaluates the fake registered by `jax_op_with_fake` and `jax.eval_shape` of
+    the kernel on the same arguments, and compares every output's shape and
+    dtype.
+
+    Args:
+        op: An op built with `jax_op_with_fake`.
+        *args: The call's positional arguments. Tensors only carry a shape and
+            dtype here, so pass them on the meta device.
+        **kwargs: The call's keyword arguments.
+
+    Raises:
+        AssertionError: The fake and the kernel disagree.
+    """
+    record = registered_op(op)
+    call = record.signature.bind(*args, **kwargs)
+    call.apply_defaults()
+    fake_leaves = torch.utils._pytree.tree_leaves(
+        record.fake(*call.args, **call.kwargs)
+    )
+    arrays = {
+        name: jax.ShapeDtypeStruct(tuple(v.shape), jax_dtype_of(v.dtype))
+        for name, v in call.arguments.items()
+        if isinstance(v, torch.Tensor)
+    }
+    statics = {
+        name: _jax_static(v)
+        for name, v in call.arguments.items()
+        if not isinstance(v, torch.Tensor)
+    }
+    kernel_leaves = jax.tree.leaves(
+        jax.eval_shape(lambda **a: record.fn(**a, **statics), **arrays)
+    )
+    fake = [(tuple(t.shape), t.dtype) for t in fake_leaves]
+    kernel = [(tuple(a.shape), torch_dtype_of(a.dtype)) for a in kernel_leaves]
+    assert fake == kernel, f"{op}: fake gives {fake}, kernel gives {kernel}."
