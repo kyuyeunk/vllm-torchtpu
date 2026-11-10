@@ -41,6 +41,7 @@ def _call(
 # (process, chip, call, variant, the reason the variant cannot run or None).
 _CAPABLE = {
     "owner output": (_ON, _TPU7X, _call(256, 10), Combine.OWNER_ONEHOT, None),
+    "segment sum": (_ON, _V6E, _call(16, 8), Combine.SEGMENT_SUM, None),
     "owner output, fp32 weights": (
         _ON,
         _TPU7X,

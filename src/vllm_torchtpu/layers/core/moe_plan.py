@@ -53,6 +53,7 @@ class Combine(enum.Enum):
     - `onehot`: a dense one-hot matmul.
     - `owner_onehot`: the blockwise one-hot unpermute kernel.
     - `gather_reduce_v1`, `_v2`, `_v3`: the SparseCore gather-reduce kernels.
+    - `segment_sum`: an XLA scatter-add of the weighted rows, in expert order.
     """
 
     TENSORCORE = "tensorcore"
@@ -61,6 +62,7 @@ class Combine(enum.Enum):
     GATHER_REDUCE_V1 = "gather_reduce_v1"
     GATHER_REDUCE_V2 = "gather_reduce_v2"
     GATHER_REDUCE_V3 = "gather_reduce_v3"
+    SEGMENT_SUM = "segment_sum"
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -210,6 +212,29 @@ def _owner_onehot(
     )
 
 
+def _segment_sum(
+    g, group_sizes, revert, weights, mask, token_indices, *, num_tokens, topk
+):
+    del topk
+    # Weight each routed row in place, through the inverse of the sort, and
+    # zero the rows past the computed prefix, which the GMM never writes.
+    weights_sorted = jnp.zeros_like(weights).at[revert].set(weights * mask)
+    computed = jnp.arange(g.shape[0], dtype=jnp.int32) < group_sizes.sum(
+        dtype=jnp.int32
+    )
+    rows = jnp.where(computed[:, None], g * weights_sorted[:, None], 0)
+    return jax.ops.segment_sum(rows, token_indices, num_segments=num_tokens)
+
+
+def _segment_sum_supports(
+    g, group_sizes, revert, weights, mask, token_indices, *, num_tokens, topk, chip
+):
+    del group_sizes, weights, mask, token_indices, num_tokens, topk, chip
+    if g.shape[0] != revert.shape[0]:
+        return "needs one routed row per route"
+    return None
+
+
 def _gather_reduce(kernel: Callable[..., jax.Array]) -> Callable[..., jax.Array]:
     def run(g, group_sizes, revert, weights, mask, token_indices, *, num_tokens, topk):
         del group_sizes, token_indices, num_tokens
@@ -281,6 +306,7 @@ VARIANTS: dict[Combine, Variant] = {
         supports=_gather_reduce_supports(v3.ragged_gather_reduce_supports),
         sparse_core=True,
     ),
+    Combine.SEGMENT_SUM: Variant(run=_segment_sum, supports=_segment_sum_supports),
 }
 DEFAULT = Combine.TENSORCORE
 
