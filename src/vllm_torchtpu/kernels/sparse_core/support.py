@@ -31,15 +31,23 @@ _SC_KERNEL_CHIPS = frozenset(
 )
 
 
+def current_tpu_info() -> pltpu.TpuInfo | None:
+    """Returns this host's chip, or None on a host without a TPU.
+
+    The one place these kernels and their callers read the chip from the
+    runtime.
+    """
+    try:
+        return pltpu.get_tpu_info()
+    except ValueError:  # Non-TPU host.
+        return None
+
+
 def get_sparse_core_info(tpu_info: pltpu.TpuInfo | None = None):
     """Returns the SparseCore info if these kernels support this chip, else None."""
-    if tpu_info is not None:
-        info = tpu_info
-    else:
-        try:
-            info = pltpu.get_tpu_info()
-        except ValueError:  # Non-TPU host.
-            return None
+    info = tpu_info if tpu_info is not None else current_tpu_info()
+    if info is None:
+        return None
     if info.sparse_core is None:
         return None
     if info.chip_version not in _SC_KERNEL_CHIPS:

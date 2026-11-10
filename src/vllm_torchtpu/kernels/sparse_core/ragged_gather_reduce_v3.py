@@ -55,6 +55,15 @@ def _fallback_implementation(
     return jnp.sum(out, axis=1).astype(x.dtype)
 
 
+def below_sparse_core_cutoff(x: jax.Array, tpu_info: pltpu.TpuInfo) -> bool:
+    """Whether `x` is too small for this kernel, which then takes the fallback.
+
+    Two buffers of `x` under 60% of VMEM run faster on the TensorCore.
+    """
+    dtype_bytes = jax.dtypes.itemsize_bits(x.dtype) // 8
+    return x.size * dtype_bytes * 2 < tpu_info.vmem_capacity_bytes * 0.6
+
+
 def _calculate_num_column_partitions(
     hidden_size: int, num_cores: int, num_lanes: int
 ) -> int:
@@ -351,8 +360,7 @@ def ragged_gather_reduce(
             valid_rows_mask,
             reduce_group_size,
         )
-    dtype_bytes = jax.dtypes.itemsize_bits(x.dtype) // 8
-    if jnp.size(x) * dtype_bytes * 2 < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6:
+    if below_sparse_core_cutoff(x, pltpu.get_tpu_info()):
         return _fallback_implementation(
             x,
             indices,

@@ -13,7 +13,7 @@
 # limitations under the License.
 """Tests for the local-routing fused MoE GMM wrapper."""
 
-import types
+import dataclasses
 from unittest.mock import patch
 
 import jax
@@ -24,12 +24,34 @@ from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
+from vllm_torchtpu.kernels.sparse_core import support
 from vllm_torchtpu.layers.core import fused_moe_gmm
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     moe_gmm,
     prepare_routed_gmm_inputs,
 )
+
+# A chip the SparseCore kernels are validated on, and variants of it that
+# differ only in the SparseCore. Tests hand one in by patching
+# `support.current_tpu_info`, the one runtime read of the chip.
+_TPU7X = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+
+
+def _tpu7x_with_sc(num_lanes: int, num_cores: int, num_subcores: int) -> pltpu.TpuInfo:
+    sparse_core = _TPU7X.sparse_core
+    assert sparse_core is not None  # noqa: S101 - TPU7x has one; narrows the type
+    sparse_core = dataclasses.replace(
+        sparse_core,
+        num_lanes=num_lanes,
+        num_cores=num_cores,
+        num_subcores=num_subcores,
+    )
+    return dataclasses.replace(_TPU7X, sparse_core=sparse_core)
+
+
+_TPU7X_NO_SC = dataclasses.replace(_TPU7X, sparse_core=None)
+_TPU7X_SC_LANES_8 = _tpu7x_with_sc(num_lanes=8, num_cores=2, num_subcores=16)
 
 
 @pytest.mark.parametrize("version", ["v1", "v2", "v3"])
@@ -110,50 +132,61 @@ def test_fused_moe_gmm_get_topk_weights_dtype(monkeypatch):
 
 @pytest.mark.parametrize("configured_version", ["v1", "v2", "v3"])
 @pytest.mark.parametrize(
-    "use_ep,use_sparse_core,threshold,dtype,hidden,topk,num_tokens,source_rows,sc_lanes,expected_path",
+    (
+        "use_ep",
+        "use_sparse_core",
+        "threshold",
+        "dtype",
+        "hidden",
+        "topk",
+        "num_tokens",
+        "source_rows",
+        "chip",
+        "expected_path",
+    ),
     [
-        (True, True, 0, jnp.bfloat16, 4, 2, 2, None, 16, "ep"),
-        (False, True, 0, jnp.bfloat16, 4096, 10, 2048, None, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 4096, 10, 2047, None, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 4096, 10, 64, None, 16, None),
-        (False, True, 0, jnp.bfloat16, 4096, 10, 256, None, 16, None),
-        (False, True, 0, jnp.bfloat16, 4096, 10, 511, None, 16, None),
-        (False, True, 0, jnp.bfloat16, 4096, 10, 512, None, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 4096, 10, 544, None, 16, None),
-        (False, True, 0, jnp.bfloat16, 4096, 10, 682, None, 16, None),
-        (False, True, 0, jnp.bfloat16, 4096, 10, 683, None, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 4096, 10, 1025, None, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 4096, 3, 512, 4096, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 4096, 2, 1024, None, 16, None),
-        (False, True, 0, jnp.bfloat16, 4096, 2, 1024, 2457, 16, None),
-        (False, True, 0, jnp.bfloat16, 4096, 2, 1024, 2458, 16, "v3"),
-        (False, True, 0, jnp.float32, 4096, 10, 2048, None, 16, None),
-        (False, True, 20480, jnp.bfloat16, 4096, 10, 2048, None, 16, None),
-        (False, True, 20481, jnp.bfloat16, 4096, 10, 2048, None, 16, None),
-        (False, False, 0, jnp.bfloat16, 4096, 10, 2048, None, 16, None),
-        (True, False, 0, jnp.bfloat16, 4, 2, 2, None, 16, None),
-        (False, True, 0, jnp.float16, 4096, 10, 2048, None, 16, None),
-        (False, True, 0, jnp.bfloat16, 512, 10, 1024, None, 16, None),
-        (False, True, 0, jnp.bfloat16, 2048, 10, 1023, None, 16, None),
-        (False, True, 0, jnp.bfloat16, 2048, 10, 1024, None, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 2048, 10, 1100, None, 16, None),
-        (False, True, 0, jnp.bfloat16, 2880, 4, 2048, None, 16, None),
-        (False, True, 0, jnp.bfloat16, 4608, 10, 2048, None, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 5120, 10, 255, None, 16, None),
-        (False, True, 0, jnp.bfloat16, 5120, 10, 256, None, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 5120, 10, 300, None, 16, None),
-        (False, True, 0, jnp.bfloat16, 7168, 10, 2048, None, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 4096, 1, 2048, None, 16, None),
-        (False, True, 0, jnp.bfloat16, 4096, 1, 4096, None, 16, None),
-        (False, True, 0, jnp.bfloat16, 4096, 2, 2048, None, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 4096, 3, 2048, None, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 4096, 4, 2048, None, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 4096, 8, 2048, None, 16, None),
+        (True, True, 0, jnp.bfloat16, 4, 2, 2, None, _TPU7X, "ep"),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 2048, None, _TPU7X, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 2047, None, _TPU7X, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 64, None, _TPU7X, None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 256, None, _TPU7X, None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 511, None, _TPU7X, None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 512, None, _TPU7X, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 544, None, _TPU7X, None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 682, None, _TPU7X, None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 683, None, _TPU7X, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 1025, None, _TPU7X, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 3, 512, 4096, _TPU7X, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 2, 1024, None, _TPU7X, None),
+        (False, True, 0, jnp.bfloat16, 4096, 2, 1024, 2457, _TPU7X, None),
+        (False, True, 0, jnp.bfloat16, 4096, 2, 1024, 2458, _TPU7X, "v3"),
+        (False, True, 0, jnp.float32, 4096, 10, 2048, None, _TPU7X, None),
+        (False, True, 20480, jnp.bfloat16, 4096, 10, 2048, None, _TPU7X, None),
+        (False, True, 20481, jnp.bfloat16, 4096, 10, 2048, None, _TPU7X, None),
+        (False, False, 0, jnp.bfloat16, 4096, 10, 2048, None, _TPU7X, None),
+        (True, False, 0, jnp.bfloat16, 4, 2, 2, None, _TPU7X, None),
+        (False, True, 0, jnp.float16, 4096, 10, 2048, None, _TPU7X, None),
+        (False, True, 0, jnp.bfloat16, 512, 10, 1024, None, _TPU7X, None),
+        (False, True, 0, jnp.bfloat16, 2048, 10, 1023, None, _TPU7X, None),
+        (False, True, 0, jnp.bfloat16, 2048, 10, 1024, None, _TPU7X, "v3"),
+        (False, True, 0, jnp.bfloat16, 2048, 10, 1100, None, _TPU7X, None),
+        (False, True, 0, jnp.bfloat16, 2880, 4, 2048, None, _TPU7X, None),
+        (False, True, 0, jnp.bfloat16, 4608, 10, 2048, None, _TPU7X, "v3"),
+        (False, True, 0, jnp.bfloat16, 5120, 10, 255, None, _TPU7X, None),
+        (False, True, 0, jnp.bfloat16, 5120, 10, 256, None, _TPU7X, "v3"),
+        (False, True, 0, jnp.bfloat16, 5120, 10, 300, None, _TPU7X, None),
+        (False, True, 0, jnp.bfloat16, 7168, 10, 2048, None, _TPU7X, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 1, 2048, None, _TPU7X, None),
+        (False, True, 0, jnp.bfloat16, 4096, 1, 4096, None, _TPU7X, None),
+        (False, True, 0, jnp.bfloat16, 4096, 2, 2048, None, _TPU7X, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 3, 2048, None, _TPU7X, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 4, 2048, None, _TPU7X, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 8, 2048, None, _TPU7X, None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 2048, None, _TPU7X_NO_SC, None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 2048, None, _TPU7X_SC_LANES_8, None),
         (False, True, 0, jnp.bfloat16, 4096, 10, 2048, None, None, None),
-        (False, True, 0, jnp.bfloat16, 4096, 10, 2048, None, 8, None),
-        (False, True, 0, jnp.bfloat16, 4096, 10, 2048, None, "no-tpu-info", None),
-        (False, True, 0, jnp.bfloat16, 4096, 10, 2048, 1 << 20, 16, "v3"),
-        (False, True, 0, jnp.bfloat16, 4096, 10, 2048, (1 << 20) + 1, 16, None),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 2048, 1 << 20, _TPU7X, "v3"),
+        (False, True, 0, jnp.bfloat16, 4096, 10, 2048, (1 << 20) + 1, _TPU7X, None),
     ],
     ids=[
         "ep-selected",
@@ -211,7 +244,7 @@ def test_moe_gmm_uses_selected_ragged_gather_reduce(
     topk,
     num_tokens,
     source_rows,
-    sc_lanes,
+    chip: pltpu.TpuInfo | None,
     expected_path,
 ):
     routes = num_tokens * topk
@@ -219,23 +252,7 @@ def test_moe_gmm_uses_selected_ragged_gather_reduce(
     indices = jnp.arange(routes, dtype=jnp.int32)
     weights = jnp.full((routes,), 0.125, dtype=jnp.bfloat16)
     valid = jnp.ones((routes,), dtype=jnp.bool_)
-    sc_info = (
-        None
-        if sc_lanes in (None, "no-tpu-info")
-        else types.SimpleNamespace(num_lanes=sc_lanes, num_cores=2, num_subcores=16)
-    )
-
-    def get_tpu_info():
-        if sc_lanes == "no-tpu-info":
-            raise ValueError("unsupported device kind")
-        return types.SimpleNamespace(
-            chip_version=pltpu.ChipVersion.TPU_7X,
-            sparse_core=sc_info,
-            num_lanes=128,
-            vmem_capacity_bytes=64 << 20,
-        )
-
-    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", get_tpu_info)
+    monkeypatch.setattr(support, "current_tpu_info", lambda: chip)
     monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *args, **kwargs: 1)
     calls = []
 
@@ -981,20 +998,6 @@ def test_fused_moe_func_int4_packed_matches_reference():
     )
 
 
-def _fake_tpu_info(sparse_core):
-    # A chip the SparseCore kernels are validated on; only the SparseCore
-    # geometry varies across these tests.
-    return types.SimpleNamespace(
-        chip_version=pltpu.ChipVersion.TPU_7X, sparse_core=sparse_core
-    )
-
-
-def _fake_sc_info(num_lanes, num_cores, num_subcores):
-    return types.SimpleNamespace(
-        num_lanes=num_lanes, num_cores=num_cores, num_subcores=num_subcores
-    )
-
-
 def test_onehot_threshold_env_parsing(monkeypatch):
     getter = envs.environment_variables["ONEHOT_MOE_PERMUTE_THRESHOLD"]
     monkeypatch.delenv("ONEHOT_MOE_PERMUTE_THRESHOLD", raising=False)
@@ -1009,7 +1012,7 @@ def test_onehot_threshold_explicit_env_skips_tpu_info(monkeypatch):
     def _fail():
         raise AssertionError("get_tpu_info must not be called")
 
-    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", _fail)
+    monkeypatch.setattr(support, "current_tpu_info", _fail)
     monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", 0, raising=False)
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
 
@@ -1021,34 +1024,24 @@ def test_onehot_threshold_auto_is_one_below_real_blocks(monkeypatch, explicit):
     # 256-row block (v6e) both sit at or below the cap, so block - 1 wins:
     # a full block stays on the SparseCore path. None and -1 both select
     # auto.
-    for sc_info, expected in (
-        (_fake_sc_info(16, 2, 16), 511),
-        (_fake_sc_info(8, 2, 16), 255),
+    for chip, expected in (
+        (_tpu7x_with_sc(16, 2, 16), 511),
+        (_tpu7x_with_sc(8, 2, 16), 255),
     ):
-        monkeypatch.setattr(
-            fused_moe_gmm.pltpu,
-            "get_tpu_info",
-            lambda info=sc_info: _fake_tpu_info(info),
-        )
+        monkeypatch.setattr(support, "current_tpu_info", lambda info=chip: info)
         assert fused_moe_gmm.resolve_onehot_permute_threshold() == expected
 
 
 def test_onehot_threshold_auto_caps_oversized_block(monkeypatch):
     monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
     # A hypothetical 1024-row block exceeds the cap, so the cap wins.
-    monkeypatch.setattr(
-        fused_moe_gmm.pltpu,
-        "get_tpu_info",
-        lambda: _fake_tpu_info(_fake_sc_info(32, 2, 16)),
-    )
+    monkeypatch.setattr(support, "current_tpu_info", lambda: _tpu7x_with_sc(32, 2, 16))
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 512
 
 
 def test_onehot_threshold_auto_zero_without_sparse_core(monkeypatch):
     monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
-    monkeypatch.setattr(
-        fused_moe_gmm.pltpu, "get_tpu_info", lambda: _fake_tpu_info(None)
-    )
+    monkeypatch.setattr(support, "current_tpu_info", lambda: _TPU7X_NO_SC)
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
 
 
@@ -1058,17 +1051,13 @@ def test_onehot_threshold_auto_zero_for_unvalidated_sparse_core_chip(monkeypatch
     # not validated on it, so the one-hot path is off.
     info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_8I, 1)
     assert info.sparse_core is not None
-    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", lambda: info)
+    monkeypatch.setattr(support, "current_tpu_info", lambda: info)
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
 
 
 def test_onehot_threshold_auto_zero_on_non_tpu_host(monkeypatch):
     monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
-
-    def _raise():
-        raise ValueError("Unsupported TPU device kind: cpu")
-
-    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", _raise)
+    monkeypatch.setattr(support, "current_tpu_info", lambda: None)
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
 
 

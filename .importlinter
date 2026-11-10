@@ -1,0 +1,46 @@
+# Each level owns its decisions and hands them down resolved; a lower level
+# never reaches up (DATA_CONTRACTS section 3). Checked by `lint-imports`.
+#
+# `ignore_imports` lists the upward edges that existed when a contract
+# landed. `unmatched_ignore_imports_alerting = error` fails the run when a
+# listed edge is gone, so the list can only shrink.
+
+[importlinter]
+root_package = vllm_torchtpu
+
+# Today's packages stand in for the scopes: the runner for the model scope,
+# models and the vLLM layer adapters for the block scope, layers.core for the
+# family scope, kernels at the bottom.
+[importlinter:contract:scopes-top-down]
+name = Scopes import only downward
+type = layers
+layers =
+    vllm_torchtpu.runner
+    vllm_torchtpu.models
+    vllm_torchtpu.layers.adapter
+    vllm_torchtpu.layers.core
+    vllm_torchtpu.kernels
+ignore_imports =
+    # Adapters read the model's forward context.
+    vllm_torchtpu.layers.adapter.attention -> vllm_torchtpu.models.vllm.vllm_model_wrapper_context
+    vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op -> vllm_torchtpu.models.vllm.vllm_model_wrapper_context
+    vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor -> vllm_torchtpu.models.vllm.vllm_model_wrapper_context
+    vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer -> vllm_torchtpu.models.vllm.vllm_model_wrapper_context
+    vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_mhc_op -> vllm_torchtpu.models.vllm.vllm_model_wrapper_context
+    # Kernels reach into layer quantization and routing.
+    vllm_torchtpu.kernels.deepseek_v4.rope -> vllm_torchtpu.layers.core.quantization
+    vllm_torchtpu.kernels.deepseek_v4.o_projection -> vllm_torchtpu.layers.core.quantization
+    vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter -> vllm_torchtpu.layers.adapter.moe_routing
+    vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter -> vllm_torchtpu.layers.adapter.quantization.configs
+unmatched_ignore_imports_alerting = error
+
+# Inside the family scope: the code that runs the MoE combine imports its
+# decision module, never the reverse.
+[importlinter:contract:family-decides-below-executor]
+name = The decision module does not import the code that runs its plan
+type = layers
+containers = vllm_torchtpu.layers.core
+layers =
+    fused_moe_gmm
+    moe_plan
+    resolution
