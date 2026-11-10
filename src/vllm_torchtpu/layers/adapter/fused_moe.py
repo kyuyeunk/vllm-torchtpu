@@ -11,11 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Torch bridge for fused MoE based on fused_moe_func in fused_moe_gmm."""
+"""Torch bridge for fused MoE based on fused_moe_op_fn in fused_moe_gmm."""
 
 import enum
-import functools
-from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -23,18 +21,31 @@ from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
-    fused_moe_func,
+    fused_moe_op_fn,
     quantize_to_native_fp4_kmajor,
     requant_unpack_kmajor,
     resolve_onehot_permute_threshold,
     unpack_fp4_to_e2m1,
 )
 
-_kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
-_load_kmajor_fp4_op = None
-_requant_kmajor_fp4_ops: dict[int, Callable] = {}
-_quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
+# Registered at import, so no registration happens inside a traced forward.
+_load_kmajor_fp4_op = pallas.jax_op("pallas::nvfp4_load_kmajor", unpack_fp4_to_e2m1)
+_requant_kmajor_fp4_op = pallas.jax_op(
+    "pallas::nvfp4_requant_kmajor", requant_unpack_kmajor
+)
+_quantize_native_fp4_kmajor_op = pallas.jax_op(
+    "pallas::nvfp4_quantize_native_kmajor", quantize_to_native_fp4_kmajor
+)
+
+
+def _fake_fused_moe(hidden_states, *args, **kwargs):
+    # vLLM traces hidden_states with a dynamic token dimension, which the
+    # default fake rejects.
+    return torch.empty_like(hidden_states)
+
+
+_fused_moe_op = pallas.jax_op("pallas::fused_moe_gmm", fused_moe_op_fn)
+_fused_moe_op.register_fake(_fake_fused_moe)
 
 
 def _resolve_activation_name(activation: Any) -> str:
@@ -92,11 +103,6 @@ def load_kmajor_fp4(w_u8: torch.Tensor) -> torch.Tensor:
     torch_tpu's native ``torch.float4_e2m1fn_x2`` dtype
     (google-pytorch/torch_tpu#1560).
     """
-    global _load_kmajor_fp4_op
-    if _load_kmajor_fp4_op is None:
-        _load_kmajor_fp4_op = pallas.jax_op(
-            "pallas::nvfp4_load_kmajor", unpack_fp4_to_e2m1
-        )
     return _load_kmajor_fp4_op(w_u8)
 
 
@@ -110,14 +116,7 @@ def requant_load_kmajor_fp4(
     K//block, 1, N]``. Doing the dequant+requant in JAX (vs torch) avoids
     materializing the dequantized weight on the host and rounds to fp4 with the
     same cast the kernel reads."""
-    op = _requant_kmajor_fp4_ops.get(block)
-    if op is None:
-        op = pallas.jax_op(
-            f"pallas::nvfp4_requant_kmajor_b{block}",
-            functools.partial(requant_unpack_kmajor, block=block),
-        )
-        _requant_kmajor_fp4_ops[block] = op
-    return op(w_u8, scale_f)
+    return _requant_kmajor_fp4_op(w_u8, scale_f, block)
 
 
 def quantize_native_fp4_kmajor(
@@ -126,98 +125,37 @@ def quantize_native_fp4_kmajor(
     """Quantize an already-dequantized, K-major float weight to native FP4.
 
     ``pack=False`` hands the weight back as ``torch.float4_e2m1fn_x2`` rather
-    than packed uint8 -- the form the fused EP MoE kernel takes. The two are
-    distinct traced programs with distinct op names, so the cache is keyed on
-    both: one qualname serving two closures would silently dispatch to
-    whichever registered first.
+    than packed uint8 -- the form the fused EP MoE kernel takes.
     """
-    key = (block, pack)
-    op = _quantize_native_fp4_kmajor_ops.get(key)
-    if op is None:
-        op = pallas.jax_op(
-            f"pallas::nvfp4_quantize_native_kmajor_b{block}"
-            f"{'' if pack else '_unpacked'}",
-            functools.partial(quantize_to_native_fp4_kmajor, block=block, pack=pack),
-        )
-        _quantize_native_fp4_kmajor_ops[key] = op
-    return op(w)
+    return _quantize_native_fp4_kmajor_op(w, block, pack)
 
 
-def _allocate_kernel_instance_id() -> int:
-    global _kernel_instance_counter
-    kernel_instance_id = _kernel_instance_counter
-    _kernel_instance_counter += 1
-    return kernel_instance_id
+# (use_sparse_core, one-hot permute threshold), resolved once outside tracing.
+# A plain global rather than functools.cache: Dynamo traces fused_moe_gmm and
+# cannot trace a call through a functools.cache wrapper.
+_moe_statics: tuple[bool, int] | None = None
 
 
-def _build_fused_moe_custom_op(
-    *,
-    topk: int,
-    activation: str,
-    use_ep: bool,
-    skip_padded_tokens: bool,
-    rhs_quant_dtype=None,
-):
-    kernel_instance_id = _allocate_kernel_instance_id()
-    op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
+def _get_moe_statics() -> tuple[bool, int]:
+    """Returns the process-wide fused MoE settings.
 
-    # TODO: once the pod's vLLM includes --moe-backend (added upstream in
-    # vLLM PR #33807, 2026-03-01; absent in the 0.19.0 we run), register the
-    # SparseCore vs plain variants through that selector + the MoE oracle
-    # instead of this env flag -- the MoE analog of how #191 moved batched
-    # RPA onto --attention-backend CUSTOM. Note MoEBackend has no CUSTOM slot
-    # yet, so that also needs an upstream OOT-backend hook.
-    use_sparse_core = envs.USE_MOE_SPARSE_CORE
+    The one-hot threshold queries the device, so `prebuild_fused_moe_kernel`
+    resolves the settings at weight load, before tracing; inside a trace this
+    only reads the stored value.
 
-    # Pass experts_start as a runtime tensor rather than static closure arg so every EP
-    # rank compiles an identical program.
-    # See fa8faaf5 for background on rank-uniform sharding in compiled Pallas graphs.
-    wrapped_fn = functools.partial(
-        fused_moe_func,
-        topk=topk,
-        activation=activation,
-        use_ep=use_ep,
-        use_sparse_core=use_sparse_core,
-        onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
-    )
-
-    fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
-
-    # We must overwrite the default fake implementation as vLLM uses dynamic
-    # dimensions for the hidden_states.
-    def _fake_fused_moe(hidden_states, *args, **kwargs):
-        return torch.empty_like(hidden_states)
-
-    fused_moe_kernel_impl.register_fake(_fake_fused_moe)
-
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
-    _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
-    return fused_moe_kernel_impl
-
-
-def _get_fused_moe_custom_op(
-    *,
-    topk: int,
-    activation: str,
-    use_ep: bool,
-    rhs_quant_dtype=None,
-    skip_padded_tokens: bool | None = None,
-):
-    if skip_padded_tokens is None:
-        skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
-    kernel = _fused_moe_kernel_cache.get(cache_key)
-    if kernel is not None:
-        return kernel
-    return _build_fused_moe_custom_op(
-        topk=topk,
-        activation=activation,
-        use_ep=use_ep,
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
-    )
+    Returns:
+        A tuple ``(use_sparse_core, onehot_moe_permute_threshold)``.
+    """
+    global _moe_statics
+    if _moe_statics is None:
+        # TODO: once the pod's vLLM includes --moe-backend (added upstream in
+        # vLLM PR #33807, 2026-03-01; absent in the 0.19.0 we run), register
+        # the SparseCore vs plain variants through that selector + the MoE
+        # oracle instead of this env flag -- the MoE analog of how #191 moved
+        # batched RPA onto --attention-backend CUSTOM. Note MoEBackend has no
+        # CUSTOM slot yet, so that also needs an upstream OOT-backend hook.
+        _moe_statics = (envs.USE_MOE_SPARSE_CORE, resolve_onehot_permute_threshold())
+    return _moe_statics
 
 
 def prebuild_fused_moe_kernel(
@@ -228,14 +166,13 @@ def prebuild_fused_moe_kernel(
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
 ) -> None:
-    """Prebuild and cache fused MoE custom op outside compile-time tracing."""
-    _get_fused_moe_custom_op(
-        topk=topk,
-        activation=activation,
-        use_ep=use_ep,
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
-    )
+    """Resolves the fused MoE settings outside compile-time tracing.
+
+    Call at weight load. The arguments are unused and kept for existing
+    callers; the layer configuration is passed to the op on each call.
+    """
+    del topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens
+    _get_moe_statics()
 
 
 def fused_moe_gmm(
@@ -267,19 +204,18 @@ def fused_moe_gmm(
     the sparse-core parity path dispatches ragged gather/gather-reduce.
     """
     use_ep = experts_start is not None
-    fused_moe = _get_fused_moe_custom_op(
-        topk=topk,
-        activation=activation,
-        use_ep=use_ep,
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
-    )
+    if skip_padded_tokens is None:
+        skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
+    use_sparse_core, onehot_threshold = _get_moe_statics()
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand
         # (see the `if use_ep:` guard in fused_moe_func), but the custom op
         # still needs a concrete tensor to call with a fixed arity.
         experts_start = torch.zeros((), dtype=torch.int32, device=hidden_states.device)
-    return fused_moe(
+    # Pass experts_start as a runtime tensor rather than a static argument so
+    # every EP rank compiles an identical program. See fa8faaf5 for background
+    # on rank-uniform sharding in compiled Pallas graphs.
+    return _fused_moe_op(
         hidden_states,
         w1,
         w2,
@@ -290,4 +226,11 @@ def fused_moe_gmm(
         topk_weights,
         topk_ids,
         experts_start,
+        topk,
+        activation,
+        use_ep,
+        use_sparse_core,
+        onehot_threshold,
+        None if rhs_quant_dtype is None else rhs_quant_dtype.__name__,
+        skip_padded_tokens,
     )
