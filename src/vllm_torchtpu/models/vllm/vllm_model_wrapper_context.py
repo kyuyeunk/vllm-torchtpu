@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from jax.sharding import Mesh
@@ -65,6 +67,36 @@ def get_pallas_op_mesh() -> Mesh | None:
     if mesh is None or mesh.size == 1:
         return None
     return mesh
+
+
+# Cache for `get_pallas_op_for_mesh`, keyed by (base op name, kernel mesh).
+_pallas_ops_by_mesh: dict[tuple[str, Mesh | None], Any] = {}
+
+
+def get_pallas_op_for_mesh(
+    name: str, register: Callable[[str, Mesh | None], Any]
+) -> Any:
+    """Returns the op registered as ``name`` for the current kernel mesh.
+
+    On first use for a mesh, calls ``register(op_name, mesh)`` with the mesh
+    from ``get_pallas_op_mesh``. A torch op name can be registered only once,
+    so each mesh after the first gets ``name`` with a numeric suffix.
+
+    Args:
+        name: Base torch op name, e.g. ``"pallas::deepseek_v4_o_proj"``.
+        register: Registers and returns the op under the given name on the
+            given mesh.
+
+    Returns:
+        The registered op.
+    """
+    mesh = get_pallas_op_mesh()
+    op = _pallas_ops_by_mesh.get((name, mesh))
+    if op is None:
+        clashes = sum(base == name for base, _ in _pallas_ops_by_mesh)
+        op = register(f"{name}_{clashes}" if clashes else name, mesh)
+        _pallas_ops_by_mesh[(name, mesh)] = op
+    return op
 
 
 @contextmanager

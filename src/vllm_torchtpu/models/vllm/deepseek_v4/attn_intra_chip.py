@@ -55,6 +55,7 @@ described.
 from __future__ import annotations
 
 import functools
+from typing import Any
 
 import jax
 import torch
@@ -71,10 +72,13 @@ from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import (
     VllmDeepseekV4MLAAttention,
-    _pallas_op_cache,
 )
 
 logger = init_logger(__name__)
+
+# The chip-pair wo_a op by EP mesh. It runs on the EP mesh, not the
+# wrapper-context mesh, so `get_pallas_op_for_mesh` cannot cache it.
+_o_fetch_ops: dict[Mesh, Any] = {}
 
 
 def _chip_pair_group() -> parallel_state.GroupCoordinator:
@@ -137,11 +141,7 @@ def _on_pair_mesh(kernel, mesh: Mesh, *args):
     )(*args)
 
 
-def _wo_a_o_fetch_fn(mesh: Mesh, head_dim: int):
-    kernel = functools.partial(
-        fused_reverse_rope_wo_a_projection_o_fetch, head_dim=head_dim
-    )
-
+def _wo_a_o_fetch_fn(mesh: Mesh):
     def fn(
         o: jax.Array,
         positions: jax.Array,
@@ -150,9 +150,13 @@ def _wo_a_o_fetch_fn(mesh: Mesh, head_dim: int):
         wo_a_scale: jax.Array,
         neighbor_mesh_index: jax.Array,
         chiplet_index: jax.Array,
+        *,
+        head_dim: int,
     ) -> jax.Array:
         return _on_pair_mesh(
-            kernel,
+            functools.partial(
+                fused_reverse_rope_wo_a_projection_o_fetch, head_dim=head_dim
+            ),
             mesh,
             o,
             positions,
@@ -211,26 +215,27 @@ class _FusedOFetch:
         )
         self.neighbor_mesh_index = as_i32([neighbor_mesh_index])
         self.chiplet_index = as_i32([group.rank_in_group])
-        name = f"pallas::deepseek_v4_wo_a_o_fetch_d{head_dim}"
-        op = _pallas_op_cache.get(name)
+        op = _o_fetch_ops.get(mesh)
         if op is None:
             (ax,) = mesh.axis_names
+            name = "pallas::deepseek_v4_wo_a_o_fetch"
             # jax_op's stub types partition specs as tuple[tuple[str, ...], ...].
             # pyrefly: ignore[no-matching-overload]
             op = pallas.jax_op(
-                name,
-                _wo_a_o_fetch_fn(mesh, head_dim),
+                f"{name}_{len(_o_fetch_ops)}" if _o_fetch_ops else name,
+                _wo_a_o_fetch_fn(mesh),
                 mesh=mesh,
                 input_partition_specs=(P(ax),) * 7,
                 output_partition_specs=P(ax),
             )
             op.register_fake(
-                lambda o, pos, _cache, wo_a, *_: o.new_empty(
+                lambda o, pos, _cache, wo_a, *_, **__: o.new_empty(
                     (pos.shape[0], wo_a.shape[1])
                 )
             )
-            _pallas_op_cache[name] = op
+            _o_fetch_ops[mesh] = op
         self._op = op
+        self._head_dim = head_dim
 
     def __call__(self, o, positions_all, cos_sin_cache, wo_a, wo_a_scale):
         """wo_a over [chiplet 0 tokens; chiplet 1 tokens] with the current
@@ -244,6 +249,7 @@ class _FusedOFetch:
             wo_a_scale,
             self.neighbor_mesh_index,
             self.chiplet_index,
+            head_dim=self._head_dim,
         )
 
 

@@ -80,7 +80,6 @@ def _load_module(monkeypatch):
     stubs["torch_tpu._internal"].pallas = None
     attention = stubs["vllm_torchtpu.models.vllm.deepseek_v4.attention"]
     attention.VllmDeepseekV4MLAAttention = _FakeBaseAttention
-    attention._pallas_op_cache = {}
     stubs["vllm.distributed"].parallel_state = types.SimpleNamespace()
     stubs["vllm.model_executor.layers.linear"].ColumnParallelLinear = object
     stubs["vllm.model_executor.layers.linear"].RowParallelLinear = object
@@ -314,12 +313,13 @@ def test_fused_o_fetch_finds_neighbor_and_chiplet_index(monkeypatch):
     aic = _load_module(monkeypatch)
     # Mesh order differs from device id order, as under PCP/DCP.
     mesh_ids = [2, 3, 1, 0]
-    mesh = types.SimpleNamespace(
-        devices=types.SimpleNamespace(
-            flat=[types.SimpleNamespace(id=i) for i in mesh_ids]
-        ),
-        axis_names=("ep",),
+    # A plain class instance rather than SimpleNamespace: the op cache keys on
+    # the mesh, which must be hashable as a real jax Mesh is.
+    mesh = type("FakeMesh", (), {})()
+    mesh.devices = types.SimpleNamespace(
+        flat=[types.SimpleNamespace(id=i) for i in mesh_ids]
     )
+    mesh.axis_names = ("ep",)
     modules = {
         "vllm_torchtpu.distributed": types.ModuleType("vllm_torchtpu.distributed"),
         "vllm_torchtpu.distributed.chip_topology": types.ModuleType("chip_topology"),

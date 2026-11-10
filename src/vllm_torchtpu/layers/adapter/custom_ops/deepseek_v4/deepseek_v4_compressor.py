@@ -14,11 +14,12 @@
 """TPU DeepSeek-V4 KV/score compressor, on the compress-and-store kernels."""
 
 import functools
-from typing import TYPE_CHECKING, Self, cast
+from typing import TYPE_CHECKING, Any, Self, cast
 
 import jax
 import torch
 import torch.nn as nn
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -35,7 +36,7 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store.compressor_v1 import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-    get_pallas_op_mesh,
+    get_pallas_op_for_mesh,
 )
 from vllm_torchtpu.utils import align_to, synchronize_tensors
 
@@ -43,8 +44,6 @@ if TYPE_CHECKING:
     from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 logger = init_logger(__name__)
-
-_compressor_op_cache = {}
 
 # The mesh has no batch axis today, so every batch-axis spec resolves to None.
 # TODO(patemotter): name it here once the DP-attention PR adds the axis.
@@ -248,6 +247,106 @@ def _compressor_jax_indexer(
         seq_along_lane=True,
     )
     return new_cache
+
+
+_COMPRESSOR_JAX_FNS = {
+    "csa": _compressor_jax_csa,
+    "hca": _compressor_jax_hca,
+    "indexer": _compressor_jax_indexer,
+}
+
+
+def _fake_compressor_one_cache(
+    hidden_states,
+    wkv_wgate,
+    ape,
+    norm_weight,
+    cos_sin_cache,
+    positions,
+    state_block_tables,
+    query_start_loc,
+    k_block_tables,
+    request_distribution,
+    cache,
+    *args,
+    **kwargs,
+):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return torch.empty_like(cache)
+
+
+def _fake_compressor_two_caches(
+    hidden_states,
+    wkv_wgate,
+    ape,
+    norm_weight,
+    cos_sin_cache,
+    positions,
+    state_block_tables,
+    query_start_loc,
+    k_block_tables,
+    request_distribution,
+    cache,
+    second_cache,
+    *args,
+    **kwargs,
+):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return torch.empty_like(cache), torch.empty_like(second_cache)
+
+
+def _register_compressor(variant: str, name: str, mesh: Mesh | None) -> Any:
+    """Registers the compressor op for `variant`.
+
+    Args:
+        variant: One of "csa", "hca" or "indexer".
+        name: Torch op name to register under.
+        mesh: Kernel mesh, or None to run on the local device.
+
+    Returns:
+        The registered op.
+    """
+    attn_data_axis = None
+    batch_axis = BATCH_AXIS
+    input_partition_specs = (
+        P(attn_data_axis, None),  # hidden_states
+        P(),  # wkv_wgate
+        P(),  # ape
+        P(),  # norm_weight
+        P(),  # cos_sin_cache
+        P(attn_data_axis),  # positions
+        P(batch_axis),  # state_block_tables
+        P(),  # query_start_loc
+        P(batch_axis),  # k_block_tables
+        P(),  # request_distribution
+        P(),  # cache
+    )
+    donate_argnums = (len(input_partition_specs) - 1,)  # cache
+    if variant != "indexer":
+        input_partition_specs += (P(),)  # rope_cache / state_cache
+        donate_argnums += (len(input_partition_specs) - 1,)
+
+    op = pallas.jax_op(
+        name,
+        _COMPRESSOR_JAX_FNS[variant],
+        mesh=mesh,
+        donate_argnums=donate_argnums,
+        input_partition_specs=input_partition_specs,
+    )
+    op.register_fake(
+        _fake_compressor_one_cache
+        if variant == "indexer"
+        else _fake_compressor_two_caches
+    )
+    return op
+
+
+def _get_compressor_op(variant: str) -> Any:
+    """Returns the compressor op for `variant` on the current kernel mesh."""
+    return get_pallas_op_for_mesh(
+        f"pallas::deepseek_v4_compressor_{variant}",
+        functools.partial(_register_compressor, variant),
+    )
 
 
 class RunLocalStateSpec(SlidingWindowMLASpec):
@@ -487,18 +586,15 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                 f"{self.prefix!r}: RunLocalStateSpec does not cache the previous "
                 "run's state, which an overlapping compressor kernel reads"
             )
-        mesh = get_pallas_op_mesh()
-
         assert self.head_dim in (512, 128), self.head_dim
         if self._has_rope_cache:
-            variant, jax_fn = "csa", _compressor_jax_csa
+            variant = "csa"
         elif self._separate_state:
-            variant, jax_fn = "hca", _compressor_jax_hca
+            variant = "hca"
         else:
-            variant, jax_fn = "indexer", _compressor_jax_indexer
-
-        wrapped_fn = functools.partial(
-            jax_fn,
+            variant = "indexer"
+        return functools.partial(
+            _get_compressor_op(variant),
             state_block_size=self.state_cache.block_size,
             head_dim=self.head_dim,
             compress_ratio=self.compress_ratio,
@@ -506,87 +602,6 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             rms_eps=self.rms_norm_eps,
             quant_block=self._quant_block,
         )
-
-        op_name = (
-            f"pallas::deepseek_v4_compressor_{variant}"
-            f"_{self.head_dim}_{self.compress_ratio}"
-            f"_{self.state_cache.block_size}"
-        )
-
-        global _compressor_op_cache
-        if op_name in _compressor_op_cache:
-            return _compressor_op_cache[op_name]
-
-        attn_data_axis = None
-        batch_axis = BATCH_AXIS
-        input_partition_specs = (
-            P(attn_data_axis, None),  # hidden_states
-            P(),  # wkv_wgate
-            P(),  # ape
-            P(),  # norm_weight
-            P(),  # cos_sin_cache
-            P(attn_data_axis),  # positions
-            P(batch_axis),  # state_block_tables
-            P(),  # query_start_loc
-            P(batch_axis),  # k_block_tables
-            P(),  # request_distribution
-            P(),  # cache
-        )
-        donate_argnums = (len(input_partition_specs) - 1,)  # cache
-        if variant != "indexer":
-            input_partition_specs += (P(),)  # rope_cache / state_cache
-            donate_argnums += (len(input_partition_specs) - 1,)
-
-        compressor_jax_op = pallas.jax_op(
-            op_name,
-            wrapped_fn,
-            mesh=mesh,
-            donate_argnums=donate_argnums,
-            input_partition_specs=input_partition_specs,
-        )
-
-        if variant == "indexer":
-
-            def _fake_compressor(
-                hidden_states,
-                wkv_wgate,
-                ape,
-                norm_weight,
-                cos_sin_cache,
-                positions,
-                state_block_tables,
-                query_start_loc,
-                k_block_tables,
-                request_distribution,
-                cache,
-                *args,
-                **kwargs,
-            ):
-                return torch.empty_like(cache)
-        else:
-
-            def _fake_compressor(
-                hidden_states,
-                wkv_wgate,
-                ape,
-                norm_weight,
-                cos_sin_cache,
-                positions,
-                state_block_tables,
-                query_start_loc,
-                k_block_tables,
-                request_distribution,
-                cache,
-                second_cache,
-                *args,
-                **kwargs,
-            ):
-                return torch.empty_like(cache), torch.empty_like(second_cache)
-
-        compressor_jax_op.register_fake(_fake_compressor)
-
-        _compressor_op_cache[op_name] = compressor_jax_op
-        return compressor_jax_op
 
     @staticmethod
     def _as_kernel_cache_view(cache: torch.Tensor | None) -> torch.Tensor | None:

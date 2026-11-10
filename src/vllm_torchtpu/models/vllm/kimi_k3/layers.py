@@ -16,13 +16,14 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
-from functools import cache
+from functools import cache, partial
 from typing import cast
 from unittest.mock import patch
 
 import jax
 import torch
 from torch import nn
+from torch_tpu._internal import pallas
 from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -39,19 +40,26 @@ from vllm_torchtpu.utils import fresh_buffer
 from .collective_ops import TokenShardCollectives
 
 
-@cache
-def _build_attention_residual_op(eps: float):
-    from torch_tpu._internal import pallas
-
+def _attention_residual_jax(
+    prefix: jax.Array, history: jax.Array, weight: jax.Array, *, eps: float
+) -> jax.Array:
     from vllm_torchtpu.kernels.kimi_k3.attention_residual import attention_residual
 
-    def core(prefix: jax.Array, history: jax.Array, weight: jax.Array) -> jax.Array:
-        return attention_residual(prefix, history, weight, eps=eps)
+    return attention_residual(prefix, history, weight, eps=eps)
 
-    suffix = float(eps).hex().replace(".", "_").replace("-", "m").replace("+", "p")
-    op = pallas.jax_op(f"pallas::kimi_attention_residual_{suffix}", core)
-    op.register_fake(lambda prefix, history, weight: torch.empty_like(prefix))
-    return op
+
+_attention_residual_op = pallas.jax_op(
+    "pallas::kimi_attention_residual", _attention_residual_jax
+)
+_attention_residual_op.register_fake(
+    lambda prefix, history, weight, **_: torch.empty_like(prefix)
+)
+
+
+@cache
+def _build_attention_residual_op(eps: float):
+    """Returns the Attention Residual op with `eps` bound."""
+    return partial(_attention_residual_op, eps=eps)
 
 
 class SituAndMul(nn.Module):

@@ -23,6 +23,7 @@ from typing import Any, NamedTuple
 
 import jax
 import torch
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
@@ -32,35 +33,13 @@ from vllm_torchtpu.kernels.deepseek_v4.mhc import (
     pre_kernel,
 )
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-    get_pallas_op_mesh,
+    get_pallas_op_for_mesh,
 )
 
 # Every mHC tensor is token-major, so its leading axis is the attention-DP
 # token axis. As in the other DeepSeek-V4 ops, the mesh carries no such axis
 # today, so it resolves to None.
 ATTN_DATA_AXIS = None
-
-_mhc_op_cache: dict[str, Any] = {}
-
-
-def _name_float(value: float) -> str:
-    """A float rendered so it is safe inside a torch op name."""
-    return f"{value:.6g}".replace(".", "p").replace("-", "m").replace("+", "")
-
-
-def _gate_suffix(
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_mult_value: float,
-    sinkhorn_repeat: int,
-) -> str:
-    """The gate constants are baked into the traced op, so they name it."""
-    return (
-        f"_r{_name_float(rms_eps)}_p{_name_float(hc_pre_eps)}"
-        f"_s{_name_float(hc_sinkhorn_eps)}"
-        f"_a{_name_float(hc_post_mult_value)}_i{sinkhorn_repeat}"
-    )
 
 
 # Module-level so `pallas.jax_op` can trace and register them as torch ops.
@@ -170,38 +149,54 @@ def _fake_mhc_fused_post_pre(
     return (torch.empty_like(residual), *_fake_pre_outputs(residual))
 
 
-def _mhc_pre_op(
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_mult_value: float,
-    sinkhorn_repeat: int,
-):
-    op_name = "pallas::deepseek_v4_mhc_pre_v1" + _gate_suffix(
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+def _register_mhc_pre(name: str, mesh: Mesh | None) -> Any:
+    op = pallas.jax_op(
+        name,
+        _mhc_pre_jax,
+        mesh=mesh,
+        input_partition_specs=(
+            P(ATTN_DATA_AXIS, None, None),  # residual
+            P(),  # fn
+            P(),  # hc_scale
+            P(),  # hc_base
+        ),
     )
-    op = _mhc_op_cache.get(op_name)
-    if op is None:
-        op = pallas.jax_op(
-            op_name,
-            functools.partial(
-                _mhc_pre_jax,
-                rms_eps=rms_eps,
-                hc_pre_eps=hc_pre_eps,
-                hc_sinkhorn_eps=hc_sinkhorn_eps,
-                hc_post_mult_value=hc_post_mult_value,
-                sinkhorn_repeat=sinkhorn_repeat,
-            ),
-            mesh=get_pallas_op_mesh(),
-            input_partition_specs=(
-                P(ATTN_DATA_AXIS, None, None),  # residual
-                P(),  # fn
-                P(),  # hc_scale
-                P(),  # hc_base
-            ),
-        )
-        op.register_fake(_fake_mhc_pre)
-        _mhc_op_cache[op_name] = op
+    op.register_fake(_fake_mhc_pre)
+    return op
+
+
+def _register_mhc_post(name: str, mesh: Mesh | None) -> Any:
+    op = pallas.jax_op(
+        name,
+        _mhc_post_jax,
+        mesh=mesh,
+        input_partition_specs=(
+            P(ATTN_DATA_AXIS, None),  # x
+            P(ATTN_DATA_AXIS, None, None),  # residual
+            P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
+            P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
+        ),
+    )
+    op.register_fake(_fake_mhc_post)
+    return op
+
+
+def _register_mhc_fused_post_pre(name: str, mesh: Mesh | None) -> Any:
+    op = pallas.jax_op(
+        name,
+        _mhc_fused_post_pre_jax,
+        mesh=mesh,
+        input_partition_specs=(
+            P(ATTN_DATA_AXIS, None),  # x
+            P(ATTN_DATA_AXIS, None, None),  # residual
+            P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
+            P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
+            P(),  # fn
+            P(),  # hc_scale
+            P(),  # hc_base
+        ),
+    )
+    op.register_fake(_fake_mhc_fused_post_pre)
     return op
 
 
@@ -211,65 +206,11 @@ def get_mhc_post_op():
     ``post`` takes no gate constants, so this needs none. Same
     outside-the-trace requirement as ``get_mhc_ops``.
     """
-    op_name = "pallas::deepseek_v4_mhc_post_v1"
-    op = _mhc_op_cache.get(op_name)
-    if op is None:
-        op = pallas.jax_op(
-            op_name,
-            _mhc_post_jax,
-            mesh=get_pallas_op_mesh(),
-            input_partition_specs=(
-                P(ATTN_DATA_AXIS, None),  # x
-                P(ATTN_DATA_AXIS, None, None),  # residual
-                P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
-                P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
-            ),
-        )
-        op.register_fake(_fake_mhc_post)
-        _mhc_op_cache[op_name] = op
-    return op
-
-
-def _mhc_fused_post_pre_op(
-    rms_eps: float,
-    hc_pre_eps: float,
-    hc_sinkhorn_eps: float,
-    hc_post_mult_value: float,
-    sinkhorn_repeat: int,
-):
-    op_name = "pallas::deepseek_v4_mhc_fused_post_pre_v1" + _gate_suffix(
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
-    )
-    op = _mhc_op_cache.get(op_name)
-    if op is None:
-        op = pallas.jax_op(
-            op_name,
-            functools.partial(
-                _mhc_fused_post_pre_jax,
-                rms_eps=rms_eps,
-                hc_pre_eps=hc_pre_eps,
-                hc_sinkhorn_eps=hc_sinkhorn_eps,
-                hc_post_mult_value=hc_post_mult_value,
-                sinkhorn_repeat=sinkhorn_repeat,
-            ),
-            mesh=get_pallas_op_mesh(),
-            input_partition_specs=(
-                P(ATTN_DATA_AXIS, None),  # x
-                P(ATTN_DATA_AXIS, None, None),  # residual
-                P(ATTN_DATA_AXIS, None, None),  # post_layer_mix
-                P(ATTN_DATA_AXIS, None, None),  # comb_res_mix
-                P(),  # fn
-                P(),  # hc_scale
-                P(),  # hc_base
-            ),
-        )
-        op.register_fake(_fake_mhc_fused_post_pre)
-        _mhc_op_cache[op_name] = op
-    return op
+    return get_pallas_op_for_mesh("pallas::deepseek_v4_mhc_post_v1", _register_mhc_post)
 
 
 class MHCOps(NamedTuple):
-    """The three registered mHC ops for one set of gate constants.
+    """The three mHC ops, bound to one set of gate constants.
 
     ``pre`` and ``post`` match vLLM's ``mhc_pre_torch`` / ``mhc_post_torch``
     contracts; ``fused`` is the seam op, equivalent to ``post`` followed by
@@ -306,12 +247,24 @@ def get_mhc_ops(
     the returned ops and invoke them directly, keeping the op lookup out of
     the traced graph entirely.
     """
+    gates = {
+        "rms_eps": rms_eps,
+        "hc_pre_eps": hc_pre_eps,
+        "hc_sinkhorn_eps": hc_sinkhorn_eps,
+        "hc_post_mult_value": hc_post_mult_value,
+        "sinkhorn_repeat": sinkhorn_repeat,
+    }
     return MHCOps(
-        pre=_mhc_pre_op(
-            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        pre=functools.partial(
+            get_pallas_op_for_mesh("pallas::deepseek_v4_mhc_pre_v1", _register_mhc_pre),
+            **gates,
         ),
-        fused=_mhc_fused_post_pre_op(
-            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        fused=functools.partial(
+            get_pallas_op_for_mesh(
+                "pallas::deepseek_v4_mhc_fused_post_pre_v1",
+                _register_mhc_fused_post_pre,
+            ),
+            **gates,
         ),
         post=get_mhc_post_op(),
     )

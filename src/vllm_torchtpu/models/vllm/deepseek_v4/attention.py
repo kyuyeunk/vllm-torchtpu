@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import jax
 import torch
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
@@ -59,14 +60,12 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer imp
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-    get_pallas_op_mesh,
+    get_pallas_op_for_mesh,
     get_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.utils import fresh_buffer
 
 logger = init_logger(__name__)
-
-_pallas_op_cache: dict[str, Any] = {}
 
 
 class DeepseekV4TPUAttentionBackend(PallasAttentionBackend):
@@ -128,9 +127,110 @@ def _fake_o_proj(x, positions, cos_sin_cache, wo_a, wo_a_scale, *args, **kwargs)
     return torch.empty((x.shape[0], wo_a.shape[-1]), dtype=x.dtype, device=x.device)
 
 
-def _name_float(value: float) -> str:
-    """A float rendered so it is safe inside a torch op name."""
-    return f"{value:.6g}".replace(".", "p").replace("-", "m").replace("+", "")
+def _fake_attn(q, new_kv, sw_cache, *args, **kwargs):
+    """Abstract implementation for PyTorch Dynamo graph tracing.
+
+    The output takes `q.shape`, which matches both the kernels (one row per
+    query head) and the zeros the profiling-shape trace returns.
+    """
+    return torch.empty(q.shape, dtype=q.dtype, device=q.device), torch.empty_like(
+        sw_cache
+    )
+
+
+def _register_attention(name: str, mesh: Mesh | None, *, is_csa: bool) -> Any:
+    """Registers the CSA or HCA/SWA attention op.
+
+    Args:
+        name: Torch op name to register under.
+        mesh: Kernel mesh, or None to run on the local device.
+        is_csa: Whether to register the CSA op rather than the HCA/SWA op.
+
+    Returns:
+        The registered op.
+    """
+    attn_data_axis = None
+    attn_head_axis = "model"
+    batch_axis = BATCH_AXIS
+    extra_spec = P(batch_axis) if not is_csa else P(batch_axis, None)
+
+    input_partition_specs = (
+        P(attn_data_axis, attn_head_axis, None),  # q
+        P(),  # new_kv
+        P(),  # sw_cache
+        P(batch_axis),  # swa_kv_lens
+        P(batch_axis),  # swa_page_indices
+        P(),  # swa_cu_q_lens
+        P(),  # swa_distribution
+        P(),  # main_cache_kv
+        P(batch_axis),  # main_kv_lens
+        extra_spec,  # extra
+        P(batch_axis),  # main_page_indices
+        P(),  # main_cu_q_lens
+        P(),  # main_distribution
+        P(attn_head_axis),  # attention_sinks
+    )
+    if is_csa:
+        input_partition_specs += (P(),)  # main_cache_rope
+
+    # Donate sw_cache to permit in-place updates by the Pallas
+    # sliding-window kernel.
+    op = pallas.jax_op(
+        name,
+        _attention_csa if is_csa else _attention_hca,
+        mesh=mesh,
+        donate_argnums=(2,),
+        input_partition_specs=input_partition_specs,
+    )
+    op.register_fake(_fake_attn)
+    return op
+
+
+def _register_qnorm_rope(name: str, mesh: Mesh | None) -> Any:
+    op = pallas.jax_op(
+        name,
+        _qnorm_rope_jax,
+        mesh=mesh,
+        input_partition_specs=(
+            P(None, "model", None),  # q
+            P(),  # positions
+            P(),  # cos_sin_cache
+        ),
+    )
+    op.register_fake(_fake_rope)
+    return op
+
+
+def _register_kv_rope(name: str, mesh: Mesh | None) -> Any:
+    op = pallas.jax_op(
+        name,
+        _rope_jax,
+        mesh=mesh,
+        input_partition_specs=(
+            P(),  # kv
+            P(),  # positions
+            P(),  # cos_sin_cache
+        ),
+    )
+    op.register_fake(_fake_rope)
+    return op
+
+
+def _register_o_proj(name: str, mesh: Mesh | None) -> Any:
+    op = pallas.jax_op(
+        name,
+        _o_proj_jax,
+        mesh=mesh,
+        input_partition_specs=(
+            P(None, "model", None),  # o
+            P(),  # positions
+            P(),  # cos_sin_cache
+            P(),  # wo_a
+            P(),  # wo_a_scale
+        ),
+    )
+    op.register_fake(_fake_o_proj)
+    return op
 
 
 # `Any`, not `object`: without torch stubs, isinstance cannot narrow `object`.
@@ -303,7 +403,6 @@ class VllmDeepseekV4MLAAttention(
 
     def _build_attn_op(self):
         vllm_context = get_vllm_model_wrapper_context()
-        mesh = get_pallas_op_mesh()
 
         swa_only = self.compress_ratio <= 1
         is_csa = self.compress_ratio == 4
@@ -376,8 +475,27 @@ class VllmDeepseekV4MLAAttention(
         # context-KV insert runs on the target's verify metadata.
         verify_q_len = static_verify_q_len(vllm_config)
 
-        wrapped_fn = functools.partial(
-            _attention_csa if is_csa else _attention_hca,
+        op_type = "csa" if is_csa else "hca"
+        logger.debug(
+            "[ATTN_BUILD] %s: %s attention logical_page_size=%s window=%s "
+            "swa_only=%s two_caches_same_buffer=%s non_causal=%s "
+            "verify_q_len=%s real_caches=%s",
+            self.custom_prefix,
+            op_type,
+            logical_page_size,
+            self.window_size,
+            swa_only,
+            two_caches_same_buffer,
+            non_causal,
+            verify_q_len,
+            built_from_real_caches,
+        )
+        op = get_pallas_op_for_mesh(
+            f"pallas::deepseek_v4_attention_{op_type}",
+            functools.partial(_register_attention, is_csa=is_csa),
+        )
+        bound_op = functools.partial(
+            op,
             sm_scale=sm_scale,
             sliding_window=self.window_size,
             logical_page_size=logical_page_size,
@@ -386,80 +504,7 @@ class VllmDeepseekV4MLAAttention(
             non_causal_block=non_causal,
             verify_q_len=verify_q_len,
         )
-
-        op_type = "swa" if swa_only else ("csa" if is_csa else "hca")
-        # Build unique cache key encoding geometry, overlay status, block
-        # causality, and profiling stage.
-        op_name = (
-            f"pallas::deepseek_v4_attention_{op_type}"
-            f"_p{logical_page_size}"
-            f"{'_aliased' if two_caches_same_buffer else ''}"
-            f"{'_ncb' if non_causal else ''}"
-            f"{f'_vq{verify_q_len}' if verify_q_len else ''}"
-            f"{'' if built_from_real_caches else '_prof'}"
-        )
-
-        if op_name in _pallas_op_cache:
-            return _pallas_op_cache[op_name], built_from_real_caches
-
-        logger.info(
-            "[ATTN_BUILD] %s: building %s logical_page_size=%s window=%s "
-            "two_caches_same_buffer=%s real_caches=%s",
-            self.custom_prefix,
-            op_name,
-            logical_page_size,
-            self.window_size,
-            two_caches_same_buffer,
-            built_from_real_caches,
-        )
-
-        attn_data_axis = None
-        attn_head_axis = "model"
-        batch_axis = BATCH_AXIS
-        extra_spec = P(batch_axis) if not is_csa else P(batch_axis, None)
-
-        input_partition_specs = (
-            P(attn_data_axis, attn_head_axis, None),  # q
-            P(),  # new_kv
-            P(),  # sw_cache
-            P(batch_axis),  # swa_kv_lens
-            P(batch_axis),  # swa_page_indices
-            P(),  # swa_cu_q_lens
-            P(),  # swa_distribution
-            P(),  # main_cache_kv
-            P(batch_axis),  # main_kv_lens
-            extra_spec,  # extra
-            P(batch_axis),  # main_page_indices
-            P(),  # main_cu_q_lens
-            P(),  # main_distribution
-            P(attn_head_axis),  # attention_sinks
-        )
-        if is_csa:
-            input_partition_specs += (P(),)  # main_cache_rope
-
-        # Donate sw_cache to permit in-place updates by the Pallas
-        # sliding-window kernel.
-        attn_jax_op = pallas.jax_op(
-            op_name,
-            wrapped_fn,
-            mesh=mesh,
-            donate_argnums=(2,),
-            input_partition_specs=input_partition_specs,
-        )
-
-        def _fake_attn(q, new_kv, sw_cache, *args, **kwargs):
-            """Abstract fake tensor implementation for PyTorch Dynamo graph tracing."""
-            num_tokens = q.shape[0]
-            out_tensor = torch.empty(
-                (num_tokens, self.mla_attn.n_local_heads, self.mla_attn.head_dim),
-                dtype=q.dtype,
-                device=q.device,
-            )
-            return out_tensor, torch.empty_like(sw_cache)
-
-        attn_jax_op.register_fake(_fake_attn)
-        _pallas_op_cache[op_name] = attn_jax_op
-        return attn_jax_op, built_from_real_caches
+        return bound_op, built_from_real_caches
 
     def attn_gemm(
         self, hidden_states: torch.Tensor
@@ -480,22 +525,12 @@ class VllmDeepseekV4MLAAttention(
         if op is not None:
             return op
 
-        eps = float(self.mla_attn.eps)
-        op_name = f"pallas::deepseek_v4_qnorm_rope_e{_name_float(eps)}"
-        op = _pallas_op_cache.get(op_name)
-        if op is None:
-            op = pallas.jax_op(
-                op_name,
-                functools.partial(_qnorm_rope_jax, eps=eps),
-                mesh=get_pallas_op_mesh(),
-                input_partition_specs=(
-                    P(None, "model", None),  # q
-                    P(),  # positions
-                    P(),  # cos_sin_cache
-                ),
-            )
-            op.register_fake(_fake_rope)
-            _pallas_op_cache[op_name] = op
+        op = functools.partial(
+            get_pallas_op_for_mesh(
+                "pallas::deepseek_v4_qnorm_rope", _register_qnorm_rope
+            ),
+            eps=float(self.mla_attn.eps),
+        )
         object.__setattr__(self, "_qnorm_rope_op_instance", op)
         return op
 
@@ -506,21 +541,7 @@ class VllmDeepseekV4MLAAttention(
         if op is not None:
             return op
 
-        op_name = "pallas::deepseek_v4_kv_rope"
-        op = _pallas_op_cache.get(op_name)
-        if op is None:
-            op = pallas.jax_op(
-                op_name,
-                _rope_jax,
-                mesh=get_pallas_op_mesh(),
-                input_partition_specs=(
-                    P(),  # kv
-                    P(),  # positions
-                    P(),  # cos_sin_cache
-                ),
-            )
-            op.register_fake(_fake_rope)
-            _pallas_op_cache[op_name] = op
+        op = get_pallas_op_for_mesh("pallas::deepseek_v4_kv_rope", _register_kv_rope)
         object.__setattr__(self, "_kv_rope_op_instance", op)
         return op
 
@@ -757,24 +778,10 @@ class VllmDeepseekV4MLAAttention(
             return op
 
         self._assert_o_proj_supported()
-        head_dim = int(self.head_dim)
-        op_name = f"pallas::deepseek_v4_o_proj_d{head_dim}"
-        op = _pallas_op_cache.get(op_name)
-        if op is None:
-            op = pallas.jax_op(
-                op_name,
-                functools.partial(_o_proj_jax, head_dim=head_dim),
-                mesh=get_pallas_op_mesh(),
-                input_partition_specs=(
-                    P(None, "model", None),  # o
-                    P(),  # positions
-                    P(),  # cos_sin_cache
-                    P(),  # wo_a
-                    P(),  # wo_a_scale
-                ),
-            )
-            op.register_fake(_fake_o_proj)
-            _pallas_op_cache[op_name] = op
+        op = functools.partial(
+            get_pallas_op_for_mesh("pallas::deepseek_v4_o_proj", _register_o_proj),
+            head_dim=int(self.head_dim),
+        )
         object.__setattr__(self, "_o_proj_op_instance", op)
         return op
 

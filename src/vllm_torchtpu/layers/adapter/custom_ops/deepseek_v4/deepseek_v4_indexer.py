@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 import torch
 import torch.nn as nn
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -42,15 +43,13 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor 
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-    get_pallas_op_mesh,
+    get_pallas_op_for_mesh,
 )
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 logger = init_logger(__name__)
-
-_indexer_op_cache = {}
 
 # Models whose attention and indexer ops score the request distribution's
 # middle segment as speculative verify windows in a static query-length pass.
@@ -175,6 +174,49 @@ def _indexer_jax(
     )
 
 
+def _fake_indexer(q, *args, k, **kwargs):
+    """Abstract implementation for PyTorch Dynamo graph tracing."""
+    return torch.empty((q.shape[0], k), dtype=torch.int32, device=q.device)
+
+
+def _register_indexer(name: str, mesh: Mesh | None) -> Any:
+    """Registers the indexer op.
+
+    Args:
+        name: Torch op name to register under.
+        mesh: Kernel mesh, or None to run on the local device.
+
+    Returns:
+        The registered op.
+    """
+    attn_data_axis = None
+    attn_head_axis = "model"
+    batch_axis = BATCH_AXIS
+    op = pallas.jax_op(
+        name,
+        _indexer_jax,
+        mesh=mesh,
+        input_partition_specs=(
+            P(attn_data_axis, attn_head_axis, None),  # q
+            P(attn_data_axis),  # positions
+            P(),  # cos_sin_cache
+            P(attn_data_axis, attn_head_axis),  # indexer_weights
+            P(),  # cache_kv
+            P(batch_axis),  # seq_lens
+            P(batch_axis),  # page_indices
+            P(),  # cu_q_lens
+            P(),  # distribution
+        ),
+    )
+    op.register_fake(_fake_indexer)
+    return op
+
+
+def _get_indexer_op() -> Any:
+    """Returns the indexer op for the current kernel mesh."""
+    return get_pallas_op_for_mesh("pallas::deepseek_v4_indexer", _register_indexer)
+
+
 class VllmDeepseekV4IndexerCache(DeepseekV4IndexerCache):
     """Indexer K cache as a packed uint8 record on TPU."""
 
@@ -213,63 +255,17 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         object.__setattr__(self.compressor, "k_cache", self.k_cache)
 
     def _build_indexer_op(self):
-        mesh = get_pallas_op_mesh()
         # Speculative verify windows all hold K + 1 tokens; the runner puts
         # them in `[distribution[0], distribution[1])`.
         verify_q_len = static_verify_q_len(get_current_vllm_config())
-
-        wrapped_fn = functools.partial(
-            _indexer_jax,
+        return functools.partial(
+            _get_indexer_op(),
             k=self.topk_tokens,
             compression_ratio=self.compress_ratio,
             softmax_scale=self.softmax_scale,
             n_head=self.n_head,
             verify_q_len=verify_q_len,
         )
-
-        _scale = (
-            f"{self.softmax_scale:.6g}".replace(".", "p")
-            .replace("-", "m")
-            .replace("+", "")
-        )
-        op_name = (
-            f"pallas::deepseek_v4_indexer_k{self.topk_tokens}"
-            f"_c{self.compress_ratio}_h{self.n_head}_s{_scale}"
-            f"{'' if verify_q_len is None else f'_vq{verify_q_len}'}"
-        )
-        global _indexer_op_cache
-        if op_name in _indexer_op_cache:
-            return _indexer_op_cache[op_name]
-
-        attn_data_axis = None
-        attn_head_axis = "model"
-        batch_axis = BATCH_AXIS
-        indexer_jax_op = pallas.jax_op(
-            op_name,
-            wrapped_fn,
-            mesh=mesh,
-            input_partition_specs=(
-                P(attn_data_axis, attn_head_axis, None),  # q
-                P(attn_data_axis),  # positions
-                P(),  # cos_sin_cache
-                P(attn_data_axis, attn_head_axis),  # indexer_weights
-                P(),  # cache_kv
-                P(batch_axis),  # seq_lens
-                P(batch_axis),  # page_indices
-                P(),  # cu_q_lens
-                P(),  # distribution
-            ),
-        )
-
-        def _fake_indexer(q, *args, **kwargs):
-            return torch.empty(
-                (q.shape[0], self.topk_tokens), dtype=torch.int32, device=q.device
-            )
-
-        indexer_jax_op.register_fake(_fake_indexer)
-
-        _indexer_op_cache[op_name] = indexer_jax_op
-        return indexer_jax_op
 
     def forward(
         self,
