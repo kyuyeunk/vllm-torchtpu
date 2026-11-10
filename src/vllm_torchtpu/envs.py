@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
+    TPU_ATTENTION_LAYER_PLAN: str = ""
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -713,6 +714,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # T/tp tokens, and the next layer all-gathers. Qwen3.5 MoE with
     # EP and TP > 1 only.
     "TPU_MOE_SEQUENCE_PARALLEL": env_bool("TPU_MOE_SEQUENCE_PARALLEL", default=False),
+    # The attention layer family's plan override, e.g. "layer=unfused,
+    # gate=eager_mul". Read only by attention_layer_plan.resolve_plan.
+    "TPU_ATTENTION_LAYER_PLAN": lambda: os.getenv("TPU_ATTENTION_LAYER_PLAN", ""),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes

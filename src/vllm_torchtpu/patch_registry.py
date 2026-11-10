@@ -21,6 +21,7 @@ callbacks are remembered across stages. Spawned processes start with an empty
 registry; forked processes inherit patches and their application records.
 """
 
+import enum
 import importlib
 import logging
 import os
@@ -133,6 +134,8 @@ PATCHES = (
         refresh="vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
     ),
     Patch("vllm_torchtpu.layers.adapter.vision_attention", _ACTIVE),
+    # Expansion points (EXPANSION_POINTS below): importing registers them.
+    Patch("vllm_torchtpu.models.vllm.qwen3_next_attention", _ACTIVE),
     # Out-of-tree FP32 rotary embedding (CUDA numerics). Must be registered
     # before any RotaryEmbedding is constructed at model load.
     Patch("vllm_torchtpu.layers.adapter.rotary_embedding", _ACTIVE),
@@ -169,6 +172,42 @@ PATCHES = (
         model_config=True,
     ),
 )
+
+
+@dataclass(frozen=True)
+class ExpansionPoint:
+    """Who owns an upstream layer's replacement, and what upstream should add.
+
+    The owner is the team that registers the expansion point: it owns the
+    plan, the guard failures and keeping the replacement in step with
+    upstream. Ownership moves to a family only if the family adopts the path.
+    """
+
+    owner: str
+    upstream_ask: str
+
+
+class ExpansionKey(enum.Enum):
+    """Names one expansion point; a replacement declares its key.
+
+    The value is the upstream class name, which a PluggableLayer upstream
+    registers under in vLLM.
+    """
+
+    QWEN3_NEXT_ATTENTION = "Qwen3NextAttention"
+
+
+EXPANSION_POINTS: dict[ExpansionKey, ExpansionPoint] = {
+    ExpansionKey.QWEN3_NEXT_ATTENTION: ExpansionPoint(
+        owner="qwen3-next model team",
+        upstream_ask=(
+            "Make Qwen3NextAttention's fusion choices one plan resolved in "
+            "__init__ (no use_fused_output_gate writes from Qwen3.5), and let "
+            "o_proj receive its input format instead of the forward peeking at "
+            "get_input_quant_key(o_proj)."
+        ),
+    ),
+}
 
 _applied: set[str] = set()
 _applying: set[str] = set()
