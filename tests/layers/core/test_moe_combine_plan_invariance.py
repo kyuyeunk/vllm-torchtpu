@@ -14,10 +14,14 @@
 """Plan invariance of the MoE combine (`moe_plan.MoeCombinePlan`).
 
 Forces every combine variant on contract-satisfying combine inputs and
-compares each output with the output under the plan `moe_gmm` resolves.
+compares each output with the output under the plan `moe_gmm` resolves. The
+TPU test compares values on the host's chip; the CPU test compiles every
+variant ahead of time for chips the host lacks.
 """
 
 import dataclasses
+import importlib.util
+import math
 
 import jax
 import jax.numpy as jnp
@@ -25,6 +29,7 @@ import numpy as np
 import pytest
 
 from tests.layers.core.plan_invariance import PlanCase, check_plan_invariance
+from tests.layers.core.plan_invariance_aot import AotChip, check_plan_compiles
 from vllm_torchtpu.layers.core import fused_moe_gmm, moe_plan
 from vllm_torchtpu.layers.core.tpu_target import TpuTarget
 
@@ -140,6 +145,35 @@ def _case(name: str, shape: _Shape, threshold: int) -> PlanCase:
     )
 
 
+def _abstract_case(name: str, shape: _Shape, threshold: int) -> PlanCase:
+    """`_case`'s argument shapes and dtypes, without values."""
+    routes = shape.num_tokens * shape.topk
+    sds = jax.ShapeDtypeStruct
+    args = (
+        sds((routes, shape.hidden), shape.dtype),
+        sds((shape.local_experts,), jnp.int32),
+        sds((routes,), jnp.int32),
+        sds((routes,), shape.dtype),
+        sds((routes,), jnp.bool_),
+        sds((routes,), jnp.int32),
+    )
+    return PlanCase(
+        name=name,
+        args=args,
+        check_values=False,
+        meta=dataclasses.replace(shape, threshold=threshold),
+    )
+
+
+def _cases(build) -> list[PlanCase]:
+    """One case per shape, at the current chip's one-hot threshold."""
+    threshold = moe_plan.auto_onehot_permute_threshold(TpuTarget.from_runtime())
+    return [
+        build(name, shape, threshold if shape.threshold is None else shape.threshold)
+        for name, shape in _SHAPES.items()
+    ]
+
+
 def _combine(case: PlanCase, plan: moe_plan.MoeCombinePlan, *args: jax.Array):
     shape: _Shape = case.meta
     return fused_moe_gmm.moe_combine(
@@ -193,6 +227,10 @@ def _plan(
     return moe_plan.MoeCombinePlan(combine=combine, ep_gather_reduce_version=version)
 
 
+# The v3 kernel pads tokens to 64 per SparseCore row partition.
+_DOMAINS = {"local_v3_token_alignment": (None, 64, 128, 256)}
+
+
 # Real findings, kept as a ratchet: each must still fail, and nothing else may.
 # With FP32 inputs the TensorCore combine stays in FP32, while the one-hot
 # matmul and the v1/v2 TensorCore fallbacks round at about BF16 precision
@@ -209,20 +247,75 @@ _KNOWN = {
 def test_combine_plan_invariance():
     if jax.default_backend() != "tpu":
         pytest.fail(f"Expected JAX TPU backend, got {jax.default_backend()}.")
-    threshold = moe_plan.auto_onehot_permute_threshold(TpuTarget.from_runtime())
-    cases = [
-        _case(name, shape, threshold if shape.threshold is None else shape.threshold)
-        for name, shape in _SHAPES.items()
-    ]
     report = check_plan_invariance(
         _combine,
-        cases,
+        _cases(_case),
         moe_plan.MoeCombinePlan,
         _tolerance,
         resolve=_resolve,
         capable=_capable,
-        # The v3 kernel pads tokens to 64 per SparseCore row partition.
-        domains={"local_v3_token_alignment": (None, 64, 128, 256)},
+        domains=_DOMAINS,
     )
     failures = {(o.case, o.plan) for o in report.failures()}
     assert failures == _KNOWN, report.summary()
+
+
+# The host's chip, and a TPU7x: its 16-lane SparseCore is the only one the
+# local and EP v3 kernels run on.
+_AOT_CHIPS = (
+    AotChip(name="v6e", topology="v6e:2x2"),
+    AotChip(name="tpu7x", topology="tpu7x:2x2x2"),
+)
+
+# Compile-tier findings, kept as ratchets like `_KNOWN`.
+# EP v3 at top-1: `combine_capable` admits it (the local v3 case checks
+# `topk >= 2`, the EP case does not), but the kernel's route-pair metadata
+# fails to trace. `plan_combine` picks it under EP with
+# RAGGED_GATHER_REDUCE_VERSION=v3 on a 16-lane SparseCore.
+_KNOWN_AOT_FAILURES = {
+    ("tpu7x", "tp_t2048_k1_h4096", _plan("ep_ragged_sc", "v3")),
+}
+# The v3 kernel derives its token alignment itself, so on the one chip where
+# local v3 runs, every alignment compiles to the same program.
+_KNOWN_AOT_UNCONSUMED = {"v6e": [], "tpu7x": ["local_v3_token_alignment"]}
+# Plans `combine_capable` rejects that still compile, so only a run can show
+# whether they fail loudly: v3 is declared BF16-only, yet takes FP32 input.
+_KNOWN_AOT_REJECTED_COMPILES = {
+    ("tpu7x", "tp_t64_k10_h4096_f32", _plan("ep_ragged_sc", "v3")),
+    *(
+        (
+            "tpu7x",
+            "tp_t64_k10_h4096_f32",
+            moe_plan.MoeCombinePlan(combine="local_v3", local_v3_token_alignment=a),
+        )
+        for a in (64, 128, 256)
+    ),
+}
+
+
+def test_combine_plan_compiles():
+    if importlib.util.find_spec("libtpu") is None:
+        pytest.skip("deviceless TPU compilation needs libtpu")
+
+    def cases() -> list[PlanCase]:
+        # NaN garbage changes values only; its shapes repeat another case's.
+        return [c for c in _cases(_abstract_case) if not math.isnan(c.meta.garbage)]
+
+    report = check_plan_compiles(
+        _combine,
+        cases,
+        moe_plan.MoeCombinePlan,
+        _AOT_CHIPS,
+        resolve=_resolve,
+        capable=_capable,
+        domains=_DOMAINS,
+    )
+    failures = {(o.chip, o.case, o.plan) for o in report.failures()}
+    assert failures == _KNOWN_AOT_FAILURES, report.summary()
+    assert report.unconsumed == _KNOWN_AOT_UNCONSUMED, report.summary()
+    unproven = {
+        (o.chip, o.case, o.plan)
+        for o in report.outcomes
+        if o.status == "rejected_compiles"
+    }
+    assert unproven == _KNOWN_AOT_REJECTED_COMPILES, report.summary()

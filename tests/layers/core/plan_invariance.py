@@ -171,7 +171,8 @@ def plan_values(
     return values, refused
 
 
-def _changed_fields(a: Any, b: Any) -> Iterator[str]:
+def changed_fields(a: Any, b: Any) -> Iterator[str]:
+    """Names of the fields two values of one plan type differ in."""
     for field in dataclasses.fields(a):
         if getattr(a, field.name) != getattr(b, field.name):
             yield field.name
@@ -268,13 +269,13 @@ def check_plan_invariance(
             if not accepted:
                 status, detail = "rejected_silent", f"{status} {detail}"
             elif status in ("mismatch", "shape_mismatch"):
-                for name in _changed_fields(plan, resolved):
+                for name in changed_fields(plan, resolved):
                     misclassified.setdefault(name, set()).add(case.name)
             outcomes.append(
                 Outcome(case=case.name, plan=plan, status=status, detail=detail)
             )
         for a, b in itertools.combinations(texts, 2):
-            changed = list(_changed_fields(a, b))
+            changed = list(changed_fields(a, b))
             if len(changed) == 1:
                 consumed[changed[0]] = (
                     bool(consumed[changed[0]]) or texts[a] != texts[b]
