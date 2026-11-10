@@ -45,6 +45,7 @@ from typing import Literal
 from vllm_torchtpu.kernels.megablox import moe_onehot_unpermute_admission as owner
 from vllm_torchtpu.kernels.sparse_core import ragged_gather_reduce_fallback as fallback
 from vllm_torchtpu.kernels.sparse_core import ragged_gather_reduce_v3_partition as v3
+from vllm_torchtpu.layers.core.plan_marker import plan_of
 from vllm_torchtpu.layers.core.tpu_target import TpuTarget
 
 # Cap on the auto one-hot threshold.
@@ -219,6 +220,7 @@ class GmmOutSpec:
         return self.dtype_bits // 8
 
 
+@plan_of("moe.entry")
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class MoeEntryPlan:
     """Decisions `fused_moe_func` makes before routing.
@@ -233,6 +235,7 @@ class MoeEntryPlan:
     scrub_nonfinite: bool
 
 
+@plan_of("moe.routing")
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class MoeRoutingPlan:
     """How `prepare_routed_gmm_inputs` builds the routed layout.
@@ -260,6 +263,7 @@ class MoeRoutingPlan:
         return self.sort in ("counting_argsort", "argsort_packed", "argsort_gather")
 
 
+@plan_of("moe.combine")
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class MoeCombinePlan:
     """Decisions made after the second GMM.
@@ -274,6 +278,15 @@ class MoeCombinePlan:
     combine: Combine
     ep_gather_reduce_version: GatherReduceVersion | None = None
     local_v3_token_alignment: int | None = None
+
+    def __post_init__(self) -> None:
+        # Each optional field belongs to one combine, so a plan cannot carry
+        # a choice its combine would silently ignore.
+        ep_ragged = self.combine in ("ep_ragged_sc", "ep_ragged_tc_fallback")
+        if (self.ep_gather_reduce_version is not None) != ep_ragged:
+            raise ValueError(f"gather-reduce version is for ep_ragged_* only: {self}")
+        if (self.local_v3_token_alignment is not None) != (self.combine == "local_v3"):
+            raise ValueError(f"token alignment is for local_v3 only: {self}")
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -670,6 +683,54 @@ def plan_combine(
             ep_gather_reduce_version=version,
         )
     return MoeCombinePlan(combine="tensorcore")
+
+
+def _sparse_core_kernel_runs(
+    version: GatherReduceVersion, out: GmmOutSpec, target: TpuTarget | None
+) -> bool:
+    if target is None or target.sparse_core is None:
+        return False
+    if version != "v3":
+        return True
+    return (
+        target.sparse_core.num_lanes == 16
+        and out.dtype == "bfloat16"
+        and out.hidden % target.num_lanes == 0
+        and out.rows <= 1 << v3.ROUTE_INDEX_BITS
+    )
+
+
+def combine_capable(
+    plan: MoeCombinePlan, op: MoeOpIn, out: GmmOutSpec, target: TpuTarget | None
+) -> bool:
+    """Whether the combine `plan` names can run on this call at all.
+
+    Capability only: the preferences `plan_combine` adds on top (the one-hot
+    threshold, the VMEM cutoff of the SparseCore kernels, the top-8 and
+    padding rules of local v3) are left out, so a plan they reject but this
+    accepts must still produce the same output. A plan this rejects must fail
+    loudly when forced.
+
+    Args:
+        plan: The combine plan to run.
+        op: This call's shapes.
+        out: The combine's input facts.
+        target: The chip, or None without a TPU description.
+
+    Returns:
+        True when the combine can run.
+    """
+    match plan.combine:
+        case "tensorcore" | "ep_onehot" | "ep_ragged_tc_fallback":
+            return True
+        case "ep_ragged_sc":
+            assert plan.ep_gather_reduce_version is not None
+            return _sparse_core_kernel_runs(plan.ep_gather_reduce_version, out, target)
+        case "local_v3":
+            # Route-pair metadata needs at least two routes.
+            return op.topk >= 2 and _sparse_core_kernel_runs("v3", out, target)
+        case "ep_owner_onehot":
+            return owner_onehot_admits(op, out, target)
 
 
 def plan_bucket(
