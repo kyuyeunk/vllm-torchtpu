@@ -34,6 +34,51 @@ def _explicit_vmem_bytes(route_capacity: int, hidden_size: int, num_tokens: int)
     return owner_and_store + double_buffered_routes + route_metadata
 
 
+def blockwise_onehot_unpermute_supports(
+    route_output: jax.ShapeDtypeStruct,
+    token_indices_sorted: jax.ShapeDtypeStruct,
+    topk_weights_sorted: jax.ShapeDtypeStruct,
+    valid_count: jax.ShapeDtypeStruct,
+    *,
+    num_tokens: int,
+    chip: pltpu.TpuInfo,
+) -> str | None:
+    """Why `blockwise_onehot_unpermute` cannot run these arguments, or None.
+
+    Takes the kernel's arguments, or their shapes and dtypes, and the chip.
+
+    Returns:
+        A short reason, or None when the kernel supports the call.
+    """
+    if route_output.ndim != 2 or route_output.dtype != jnp.bfloat16:
+        return "route output must be 2-D BF16"
+    route_capacity, hidden_size = route_output.shape
+    if token_indices_sorted.shape != (route_capacity,):
+        return "one token index per route"
+    if token_indices_sorted.dtype != jnp.int32:
+        return "token indices must be int32"
+    if topk_weights_sorted.shape != (route_capacity,):
+        return "one weight per route"
+    if topk_weights_sorted.dtype != jnp.bfloat16:
+        return "weights must be BF16"
+    if valid_count.shape != (1,) or valid_count.dtype != jnp.int32:
+        return "valid count must be one int32"
+    if route_capacity % _ROUTE_BLOCK_SIZE:
+        return f"routes must be a multiple of {_ROUTE_BLOCK_SIZE}"
+    if hidden_size % chip.mxu_column_size:
+        return "hidden size must be a multiple of the MXU width"
+    if num_tokens % chip.get_sublane_tiling(route_output.dtype):
+        return "tokens must be a multiple of the sublane tiling"
+    vmem_limit_bytes = int(chip.vmem_capacity_bytes * 0.9)
+    required_vmem_bytes = (
+        _explicit_vmem_bytes(route_capacity, hidden_size, num_tokens)
+        + _VMEM_WORKSPACE_MARGIN_BYTES
+    )
+    if required_vmem_bytes > vmem_limit_bytes:
+        return "exceeds VMEM"
+    return None
+
+
 def can_use_blockwise_onehot_unpermute(
     route_output: jax.Array,
     token_indices_sorted: jax.Array,
@@ -43,33 +88,15 @@ def can_use_blockwise_onehot_unpermute(
     num_tokens: int,
 ) -> bool:
     """Return whether this one-hot shape satisfies kernel safety constraints."""
-    if route_output.ndim != 2 or route_output.dtype != jnp.bfloat16:
-        return False
-    route_capacity, hidden_size = route_output.shape
-    if token_indices_sorted.shape != (route_capacity,):
-        return False
-    if token_indices_sorted.dtype != jnp.int32:
-        return False
-    if topk_weights_sorted.shape != (route_capacity,):
-        return False
-    if topk_weights_sorted.dtype != jnp.bfloat16:
-        return False
-    if valid_count.shape != (1,) or valid_count.dtype != jnp.int32:
-        return False
-
-    tpu_info = pltpu.get_tpu_info()
-    if route_capacity % _ROUTE_BLOCK_SIZE:
-        return False
-    if hidden_size % tpu_info.mxu_column_size:
-        return False
-    if num_tokens % tpu_info.get_sublane_tiling(route_output.dtype):
-        return False
-    vmem_limit_bytes = int(tpu_info.vmem_capacity_bytes * 0.9)
-    required_vmem_bytes = (
-        _explicit_vmem_bytes(route_capacity, hidden_size, num_tokens)
-        + _VMEM_WORKSPACE_MARGIN_BYTES
+    reason = blockwise_onehot_unpermute_supports(
+        route_output,
+        token_indices_sorted,
+        topk_weights_sorted,
+        valid_count,
+        num_tokens=num_tokens,
+        chip=pltpu.get_tpu_info(),
     )
-    return required_vmem_bytes <= vmem_limit_bytes
+    return reason is None
 
 
 def _make_route_block_selector(

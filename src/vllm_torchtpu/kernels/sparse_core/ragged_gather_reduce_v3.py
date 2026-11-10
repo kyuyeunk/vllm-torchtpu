@@ -94,6 +94,56 @@ def token_block_alignment(hidden_size: int, tpu_info) -> int:
     return partition_counts(hidden_size, tpu_info)[1] * _TOKEN_BLOCK
 
 
+def takes_sparse_core_path(x: jax.ShapeDtypeStruct, chip: pltpu.TpuInfo) -> bool:
+    """Whether the kernel runs on the SparseCore rather than its TensorCore fallback.
+
+    Args:
+        x: The source rows, or their shape and dtype.
+        chip: The chip.
+
+    Returns:
+        True on chips with SparseCore kernels, for lane-aligned BF16 sources.
+    """
+    return (
+        get_sparse_core_info(chip) is not None
+        and x.dtype == jnp.bfloat16
+        and x.shape[-1] % chip.num_lanes == 0
+    )
+
+
+def ragged_gather_reduce_supports(
+    x: jax.ShapeDtypeStruct,
+    indices: jax.ShapeDtypeStruct,
+    topk_weights: jax.ShapeDtypeStruct,
+    valid_rows_mask: jax.ShapeDtypeStruct,
+    reduce_group_size: int,
+    *,
+    chip: pltpu.TpuInfo | None,
+) -> str | None:
+    """Why `ragged_gather_reduce` cannot run these arguments, or None if it can.
+
+    Takes the kernel's arguments, or their shapes and dtypes, and the chip.
+    Hard limits only: the TensorCore fallback runs anything.
+
+    Returns:
+        A short reason, or None when the kernel supports the call.
+    """
+    del topk_weights, valid_rows_mask  # The kernel accepts any of these.
+    if indices.size % reduce_group_size:
+        return "routes are not a multiple of reduce_group_size"
+    if chip is None or not takes_sparse_core_path(x, chip):
+        return None
+    sc_info = get_sparse_core_info(chip)
+    assert sc_info is not None
+    if sc_info.num_lanes != _TOKEN_SUBCHUNK:
+        return "the SparseCore path needs 16-lane SparseCores"
+    if reduce_group_size < 2:
+        return "the route-pair metadata needs two routes per token"
+    if x.shape[0] > 1 << _ROUTE_INDEX_BITS:
+        return "source rows exceed the 20-bit route index"
+    return None
+
+
 def _main_kernel(
     x_hbm_ref: jax.Ref,
     route_metadata_hbm_ref: jax.Ref,
@@ -339,20 +389,7 @@ def ragged_gather_reduce(
 ) -> jax.Array:
     """Destination-major prototype for MoE output combine."""
     sc_info = get_sparse_core_info()
-    if (
-        sc_info is None
-        or x.dtype != jnp.bfloat16
-        or x.shape[-1] % pltpu.get_tpu_info().num_lanes != 0
-    ):
-        return _fallback_implementation(
-            x,
-            indices,
-            topk_weights,
-            valid_rows_mask,
-            reduce_group_size,
-        )
-    dtype_bytes = jax.dtypes.itemsize_bits(x.dtype) // 8
-    if jnp.size(x) * dtype_bytes * 2 < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6:
+    if sc_info is None or not takes_sparse_core_path(x, pltpu.get_tpu_info()):
         return _fallback_implementation(
             x,
             indices,

@@ -276,16 +276,6 @@
       "concise_description": "`None` is not subscriptable"
     },
     {
-      "path": "src/vllm_torchtpu/layers/core/fused_moe_gmm.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `num_lanes`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/fused_moe_gmm.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `vmem_capacity_bytes`"
-    },
-    {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `object` has no attribute `ndim`"

@@ -24,24 +24,9 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     dense_expert_moe,
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
-from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
-    blockwise_onehot_unpermute,
-    can_use_blockwise_onehot_unpermute,
-)
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import (
-    ragged_gather_reduce as ragged_gather_reduce_v1,
-)
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import (
-    ragged_gather_reduce_v2,
-)
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
-    ragged_gather_reduce as ragged_gather_reduce_v3,
-)
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
-    token_block_alignment,
-)
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 from vllm_torchtpu.kernels.sparse_core.support import get_sparse_core_info
+from vllm_torchtpu.layers.core import moe_plan
 from vllm_torchtpu.logger import init_logger
 
 
@@ -54,20 +39,6 @@ def _get_topk_weights_dtype(default_dtype: jnp.dtype) -> jnp.dtype:
 
 logger = init_logger(__name__)
 
-
-def _select_ragged_gather_reduce(version: str):
-    return {
-        "v1": ragged_gather_reduce_v1,
-        "v2": ragged_gather_reduce_v2,
-        "v3": ragged_gather_reduce_v3,
-    }[version]
-
-
-# The server sets its environment before importing model code, so the selected
-# EP combine remains fixed for the process lifetime. The default is v2; set
-# RAGGED_GATHER_REDUCE_VERSION=v3 to select the destination-major kernel for EP.
-# The non-EP combine in moe_gmm selects that kernel directly.
-ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VERSION)
 
 _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
@@ -538,9 +509,6 @@ def moe_gmm(
     packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
     gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
 
-    topk_weights = topk_weights_flat.reshape((num_tokens, topk))
-    valid_mask = valid_mask_flat.reshape((num_tokens, topk))
-
     gmm2_res = gmm_wrapper(
         gmm1_res,
         w2,
@@ -552,115 +520,81 @@ def moe_gmm(
         preferred_element_type=x.dtype,
         rhs_quant_dtype=rhs_quant_dtype,
     )
-    # The destination-major kernel packs source indices into 20 bits and
-    # processes 16-lane SparseCore tiles.
-    use_local_ragged_combine = (
-        # Local SparseCore path; route-pair metadata needs at least two routes.
-        use_sparse_core
-        and not use_ep
-        and topk >= 2
-        # TensorCore combine handles top-8 batches.
-        and topk != 8
-        # Honor the configured SparseCore dispatch cutoff.
-        and argsort_revert_indices.size > onehot_moe_permute_threshold
-        # BF16 kernel input.
-        and gmm2_res.dtype == jnp.bfloat16
-        # Packed source-index capacity.
-        and gmm2_res.shape[0] <= 1 << 20
+    return moe_combine(
+        gmm2_res,
+        group_sizes,
+        argsort_revert_indices,
+        topk_weights_flat,
+        valid_mask_flat,
+        token_indices_sorted,
+        num_tokens=num_tokens,
+        topk=topk,
+        use_sparse_core=use_sparse_core,
     )
-    if use_local_ragged_combine:
-        try:
-            tpu_info = pltpu.get_tpu_info()
-        except ValueError:
-            # get_tpu_info raises for unsupported device kinds (e.g. CPU hosts).
-            tpu_info = None
-        sc_info = get_sparse_core_info(tpu_info)
-        # Lane-aligned width, 16-lane SparseCore, and v3's own cutoff (two
-        # BF16 buffers use at least 60% of VMEM).
-        if (
-            sc_info is not None
-            and sc_info.num_lanes == 16
-            and gmm2_res.shape[-1] % tpu_info.num_lanes == 0
-            and gmm2_res.size * 4 >= tpu_info.vmem_capacity_bytes * 0.6
-        ):
-            # The kernel pads destination tokens to one 64-token block per
-            # SparseCore row partition: require at least one full block and
-            # padding of at most half the batch.
-            alignment = token_block_alignment(gmm2_res.shape[-1], tpu_info)
-            padded_tokens = -(-num_tokens // alignment) * alignment
-            if num_tokens >= alignment and padded_tokens * 2 <= num_tokens * 3:
-                return ragged_gather_reduce_v3(
-                    gmm2_res,
-                    argsort_revert_indices,
-                    topk_weights_flat,
-                    valid_mask_flat,
-                    reduce_group_size=topk,
-                ).astype(x.dtype)
-    if use_ep and use_sparse_core:
-        if argsort_revert_indices.size <= onehot_moe_permute_threshold:
-            # Use onehot + matmul for unpermutation, which can be faster
-            # for small batch size.
-            # `argsort_revert_indices` is the inverse of the sort, so scattering
-            # through it is the gather by the (unmaterialised) forward one.
-            topk_weights_sorted = (
-                jnp.zeros_like(topk_weights_flat)
-                .at[argsort_revert_indices]
-                .set(topk_weights_flat)
-            )
-            valid_count = group_sizes.sum(dtype=jnp.int32)[None]
-            if (
-                envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() == "on"
-                and can_use_blockwise_onehot_unpermute(
-                    gmm2_res,
-                    token_indices_sorted,
-                    topk_weights_sorted,
-                    valid_count,
-                    num_tokens=num_tokens,
-                )
-            ):
-                logger.info_once(
-                    "Selected owner_output blockwise one-hot unpermute: "
-                    "routes=%d hidden=%d tokens=%d",
-                    gmm2_res.shape[0],
-                    gmm2_res.shape[1],
-                    num_tokens,
-                )
-                return blockwise_onehot_unpermute(
-                    gmm2_res,
-                    token_indices_sorted,
-                    topk_weights_sorted,
-                    valid_count,
-                    num_tokens=num_tokens,
-                ).astype(x.dtype)
-            # Rows past the computed prefix (non-local experts under EP,
-            # skipped padded tokens) are never written by the GMM; zero them
-            # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
-            computed = jnp.arange(gmm2_res.shape[0], dtype=jnp.int32) < group_sizes.sum(
-                dtype=jnp.int32
-            )
-            gmm2_res = jnp.where(computed[:, None], gmm2_res, 0)
-            revert_indices = argsort_revert_indices.reshape(num_tokens, topk)
-            onehot = jax.nn.one_hot(
-                revert_indices, argsort_revert_indices.size, dtype=gmm2_res.dtype
-            )
-            combine = (onehot * topk_weights[..., None] * valid_mask[..., None]).sum(
-                axis=1
-            )
-            return (combine @ gmm2_res).astype(x.dtype)
-        return ragged_gather_reduce(
-            gmm2_res,
-            argsort_revert_indices,
-            topk_weights_flat,
-            valid_mask_flat,
-            reduce_group_size=topk,
-        ).astype(x.dtype)
 
-    token_hidden = gmm2_res[argsort_revert_indices]
-    token_topk_hidden = token_hidden.reshape((num_tokens, topk, gmm2_res.shape[-1]))
-    token_topk_hidden = token_topk_hidden * jnp.expand_dims(topk_weights, axis=-1)
-    token_topk_hidden = jnp.where(valid_mask[:, :, None], token_topk_hidden, 0)
+
+def _chip() -> pltpu.TpuInfo | None:
+    """The chip this trace targets, or None on a host without a TPU."""
+    try:
+        return pltpu.get_tpu_info()
+    except ValueError:
+        return None
+
+
+def moe_combine(
+    gmm2_res: jax.Array,
+    group_sizes: jax.Array,
+    argsort_revert_indices: jax.Array,
+    topk_weights_flat: jax.Array,
+    valid_mask_flat: jax.Array,
+    token_indices_sorted: jax.Array,
+    *,
+    num_tokens: int,
+    topk: int,
+    use_sparse_core: bool,
+) -> jax.Array:
+    """Sums the second GMM's routed rows back into one row per token.
+
+    Args:
+        gmm2_res: Routed rows, in expert order.
+        group_sizes: Routed rows per local expert.
+        argsort_revert_indices: For each token's top-k slot, its routed row.
+        topk_weights_flat: Routing weight of each top-k slot.
+        valid_mask_flat: Whether each top-k slot routes to a local expert.
+        token_indices_sorted: For each routed row, its token.
+        num_tokens: Tokens in the batch.
+        topk: Experts per token.
+        use_sparse_core: Token movement may use the SparseCore.
+
+    Returns:
+        `[num_tokens, hidden]` in `gmm2_res`'s dtype.
+    """
+    chip = _chip()
+    plan = moe_plan.plan_combine(
+        moe_plan.resolve_moe_process(envs, chip, use_sparse_core=use_sparse_core),
+        moe_plan.MoeOpIn(
+            num_tokens=num_tokens, topk=topk, local_num_experts=group_sizes.shape[0]
+        ),
+        moe_plan.GmmOutSpec(
+            rows=gmm2_res.shape[0],
+            hidden=gmm2_res.shape[1],
+            dtype=gmm2_res.dtype,
+            weights_dtype=topk_weights_flat.dtype,
+        ),
+        chip,
+    )
+    out = moe_plan.VARIANTS[plan.combine].run(
+        gmm2_res,
+        group_sizes,
+        argsort_revert_indices,
+        topk_weights_flat,
+        valid_mask_flat,
+        token_indices_sorted,
+        num_tokens=num_tokens,
+        topk=topk,
+    )
     # FP32 top-k weights can promote BF16 outputs; keep the custom-op dtype.
-    return token_topk_hidden.sum(axis=1).astype(x.dtype)
+    return out.astype(gmm2_res.dtype)
 
 
 @functools.partial(
