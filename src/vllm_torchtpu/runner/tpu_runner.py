@@ -91,7 +91,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import blocks, envs, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -5783,6 +5783,28 @@ class TPUModelRunner(GPUModelRunner):
 
         return async_output
 
+    def _install_blocks(self, model: torch.nn.Module) -> None:
+        from vllm.distributed import get_tensor_model_parallel_world_size
+
+        from vllm_torchtpu.blocks.attn_moe import plan as block_plan
+
+        hf_config = self.model_config.hf_text_config
+        # The user's and the model config's pins are parsed here, once.
+        pin = getattr(hf_config, "tpu_block_plan", "")  # str-ok: optional HF config key
+        with set_current_vllm_config(self.vllm_config):
+            self._block_report = blocks.install(
+                model,
+                blocks.InstallContext(
+                    tp=get_tensor_model_parallel_world_size(),
+                    dtype=self.model_config.dtype,
+                    buckets=tuple(self.num_tokens_paddings),
+                    block_pin=block_plan.parse_pin(
+                        envs.TPU_BLOCK_PLAN, "TPU_BLOCK_PLAN"
+                    ),
+                    block_model_pin=block_plan.parse_pin(pin or "", "tpu_block_plan"),
+                ),
+            )
+
     def load_model(self) -> None:
         self.device_config.device = torch.device("tpu")
         self.device = self.device_config.device
@@ -5815,6 +5837,10 @@ class TPUModelRunner(GPUModelRunner):
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
+        # Block-scope plans bind their children's decisions here: after the
+        # weights load, before LoRA wraps the layers and before any compile
+        # or arming reads those decisions.
+        self._install_blocks(model)
         self.model = model
         if self.lora_config is not None:
             self.model = self.load_lora_model(self.model, self.vllm_config, self.device)

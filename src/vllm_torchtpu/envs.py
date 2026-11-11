@@ -20,7 +20,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    TPU_ATTN_MOE_OVERLAP: bool = False
+    TPU_BLOCK_PLAN: str = ""
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
@@ -440,10 +440,10 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
-    # Qwen3.5 MoE at TP > 1: reduce-scatter the attention output, run the
-    # post-attention norm and router gate on the token shard, and fold the
-    # attention partial sum into the MoE all-reduce. Default MoE path only.
-    "TPU_ATTN_MOE_OVERLAP": env_bool("TPU_ATTN_MOE_OVERLAP", default=False),
+    # User override of the attn_then_moe block plan for every bucket:
+    # "collectives=all_reduce" or "collectives=reduce_scatter_all_gather".
+    # Empty: the rule (overlap at >= 8 MiB of activations per chip).
+    "TPU_BLOCK_PLAN": env_str("TPU_BLOCK_PLAN", ""),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many
