@@ -62,7 +62,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_EXPERT_PLACEMENT` | `""` | Static expert placement for `EP`: a JSON table (a local path or a `gs://` URI) that sets, per MoE layer, which experts each EP rank holds, as a permutation. Applied at weight load to the experts and the router, so every MoE kernel serves it unchanged. With Ray DP engines, also list it in `VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`: vLLM copies only `VLLM_` variables and the names listed there to the engine actors. |
 | `TPU_MOE_HIERARCHICAL_EP` | `False` | Enables two-level intra-chip / inter-chip hierarchical Expert Parallelism on dual-core TPU v7x hosts. |
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
-| `TPU_ATTN_MOE_OVERLAP` | `False` | Overlaps Qwen3.5 MoE post-attention norm and router gate with TP collectives on token buckets >= 8 MiB per rank. |
+| `TPU_BLOCK_PLAN` | `""` | Pins the `attn_then_moe` block plan for every bucket: `collectives=all_reduce` or `collectives=reduce_scatter_all_gather`. Empty: overlap on buckets >= 8 MiB of activations per rank. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
 | `ENABLE_QUANTIZED_MATMUL_KERNEL` | `False` | Dispatches quantized linear layers to the custom Pallas quantized matmul kernel. |

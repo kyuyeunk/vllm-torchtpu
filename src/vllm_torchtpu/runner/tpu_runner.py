@@ -91,7 +91,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import blocks, envs, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -5783,6 +5783,22 @@ class TPUModelRunner(GPUModelRunner):
 
         return async_output
 
+    def _install_blocks(self, model: torch.nn.Module) -> None:
+        from vllm.distributed import get_tensor_model_parallel_world_size
+
+        hf_config = self.model_config.hf_text_config
+        with set_current_vllm_config(self.vllm_config):
+            self._block_report = blocks.install(
+                model,
+                blocks.InstallContext(
+                    tp=get_tensor_model_parallel_world_size(),
+                    dtype=str(self.model_config.dtype).removeprefix("torch."),
+                    buckets=tuple(self.num_tokens_paddings),
+                    override=envs.TPU_BLOCK_PLAN,
+                    model_plan=getattr(hf_config, "tpu_block_plan", "") or "",
+                ),
+            )
+
     def load_model(self) -> None:
         self.device_config.device = torch.device("tpu")
         self.device = self.device_config.device
@@ -5815,6 +5831,10 @@ class TPUModelRunner(GPUModelRunner):
                 vllm_config=self.vllm_config, model_config=self.model_config
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
+        # Block-scope plans bind their children's decisions here: after the
+        # weights load, before LoRA wraps the layers and before any compile
+        # or arming reads those decisions.
+        self._install_blocks(model)
         self.model = model
         if self.lora_config is not None:
             self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
