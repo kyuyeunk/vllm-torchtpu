@@ -52,12 +52,90 @@ class Stream:
     unpack: Callable[..., Triple]
 
 
+class PositionsFirst(Protocol):
+    """``forward(positions, hidden_states, residual)``: Qwen3-MoE, GLM-4 MoE."""
+
+    def forward(
+        self, positions: Tensor, hidden_states: Tensor, residual: Tensor | None
+    ) -> object: ...
+
+
+class PositionsFirstScaled(Protocol):
+    """``forward(positions, hidden_states, residual, llama_4_scaling)``: DeepSeek-V2."""
+
+    def forward(
+        self,
+        positions: Tensor,
+        hidden_states: Tensor,
+        residual: Tensor | None,
+        llama_4_scaling: Tensor | None = None,
+    ) -> object: ...
+
+
 class HiddenResidualPositions(Protocol):
     """``forward(hidden_states, residual, positions)``: Qwen3-Next, Qwen3.5."""
 
     def forward(
         self, hidden_states: Tensor, residual: Tensor | None, positions: Tensor
     ) -> object: ...
+
+
+class HiddenPositionsResidual(Protocol):
+    """``forward(hidden_states, positions, residual)``: gpt-oss."""
+
+    def forward(
+        self, hidden_states: Tensor, positions: Tensor, residual: Tensor | None
+    ) -> object: ...
+
+
+class HiddenPositionIdsResidual(Protocol):
+    """``forward(hidden_states, position_ids, residual)``: Bailing-MoE."""
+
+    def forward(
+        self, hidden_states: Tensor, position_ids: Tensor, residual: Tensor | None
+    ) -> object: ...
+
+
+class HiddenResidual(Protocol):
+    """``forward(hidden_states, residual)``: a layer that reads no positions."""
+
+    def forward(self, hidden_states: Tensor, residual: Tensor | None) -> object: ...
+
+
+def positions_first(layer: PositionsFirst) -> Stream:
+    """The stream of a ``forward(positions, hidden_states, residual)`` layer."""
+
+    def call(h: Tensor, r: Tensor | None, p: Tensor) -> object:
+        return layer.forward(p, h, r)
+
+    def unpack(
+        positions: Tensor, hidden_states: Tensor, residual: Tensor | None
+    ) -> Triple:
+        return hidden_states, residual, positions
+
+    return Stream(call, unpack)
+
+
+def positions_first_unscaled(layer: PositionsFirstScaled) -> Stream:
+    """The stream of a layer that also takes ``llama_4_scaling``, called without.
+
+    The block does not carry the scaling: a call that passes one is refused.
+    """
+
+    def call(h: Tensor, r: Tensor | None, p: Tensor) -> object:
+        return layer.forward(p, h, r)
+
+    def unpack(
+        positions: Tensor,
+        hidden_states: Tensor,
+        residual: Tensor | None,
+        llama_4_scaling: Tensor | None = None,
+    ) -> Triple:
+        if llama_4_scaling is not None:
+            raise NotImplementedError("the block does not carry llama_4_scaling")
+        return hidden_states, residual, positions
+
+    return Stream(call, unpack)
 
 
 def hidden_residual_positions(layer: HiddenResidualPositions) -> Stream:
@@ -74,6 +152,58 @@ def hidden_residual_positions(layer: HiddenResidualPositions) -> Stream:
     return Stream(call, unpack)
 
 
+def hidden_positions_residual(layer: HiddenPositionsResidual) -> Stream:
+    """The stream of a ``forward(hidden_states, positions, residual)`` layer."""
+
+    def call(h: Tensor, r: Tensor | None, p: Tensor) -> object:
+        return layer.forward(h, p, r)
+
+    def unpack(
+        hidden_states: Tensor, positions: Tensor, residual: Tensor | None
+    ) -> Triple:
+        return hidden_states, residual, positions
+
+    return Stream(call, unpack)
+
+
+def hidden_position_ids_residual(layer: HiddenPositionIdsResidual) -> Stream:
+    """The stream of a ``forward(hidden_states, position_ids, residual)`` layer."""
+
+    def call(h: Tensor, r: Tensor | None, p: Tensor) -> object:
+        return layer.forward(h, p, r)
+
+    def unpack(
+        hidden_states: Tensor, position_ids: Tensor, residual: Tensor | None
+    ) -> Triple:
+        return hidden_states, residual, position_ids
+
+    return Stream(call, unpack)
+
+
+def hidden_residual(layer: HiddenResidual) -> Stream:
+    """The stream of a ``forward(hidden_states, residual)`` layer."""
+
+    def call(h: Tensor, r: Tensor | None, p: Tensor) -> object:
+        del p
+        return layer.forward(h, r)
+
+    def unpack(hidden_states: Tensor, residual: Tensor | None) -> Triple:
+        return hidden_states, residual, None
+
+    return Stream(call, unpack)
+
+
+STREAMS: tuple[Callable[..., Stream], ...] = (
+    positions_first,
+    positions_first_unscaled,
+    hidden_residual_positions,
+    hidden_positions_residual,
+    hidden_position_ids_residual,
+    hidden_residual,
+)
+"""Every helper above, for a tool that tries each (``suggest_blocks``)."""
+
+
 Attend = Callable[[Tensor, Tensor | None], Tensor]
 """``attend(normed, positions) -> attention's output``: how the layer calls it."""
 
@@ -82,6 +212,26 @@ class AttentionWithPositions(Protocol):
     """An attention whose forward takes ``positions`` and ``hidden_states``."""
 
     def forward(self, positions: Tensor, hidden_states: Tensor) -> Tensor: ...
+
+
+class AttentionWithPositionIds(Protocol):
+    """An attention whose forward takes ``hidden_states`` and ``position_ids``."""
+
+    def forward(self, hidden_states: Tensor, position_ids: Tensor) -> Tensor: ...
+
+
+class AttentionWithScaling(Protocol):
+    """An attention taking ``positions``, ``hidden_states`` and ``llama_4_scaling``.
+
+    DeepSeek-V2/V3's attention; the block passes no scaling.
+    """
+
+    def forward(
+        self,
+        positions: Tensor,
+        hidden_states: Tensor,
+        llama_4_scaling: Tensor | None,
+    ) -> Tensor: ...
 
 
 class AttentionWithoutPositions(Protocol):
@@ -108,6 +258,30 @@ def attend_with_positions(attention: AttentionWithPositions) -> Attend:
     return attend
 
 
+def attend_with_position_ids(attention: AttentionWithPositionIds) -> Attend:
+    """Calls ``attention`` with the normed tokens and the position ids."""
+
+    def attend(normed: Tensor, positions: Tensor | None) -> Tensor:
+        return attention.forward(
+            hidden_states=normed, position_ids=require_positions(positions)
+        )
+
+    return attend
+
+
+def attend_unscaled(attention: AttentionWithScaling) -> Attend:
+    """Calls ``attention`` with the normed tokens, the positions and no scaling."""
+
+    def attend(normed: Tensor, positions: Tensor | None) -> Tensor:
+        return attention.forward(
+            positions=require_positions(positions),
+            hidden_states=normed,
+            llama_4_scaling=None,
+        )
+
+    return attend
+
+
 def attend_without_positions(attention: AttentionWithoutPositions) -> Attend:
     """Calls ``attention`` with the normed tokens only."""
 
@@ -116,3 +290,12 @@ def attend_without_positions(attention: AttentionWithoutPositions) -> Attend:
         return attention.forward(hidden_states=normed)
 
     return attend
+
+
+ATTENDS: tuple[Callable[..., Attend], ...] = (
+    attend_with_positions,
+    attend_with_position_ids,
+    attend_unscaled,
+    attend_without_positions,
+)
+"""Every attend helper above, for a tool that tries each (``suggest_blocks``)."""

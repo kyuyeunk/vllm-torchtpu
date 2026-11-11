@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Builds one vLLM MoE decoder layer on the meta device.
+"""Builds one decoder layer of each surveyed vLLM MoE model on the meta device.
 
 Every layer is built from a tiny config through the model's own constructor in
 a single-rank gloo world, with vLLM's platform pinned to CPU by the package
@@ -35,7 +35,24 @@ from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
 )
+from vllm.model_executor.models import nemotron_h
+from vllm.model_executor.models.bailing_moe import BailingMoeBlock
+from vllm.model_executor.models.deepseek_v2 import DeepseekV2DecoderLayer
+from vllm.model_executor.models.glm4_moe import Glm4MoeDecoderLayer
+from vllm.model_executor.models.gpt_oss import TransformerBlock
+from vllm.model_executor.models.jamba import (
+    JambaAttentionDecoderLayer,
+    JambaMambaDecoderLayer,
+)
+from vllm.model_executor.models.llama4 import Llama4DecoderLayer
+from vllm.model_executor.models.minimax_m2 import MiniMaxM2DecoderLayer
+from vllm.model_executor.models.mixtral import MixtralDecoderLayer
+from vllm.model_executor.models.qwen2_moe import Qwen2MoeDecoderLayer
 from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
+from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer
+from vllm.model_executor.models.qwen3_next import Qwen3NextDecoderLayer
+from vllm.models.kimi_k3.nvidia.model import KimiDecoderLayer
+from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 
 def _tiny[C](
@@ -84,6 +101,11 @@ class Spec:
     use_mla: bool = False
 
 
+def _hf_args(b: Built) -> tuple[Any, Any]:
+    """``(config, cache_config)``, the arguments most older layers take first."""
+    return b.hf, b.vllm_config.cache_config
+
+
 SPECS: tuple[Spec, ...] = (
     Spec(
         "Qwen3.5-MoE (full attention)",
@@ -113,6 +135,230 @@ SPECS: tuple[Spec, ...] = (
         Qwen3_5DecoderLayer,
         lambda b: Qwen3_5DecoderLayer(
             b.vllm_config, layer_type="linear_attention", prefix=b.prefix
+        ),
+    ),
+    Spec(
+        "Qwen3-Next",
+        _tiny(
+            transformers.Qwen3NextConfig,
+            num_experts=8,
+            num_experts_per_tok=2,
+            shared_expert_intermediate_size=32,
+            decoder_sparse_step=1,
+        ),
+        Qwen3NextDecoderLayer,
+        lambda b: Qwen3NextDecoderLayer(
+            b.vllm_config, layer_type="full_attention", prefix=b.prefix
+        ),
+    ),
+    Spec(
+        "Qwen3-MoE",
+        _tiny(
+            transformers.Qwen3MoeConfig,
+            num_experts=8,
+            num_experts_per_tok=2,
+            decoder_sparse_step=1,
+        ),
+        Qwen3MoeDecoderLayer,
+        lambda b: Qwen3MoeDecoderLayer(b.vllm_config, prefix=b.prefix),
+    ),
+    Spec(
+        "Qwen2-MoE",
+        _tiny(
+            transformers.Qwen2MoeConfig,
+            num_experts=8,
+            num_experts_per_tok=2,
+            shared_expert_intermediate_size=32,
+            decoder_sparse_step=1,
+        ),
+        Qwen2MoeDecoderLayer,
+        lambda b: Qwen2MoeDecoderLayer(
+            *_hf_args(b), quant_config=None, prefix=b.prefix
+        ),
+    ),
+    Spec(
+        "GLM-4 MoE",
+        _tiny(
+            transformers.Glm4MoeConfig,
+            n_routed_experts=8,
+            num_experts_per_tok=2,
+            n_shared_experts=1,
+            first_k_dense_replace=0,
+            n_group=1,
+            topk_group=1,
+        ),
+        Glm4MoeDecoderLayer,
+        lambda b: Glm4MoeDecoderLayer(*_hf_args(b), quant_config=None, prefix=b.prefix),
+    ),
+    Spec(
+        "Mixtral",
+        _tiny(transformers.MixtralConfig, num_local_experts=8, num_experts_per_tok=2),
+        MixtralDecoderLayer,
+        lambda b: MixtralDecoderLayer(*_hf_args(b), quant_config=None, prefix=b.prefix),
+    ),
+    Spec(
+        "MiniMax-M2",
+        _tiny(
+            transformers.MiniMaxM2Config,
+            num_local_experts=8,
+            num_experts_per_tok=2,
+            rotary_dim=8,
+            scoring_func="sigmoid",
+            use_routing_bias=True,
+        ),
+        MiniMaxM2DecoderLayer,
+        lambda b: MiniMaxM2DecoderLayer(
+            b.hf,
+            prefix=b.prefix,
+            model_config=b.vllm_config.model_config,
+            cache_config=b.vllm_config.cache_config,
+            quant_config=None,
+        ),
+    ),
+    Spec(
+        "Llama4 (MoE layer)",
+        _tiny(
+            transformers.Llama4TextConfig,
+            num_local_experts=8,
+            num_experts_per_tok=1,
+            interleave_moe_layer_step=1,
+            intermediate_size_mlp=128,
+            no_rope_layers=[1, 1],
+        ),
+        Llama4DecoderLayer,
+        lambda b: Llama4DecoderLayer(b.vllm_config, prefix=b.prefix, config=b.hf),
+    ),
+    Spec(
+        "GPT-OSS",
+        _tiny(
+            transformers.GptOssConfig,
+            num_local_experts=8,
+            num_experts_per_tok=2,
+            intermediate_size=32,
+            sliding_window=16,
+        ),
+        TransformerBlock,
+        lambda b: TransformerBlock(b.vllm_config, quant_config=None, prefix=b.prefix),  # pyright: ignore[reportArgumentType]
+    ),
+    Spec(
+        "DeepSeek-V3",
+        _tiny(
+            transformers.DeepseekV3Config,
+            n_routed_experts=8,
+            num_experts_per_tok=2,
+            n_shared_experts=1,
+            first_k_dense_replace=0,
+            n_group=1,
+            topk_group=1,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_nope_head_dim=16,
+            qk_rope_head_dim=8,
+            v_head_dim=16,
+        ),
+        DeepseekV2DecoderLayer,
+        lambda b: DeepseekV2DecoderLayer(b.vllm_config, prefix=b.prefix, config=b.hf),
+        use_mla=True,
+    ),
+    Spec(
+        "Bailing-MoE",
+        _tiny(
+            transformers.PretrainedConfig,
+            num_experts=8,
+            num_experts_per_tok=2,
+            num_shared_experts=1,
+            moe_shared_expert_intermediate_size=32,
+            norm_topk_prob=True,
+            use_bias=False,
+            use_qkv_bias=False,
+            first_k_dense_replace=0,
+            hidden_act="silu",
+            rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+        ),
+        BailingMoeBlock,
+        lambda b: BailingMoeBlock(*_hf_args(b), quant_config=None, prefix=b.prefix),
+    ),
+    Spec(
+        "Kimi-Linear (nvidia)",
+        _tiny(
+            KimiLinearConfig,
+            num_experts=8,
+            num_experts_per_token=2,
+            num_shared_experts=1,
+            first_k_dense_replace=0,
+            moe_layer_freq=1,
+            qk_nope_head_dim=16,
+            qk_rope_head_dim=8,
+            v_head_dim=16,
+            kv_lora_rank=32,
+            mla_use_nope=True,
+        ),
+        KimiDecoderLayer,
+        lambda b: KimiDecoderLayer(b.hf, vllm_config=b.vllm_config, prefix=b.prefix),
+        use_mla=True,
+    ),
+    Spec(
+        "Jamba (attention layer)",
+        _tiny(
+            transformers.JambaConfig,
+            num_experts=8,
+            num_experts_per_tok=2,
+            expert_layer_period=1,
+            expert_layer_offset=0,
+            attn_layer_period=1,
+            attn_layer_offset=0,
+        ),
+        JambaAttentionDecoderLayer,
+        lambda b: JambaAttentionDecoderLayer(
+            b.hf,
+            layer_idx=0,
+            model_config=b.vllm_config.model_config,
+            cache_config=b.vllm_config.cache_config,
+            quant_config=None,
+            prefix=b.prefix,
+        ),
+    ),
+    Spec(
+        "Jamba (Mamba layer)",
+        _tiny(
+            transformers.JambaConfig,
+            num_experts=8,
+            num_experts_per_tok=2,
+            expert_layer_period=1,
+            expert_layer_offset=0,
+            mamba_d_state=8,
+            mamba_dt_rank=8,
+        ),
+        JambaMambaDecoderLayer,
+        lambda b: JambaMambaDecoderLayer(
+            b.hf,
+            layer_idx=0,
+            model_config=b.vllm_config.model_config,
+            cache_config=b.vllm_config.cache_config,
+            quant_config=None,
+            prefix=b.prefix,
+        ),
+    ),
+    Spec(
+        "Nemotron-H (MoE layer)",
+        _tiny(
+            transformers.NemotronHConfig,
+            n_routed_experts=8,
+            num_experts_per_tok=2,
+            n_shared_experts=1,
+            moe_shared_expert_intermediate_size=32,
+            n_group=1,
+            topk_group=1,
+        ),
+        nemotron_h.NemotronHMoEDecoderLayer,
+        lambda b: nemotron_h.NemotronHMoEDecoderLayer(
+            b.hf,
+            layer_idx=0,
+            model_config=b.vllm_config.model_config,
+            cache_config=b.vllm_config.cache_config,
+            quant_config=None,
+            parallel_config=b.vllm_config.parallel_config,
+            prefix=b.prefix,
         ),
     ),
 )

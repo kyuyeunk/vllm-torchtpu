@@ -105,6 +105,7 @@ On a CPU against vLLM v0.33.0 (`<vllm>`); nothing loads libtpu.
 ```bash
 export PYTHONPATH=src:.:<vllm>
 python -m prototype.check_block
+python -m prototype.suggest_blocks
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 JAX_PLATFORMS=cpu python -m pytest tests/blocks
 ```
 
@@ -135,6 +136,119 @@ the read-only guard. Output (warnings omitted):
 3 outside write raises after binding
     raised: TpuRowParallelLinear.reduce_results is decided by the attn_then_moe block plan; pin TPU_BLOCK_PLAN instead
   -> PASS
+```
+
+### `prototype.suggest_blocks`
+
+A suggestion tool; it applies nothing. For one decoder layer per surveyed
+vLLM MoE model, built on the meta device from a tiny config through the
+model's own constructor (`prototype/_build.py`), it finds children of the role
+kinds, tries every binding of them under every forward convention
+(`blocks/stream.py`) and runs the same conformance check. A layer that
+conforms gets the binding function its model owner could add (the first in
+full below; for the others, the lines that differ); one that does not gets
+the reason:
+
+```
+=== proposed attn_then_moe declarations (not applied)
+
+Qwen3.5-MoE (full attention) (vllm.model_executor.models.qwen3_5.Qwen3_5DecoderLayer)
+  @declare_block(Qwen3_5DecoderLayer)
+  def binding(layer: Qwen3_5DecoderLayer) -> AttnMoEParts | None:
+      attention, moe = layer.self_attn, layer.mlp
+      return AttnMoEParts(
+          input_norm=layer.input_layernorm,
+          attention=attention,
+          out_proj=attention.o_proj,
+          post_norm=layer.post_attention_layernorm,
+          moe=moe,
+          router=moe.gate,
+          experts=moe.experts,
+          stream=hidden_residual_positions(layer),
+          attend=attend_with_positions(attention),
+      )
+
+Qwen3.5-MoE (linear attention) (vllm.model_executor.models.qwen3_5.Qwen3_5DecoderLayer)
+  ...
+      attention, moe = layer.linear_attn, layer.mlp
+          stream=hidden_residual_positions(layer),
+          attend=attend_without_positions(attention),
+  ...
+
+Qwen3-Next (vllm.model_executor.models.qwen3_next.Qwen3NextDecoderLayer)
+  ...
+      attention, moe = layer.self_attn, layer.mlp
+          stream=hidden_residual_positions(layer),
+          attend=attend_with_positions(attention),
+  ...
+
+Qwen3-MoE (vllm.model_executor.models.qwen3_moe.Qwen3MoeDecoderLayer)
+  ...
+      attention, moe = layer.self_attn, layer.mlp
+          stream=positions_first(layer),
+          attend=attend_with_positions(attention),
+  ...
+
+Qwen2-MoE (vllm.model_executor.models.qwen2_moe.Qwen2MoeDecoderLayer)
+  ...
+      attention, moe = layer.self_attn, layer.mlp
+          stream=positions_first(layer),
+          attend=attend_with_positions(attention),
+  ...
+
+GLM-4 MoE (vllm.model_executor.models.glm4_moe.Glm4MoeDecoderLayer)
+  ...
+      attention, moe = layer.self_attn, layer.mlp
+          stream=positions_first(layer),
+          attend=attend_with_positions(attention),
+  ...
+
+Mixtral (vllm.model_executor.models.mixtral.MixtralDecoderLayer)
+  ...
+      attention, moe = layer.self_attn, layer.block_sparse_moe
+          stream=positions_first(layer),
+          attend=attend_with_positions(attention),
+  ...
+
+MiniMax-M2 (vllm.model_executor.models.minimax_m2.MiniMaxM2DecoderLayer)
+  ...
+      attention, moe = layer.self_attn, layer.block_sparse_moe
+          stream=positions_first(layer),
+          attend=attend_with_positions(attention),
+  ...
+
+Llama4 (MoE layer) (vllm.model_executor.models.llama4.Llama4DecoderLayer)
+  ...
+      attention, moe = layer.self_attn, layer.feed_forward
+          stream=positions_first(layer),
+          attend=attend_with_positions(attention),
+  ...
+
+GPT-OSS (vllm.model_executor.models.gpt_oss.TransformerBlock)
+  does not conform: declared attn_then_moe (moe), but extra op aten.alias between experts and the block output at gpt_oss.py:416
+
+DeepSeek-V3 (vllm.model_executor.models.deepseek_v2.DeepseekV2DecoderLayer)
+  ...
+      attention, moe = layer.self_attn, layer.mlp
+          stream=positions_first(layer),
+          attend=attend_unscaled(attention),
+  ...
+
+Bailing-MoE (vllm.model_executor.models.bailing_moe.BailingMoeBlock)
+  ...
+      attention, moe = layer.attention, layer.mlp
+          stream=hidden_positions_residual(layer),
+          attend=attend_with_position_ids(attention),
+  ...
+
+Kimi-Linear (nvidia) (vllm.models.kimi_k3.nvidia.model.KimiDecoderLayer)
+  does not conform: declared attn_then_moe on KimiDecoderLayer (moe), but the runner also takes ['shared_experts_input'], which the pattern does not pass
+
+Jamba (attention layer) (vllm.model_executor.models.jamba.JambaAttentionDecoderLayer)
+  does not conform: attention has no RowParallelLinear to the hidden size
+
+Jamba (Mamba layer) (vllm.model_executor.models.jamba.JambaMambaDecoderLayer)
+  does not conform: declared attn_then_moe, but extra op aten.empty_like between in_norm and post_norm at jamba.py:174
 ```
 
 ### `tests/blocks`
@@ -205,7 +319,11 @@ At concurrency 8 the spread between passes is larger than the differences.
 
 ## What this prototype does not show
 
-- **One model on a TPU.** Only Qwen3.5-35B-A3B-FP8 at TP 4 has run.
+- **One model on a TPU.** Only Qwen3.5-35B-A3B-FP8 at TP 4 has run, and it
+  is the only declaration; the others `suggest_blocks` proposes are not
+  declared.
+- **Suggestions are built at TP 1.** A decision that depends on the real TP
+  size shows only in the startup check.
 - **Conformance treats each role as its contract.** That attention ends in
   its output projection and that the runner returns `(tokens, hidden)` come
   from the part kinds, not from the graph.
