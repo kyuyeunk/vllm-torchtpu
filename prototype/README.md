@@ -1,0 +1,89 @@
+# Prototype: two ratchets that keep decisions with their owners
+
+`tools/check_reach_ins.py` is an AST lint with two ratchets, each against a
+baseline of today's entries:
+
+- **writes**: no new assignment to a field of an object reached through
+  another object, such as `layer.mlp.experts.gate = None`. A child's decision
+  set from outside bypasses the plan that should hand it down. `self.x = ...`
+  is the module's own state and does not count.
+- **identity**: outside `models/`, no new import of a model module and no new
+  comparison against a `model_type` or `architectures` string. Shared code
+  chooses by structure and declared capability, not by which model it is.
+
+Existing entries stay until someone migrates them. A new entry fails. A fixed
+entry must be deleted from the baseline so it cannot come back.
+
+## Commands
+
+Python 3.12, from the repository root:
+
+```bash
+python tools/check_reach_ins.py                    # check both ratchets
+python tools/check_reach_ins.py --update           # rewrite both baselines
+python tools/check_reach_ins.py --report PATH...   # list hits in any files
+```
+
+### The tree passes against its baselines
+
+```
+$ python tools/check_reach_ins.py; echo rc=$?
+rc=0
+```
+
+The baselines hold 131 write entries and 37 identity entries.
+
+### What it flags in PR #1492's patch and in vLLM
+
+`<vllm>` is a vLLM v0.33.0 checkout; vLLM main at `1ecc9cc4ce` has the same
+Kimi write.
+
+```
+$ python tools/check_reach_ins.py --report \
+    src/vllm_torchtpu/models/vllm/qwen3_5_patch.py \
+    <vllm>/vllm/models/kimi_k3/nvidia/model.py | grep -v :import:
+src/vllm_torchtpu/models/vllm/qwen3_5_patch.py:_configure_layer:experts.gate
+src/vllm_torchtpu/models/vllm/qwen3_5_patch.py:_configure_layer:experts.moe_config.skip_final_all_reduce
+src/vllm_torchtpu/models/vllm/qwen3_5_patch.py:_configure_layer:proj.reduce_results
+src/vllm_torchtpu/models/vllm/qwen3_5_patch.py:model_type:qwen3_5_moe_text
+<vllm>/vllm/models/kimi_k3/nvidia/model.py:__init__:self.experts.moe_config.intermediate_size_per_partition_unpadded
+<vllm>/vllm/models/kimi_k3/nvidia/model.py:__init__:self.gate.e_score_correction_bias
+<vllm>/vllm/models/kimi_k3/nvidia/model.py:__init__:self.self_attn.o_proj.reduce_results
+```
+
+- **#1492's patch** writes three children's decisions after they are built
+  (`o_proj/out_proj.reduce_results`, `experts.gate`,
+  `moe_config.skip_final_all_reduce`) and keys on a `model_type` literal.
+  The three writes are in the baseline today, so retiring the patch shrinks
+  it. The patch lives under `models/`, so the identity ratchet does not
+  apply to it, but `--report` lists the literal.
+- **vLLM's Kimi decoder layer** writes its attention child's
+  `o_proj.reduce_results`: the same reach-in, upstream.
+
+### A new reach-in fails
+
+A planted file under `src/vllm_torchtpu/layers/`:
+
+```python
+def f(layer):
+    layer.mlp.experts.gate = None
+
+
+def g(cfg):
+    return cfg.model_type == "qwen3_5_moe_text"
+```
+
+```
+$ python tools/check_reach_ins.py; echo rc=$?
+new writes reach-in: src/vllm_torchtpu/layers/planted_reach_in.py:f:layer.mlp.experts.gate
+new identity reach-in: src/vllm_torchtpu/layers/planted_reach_in.py:model_type:qwen3_5_moe_text
+rc=1
+```
+
+## What this prototype does not show
+
+- **The lints are syntactic.** `setattr(obj, name, value)` and a write
+  through a function parameter one hop deep are not caught.
+- **A sanctioned writer needs an exemption.** A block's contract adapter,
+  which binds child decisions once at install time, uses `setattr` and so
+  passes today; production would exempt it by name instead.
