@@ -159,7 +159,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
-from vllm_torchtpu.runner import greedy_top_tokens, spec_boundary_state
+from vllm_torchtpu.runner import greedy_top_tokens, spec_boundary_state, step_plan
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
@@ -675,7 +675,7 @@ class TPUModelRunner(GPUModelRunner):
     empty_slot_mappings: dict[int, torch.Tensor]
     # Defaults for a runner built without __init__.
     _pp_wave: PPWave | PPRing | None = None
-    _dp_step_other_decode: bool = False
+    _dp_step: step_plan.DpStep = step_plan.DpStep()
     _adaptive_verification: AdaptiveVerificationManager | None = None
     # 1.0 on TP rank 0, else 0.0; set when TP > 1. Kept apart from the draft
     # pin's mask, whose dtype follows the draft tokens.
@@ -914,19 +914,12 @@ class TPUModelRunner(GPUModelRunner):
         self._kv_cache_bundle: torch.Tensor | None = None
         self._kv_cache_bundle_layer_index: dict[str, int] = {}
 
-        # EP-DP lockstep state, refreshed each step by execute_model /
-        # execute_dummy_batch: the coordinated (max-across-ranks) token
-        # bucket and chunk count.
-        self._dp_target_bucket: int | None = None
+        # The DP agreement for the current step; only `_dp_coordinated_step`
+        # writes it, and always whole.
+        self._dp_step = step_plan.DpStep()
         # Whether the lm_head is sharded over DP (TPU_DP_VOCAB_PARALLEL); set at
         # model load.
         self._dp_vocab_logits = False
-        self._dp_step_num_chunks: int = 0
-        self._dp_step_max_reqs: int = 0
-        self._dp_step_has_encoder_inputs = False
-        # Whether another DP rank ran a decode this step; SrptPrefillScheduler
-        # applies VLLM_TPU_SRPT_ATTN_WORK_CAP only while some rank decodes.
-        self._dp_step_other_decode = False
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
@@ -1780,11 +1773,12 @@ class TPUModelRunner(GPUModelRunner):
         num_tokens_padded: int | None = None,
         num_reqs_padded: int | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
+        *,
+        ctx: AttentionMetadataBuilderContext,
     ) -> tuple[dict[str, AttentionMetadata], None]:
         """Lean TPU group walk: stage one batched block-table upload, then
         build every group's metadata straight from the builder context.
         """
-        ctx = self._attn_metadata_builder_ctx
         effective_num_reqs_padded = (
             num_reqs_padded if num_reqs_padded is not None else num_reqs
         )
@@ -1803,6 +1797,7 @@ class TPUModelRunner(GPUModelRunner):
                 ).build(
                     common_prefix_len=0,
                     common_attn_metadata=common,
+                    ctx=ctx,
                 )
                 for layer_name in group.layer_names:
                     per_layer_attn_metadata[layer_name] = built
@@ -1812,6 +1807,7 @@ class TPUModelRunner(GPUModelRunner):
         self,
         layer_names: Collection[str],
         num_reqs_padded: int,
+        ctx: AttentionMetadataBuilderContext,
     ) -> dict[str, AttentionMetadata]:
         """Build attention metadata for only the groups owning `layer_names`.
 
@@ -1822,19 +1818,16 @@ class TPUModelRunner(GPUModelRunner):
         discarding all but the draft's costs a block-table H2D plus a handful
         of gathers per discarded group, per chunk, per step.
 
-        Reads the same `_attn_metadata_builder_ctx` the full build does, so
-        callers stage it identically.
+        Takes the builder context as an argument, as the full build does.
         """
         # `AttentionMetadataBuilder.build` takes only `num_reqs` off the
-        # common metadata; everything else it needs comes from
-        # `_attn_metadata_builder_ctx`.
+        # common metadata; everything else it needs comes from `ctx`.
         selected_groups = []
         for group_list in self.attn_groups:
             for group in group_list:
                 selected = [n for n in group.layer_names if n in layer_names]
                 if selected:
                     selected_groups.append((group, selected))
-        ctx = self._attn_metadata_builder_ctx
         if ctx.staged_block_tables is None and selected_groups:
             # One H2D for exactly the groups this targeted walk will build.
             stage_block_table_uploads(
@@ -1854,6 +1847,7 @@ class TPUModelRunner(GPUModelRunner):
             built = cast(AttentionMetadataBuilder, group.metadata_builders[0]).build(
                 common_prefix_len=0,
                 common_attn_metadata=common,
+                ctx=ctx,
             )
             for name in selected:
                 metadata[name] = built
@@ -3122,12 +3116,12 @@ class TPUModelRunner(GPUModelRunner):
         manager = self._adaptive_verification
         if (
             manager is None
-            or self._dp_target_bucket is None
+            or self._dp_step.bucket is None
             or not local_num_chunks == target_num_chunks == 1
         ):
             return None
         expanded = manager.expand(
-            self._dp_target_bucket - scheduler_output.total_num_scheduled_tokens
+            self._dp_step.bucket - scheduler_output.total_num_scheduled_tokens
         )
         if expanded is None:
             return None
@@ -3288,12 +3282,12 @@ class TPUModelRunner(GPUModelRunner):
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
-        start_index: int,
-        num_decode_reqs: int,
-        num_windowed_reqs: int | None = None,
+        step: step_plan.StepPlan,
+        chunk: step_plan.ChunkPlan,
     ):
-        if num_windowed_reqs is None:
-            num_windowed_reqs = num_decode_reqs
+        start_index = chunk.start_index
+        num_decode_reqs = step.num_decode
+        num_windowed_reqs = step.num_windowed
         assert self.reorder_batch_threshold is not None
         rpa_num_decode_reqs = (
             num_windowed_reqs if self.reorder_batch_threshold > 1 else num_decode_reqs
@@ -3304,45 +3298,11 @@ class TPUModelRunner(GPUModelRunner):
         assert start_index < num_reqs
         self._wait_input_staging_fence()
 
-        # Get the number of scheduled tokens for each request.
-        use_max_model_len = self.most_model_len is None
-        num_scheduled_tokens_per_req = []
-        max_num_scheduled_tokens_all_reqs = 0
-        end_index = start_index
-
-        # Use either most_model_len or max_model_len depending on request size.
-        for i in range(start_index, num_reqs):
-            req_id = self.input_batch.req_ids[i]
-            assert req_id is not None
-            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            if (
-                not use_max_model_len
-                and self.most_model_len is not None
-                and num_tokens > self.most_model_len
-            ):
-                use_max_model_len = True
-            num_scheduled_tokens_per_req.append(num_tokens)
-        if use_max_model_len:
-            if len(num_scheduled_tokens_per_req) > self.num_reqs_max_model_len:
-                num_scheduled_tokens_per_req = num_scheduled_tokens_per_req[
-                    : self.num_reqs_max_model_len
-                ]
-                end_index = start_index + self.num_reqs_max_model_len
-            else:
-                end_index = num_reqs
-        else:
-            assert self.num_reqs_most_model_len is not None
-            if len(num_scheduled_tokens_per_req) > self.num_reqs_most_model_len:
-                num_scheduled_tokens_per_req = num_scheduled_tokens_per_req[
-                    : self.num_reqs_most_model_len
-                ]
-                end_index = start_index + self.num_reqs_most_model_len
-            else:
-                end_index = num_reqs
-        max_num_scheduled_tokens_all_reqs = max(num_scheduled_tokens_per_req)
-        num_scheduled_tokens_per_req = np.array(
-            num_scheduled_tokens_per_req, dtype=np.int32
-        )
+        # The chunk's requests and capacity come from the step plan.
+        use_max_model_len = chunk.use_max_model_len
+        end_index = chunk.end_index
+        max_num_scheduled_tokens_all_reqs = max(chunk.tokens_per_req)
+        num_scheduled_tokens_per_req = np.array(chunk.tokens_per_req, dtype=np.int32)
         total_num_scheduled_tokens = sum(num_scheduled_tokens_per_req)
         assert max_num_scheduled_tokens_all_reqs > 0
 
@@ -3450,11 +3410,7 @@ class TPUModelRunner(GPUModelRunner):
                 0, 0, int(total_num_scheduled_tokens)
             ).clone()
 
-        if use_max_model_len:
-            target_num_reqs = self.num_reqs_max_model_len
-        else:
-            assert self.num_reqs_most_model_len is not None
-            target_num_reqs = self.num_reqs_most_model_len
+        target_num_reqs = chunk.target_num_reqs
         padded_num_reqs = _get_padded_num_reqs_with_upper_limit(
             num_reqs, self.max_num_reqs
         )
@@ -3542,7 +3498,7 @@ class TPUModelRunner(GPUModelRunner):
             pos_idx_np = np.full(padded_total_num_scheduled_tokens, -1, dtype=np.int32)
             acc = 0
             for i in range(num_reqs):
-                req_id = self.input_batch.req_ids[start_index + i]
+                req_id = step.req_order[start_index + i]
                 n_sched = int(num_scheduled_tokens_per_req[i])
                 pos = self._pre_async_results.req_id_to_index_copy.get(req_id)
                 if pos is not None:
@@ -3578,9 +3534,7 @@ class TPUModelRunner(GPUModelRunner):
             num_draft_tokens = np.array(
                 [
                     len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()))
-                    for req_id in self.input_batch.req_ids[
-                        start_index : start_index + num_reqs
-                    ]
+                    for req_id in step.req_order[start_index : start_index + num_reqs]
                 ],
                 dtype=np.int32,
             )
@@ -3736,7 +3690,7 @@ class TPUModelRunner(GPUModelRunner):
                 self._prefill_ckpt_offsets_cpu[:target_num_reqs],
             )
 
-        self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+        attn_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=start_index,
             use_max_model_len=use_max_model_len,
@@ -3758,6 +3712,9 @@ class TPUModelRunner(GPUModelRunner):
             ),
             sequence_layout_descriptor=layout_plan.descriptor,
         )
+        # Still read after the forward by the chunk loop (mamba rollback,
+        # draft capture); the builders receive `attn_ctx` as an argument.
+        self._attn_metadata_builder_ctx = attn_ctx
         slot_mappings = self.empty_slot_mappings
         per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = (
             self._build_attention_metadata(
@@ -3767,6 +3724,7 @@ class TPUModelRunner(GPUModelRunner):
                 num_tokens_padded=local_padded_total_num_scheduled_tokens,
                 num_reqs_padded=target_num_reqs,
                 slot_mappings=slot_mappings,
+                ctx=attn_ctx,
             )
         )
 
@@ -3925,76 +3883,40 @@ class TPUModelRunner(GPUModelRunner):
     def _dp_lockstep_enabled(self) -> bool:
         return utils.dp_engines_in_lockstep(self.parallel_config)
 
-    def _count_input_chunks(
+    def _split_chunks(
         self, scheduler_output: "SchedulerOutput"
-    ) -> tuple[int, int]:
-        """Match _prepare_inputs chunking without staging any tensors.
+    ) -> tuple[step_plan.ChunkPlan, ...]:
+        """This rank's forwards, before the DP agreement; the one chunk split."""
+        return step_plan.split_chunks(
+            self._tokens_per_req(scheduler_output),
+            most_model_len=self.most_model_len,
+            num_reqs_max_model_len=self.num_reqs_max_model_len,
+            num_reqs_most_model_len=self.num_reqs_most_model_len,
+        )
 
-        Returns (num_chunks, max_chunk_reqs). The second value is the exact
-        maximum request count of any chunk — a most-model-len chunk holds up
-        to num_reqs_most_model_len requests, which can exceed
-        num_reqs_max_model_len, so no batch-level clamp is a safe substitute.
-        """
-        if scheduler_output.total_num_scheduled_tokens == 0:
-            return 0, 0
+    def _tokens_per_req(self, scheduler_output: "SchedulerOutput") -> list[int]:
+        return [
+            scheduler_output.num_scheduled_tokens[cast(str, r)]
+            for r in self.input_batch.req_ids[: self.input_batch.num_reqs]
+        ]
 
-        num_reqs = self.input_batch.num_reqs
-        start_index = 0
-        num_chunks = 0
-        max_chunk_reqs = 0
-        while start_index < num_reqs:
-            use_max_model_len = self.most_model_len is None
-            for i in range(start_index, num_reqs):
-                req_id = self.input_batch.req_ids[i]
-                assert req_id is not None
-                num_tokens = scheduler_output.num_scheduled_tokens[req_id]
-                if (
-                    not use_max_model_len
-                    and self.most_model_len is not None
-                    and num_tokens > self.most_model_len
-                ):
-                    use_max_model_len = True
-
-            if use_max_model_len:
-                chunk_reqs = self.num_reqs_max_model_len
-            else:
-                assert self.num_reqs_most_model_len is not None
-                chunk_reqs = self.num_reqs_most_model_len
-            this_chunk_reqs = min(chunk_reqs, num_reqs - start_index)
-            max_chunk_reqs = max(max_chunk_reqs, this_chunk_reqs)
-            start_index += this_chunk_reqs
-            num_chunks += 1
-        return num_chunks, max_chunk_reqs
-
-    def _pp_forward_rows(self, scheduler_output: "SchedulerOutput") -> list[int]:
+    def _pp_forward_rows(
+        self, scheduler_output: "SchedulerOutput", step: step_plan.StepPlan
+    ) -> list[int]:
         """The padded token count of each forward this step runs, in order,
         as _prepare_inputs sizes them, without staging any tensors."""
         planner = _get_sequence_layout_planner_for_runner(self)
-        num_reqs = self.input_batch.num_reqs
-        rows: list[int] = []
-        all_counts = [
-            scheduler_output.num_scheduled_tokens[self.input_batch.req_ids[i]]
-            for i in range(num_reqs)
-        ]
-        start_index = 0
-        while start_index < num_reqs:
-            counts = all_counts[start_index:]
-            if self.most_model_len is None or max(counts) > self.most_model_len:
-                chunk_reqs = self.num_reqs_max_model_len
-            else:
-                assert self.num_reqs_most_model_len is not None
-                chunk_reqs = self.num_reqs_most_model_len
-            counts = counts[:chunk_reqs]
-            rows.append(
-                planner.padded_num_tokens(
-                    runner=self,
-                    scheduler_output=scheduler_output,
-                    start_index=start_index,
-                    num_scheduled_tokens_per_req=np.array(counts, dtype=np.int32),
-                )
+        return [
+            planner.padded_num_tokens(
+                runner=self,
+                scheduler_output=scheduler_output,
+                start_index=chunk.start_index,
+                num_scheduled_tokens_per_req=np.array(
+                    chunk.tokens_per_req, dtype=np.int32
+                ),
             )
-            start_index += len(counts)
-        return rows
+            for chunk in step.chunks
+        ]
 
     def _dp_coordinated_step(
         self,
@@ -4003,11 +3925,16 @@ class TPUModelRunner(GPUModelRunner):
         local_num_reqs: int = 0,
         has_encoder_inputs: bool = False,
         local_any_decode: bool = False,
-    ) -> "tuple[int | None, int]":
-        """Return the DP-wide padded token bucket and forward chunk count."""
-        self._dp_step_other_decode = False
+    ) -> step_plan.DpStep:
+        """Agrees on this step's `DpStep` across DP ranks; its only writer."""
         if not self._dp_lockstep_enabled():
-            return None, local_num_chunks
+            self._dp_step = dataclasses.replace(
+                self._dp_step,
+                bucket=None,
+                num_forwards=local_num_chunks,
+                other_decode=False,
+            )
+            return self._dp_step
         from vllm.distributed.parallel_state import get_dp_group
 
         dp_group = get_dp_group()
@@ -4038,13 +3965,15 @@ class TPUModelRunner(GPUModelRunner):
         # max per-chunk request count (see DFlashProposer), riding this same
         # all-reduce instead of paying the theoretical max bucket or a
         # second collective.
-        self._dp_step_max_reqs = int(t[2].item())
-        self._dp_step_has_encoder_inputs = bool(t[3].item())
         highest, lowest = int(t[4].item()) - 1, dp_size - int(t[5].item())
-        self._dp_step_other_decode = highest >= 0 and (
-            highest != lowest or highest != dp_rank
+        self._dp_step = step_plan.DpStep(
+            bucket=bucket,
+            num_forwards=int(t[1].item()),
+            max_reqs=int(t[2].item()),
+            has_encoder_inputs=bool(t[3].item()),
+            other_decode=highest >= 0 and (highest != lowest or highest != dp_rank),
         )
-        return bucket, int(t[1].item())
+        return self._dp_step
 
     def _any_decode(self, scheduler_output: "SchedulerOutput") -> bool:
         """Whether this step schedules a request past its prompt; computed
@@ -4065,7 +3994,7 @@ class TPUModelRunner(GPUModelRunner):
     def _execute_dp_mm_encoder(
         self, scheduler_output: "SchedulerOutput | None" = None
     ) -> None:
-        if not self._dp_step_has_encoder_inputs:
+        if not self._dp_step.has_encoder_inputs:
             return
         manager = cast(MMEncoderManager | None, self.encoder_cudagraph_manager)
         if manager is None:
@@ -4119,13 +4048,11 @@ class TPUModelRunner(GPUModelRunner):
             dp_lockstep=True,
         )
 
-    def _run_dp_idle_pairing(self, bucket: int, num_chunks: int) -> None:
+    def _run_dp_idle_pairing(self, step: step_plan.StepPlan) -> None:
         """Pair encoder, target and draft collectives on an idle EP-DP rank."""
+        assert not step.chunks and step.dp.bucket is not None
+        bucket, num_chunks = step.dp.bucket, step.num_forwards
         self._execute_dp_mm_encoder()
-        # Set before decoder dummies: both _run_dp_dummy_chunk and the draft
-        # run_dp_dummy_draft read _dp_target_bucket for the coordinated,
-        # equal-token shape.
-        self._dp_target_bucket = bucket
         # Phase 1: all TARGET dummy forwards.
         for _ in range(num_chunks):
             self._run_dp_dummy_chunk(bucket)
@@ -4200,26 +4127,38 @@ class TPUModelRunner(GPUModelRunner):
         num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
             scheduler_output
         )
-        local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
-            scheduler_output
-        )
-        self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
+        local_chunks = self._split_chunks(scheduler_output)
+        dp = self._dp_coordinated_step(
             scheduler_output.total_num_scheduled_tokens,
-            local_num_chunks,
-            local_num_reqs=local_max_chunk_reqs,
+            len(local_chunks),
+            local_num_reqs=max(c.num_reqs for c in local_chunks),
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
             local_any_decode=self._any_decode(scheduler_output),
         )
-        self._dp_step_num_chunks = target_num_chunks
         readmitted = self._readmit_trimmed_drafts(
-            scheduler_output, local_num_chunks, target_num_chunks
+            scheduler_output, len(local_chunks), dp.num_forwards
         )
         if readmitted is not None:
             scheduler_output, num_decode_reqs, num_windowed_reqs = readmitted
+        # The step's decisions, final from here on; every stage below
+        # receives them (or one chunk of them) as an argument.
+        step = step_plan.plan_step(
+            req_order=[
+                cast(str, r)
+                for r in self.input_batch.req_ids[: self.input_batch.num_reqs]
+            ],
+            tokens_per_req=self._tokens_per_req(scheduler_output),
+            num_decode=num_decode_reqs,
+            num_windowed=num_windowed_reqs,
+            dp=dp,
+            most_model_len=self.most_model_len,
+            num_reqs_max_model_len=self.num_reqs_max_model_len,
+            num_reqs_most_model_len=self.num_reqs_most_model_len,
+        )
         if isinstance(self._pp_wave, PPRing) and not self._pp_is_first:
             # Post this step's receives first, so the previous stage can send
             # while this one prepares its inputs.
-            self._pp_wave.begin_step(self._pp_forward_rows(scheduler_output))
+            self._pp_wave.begin_step(self._pp_forward_rows(scheduler_output, step))
 
         # Run the multimodal (vision) encoder. vLLM's base
         # GPUModelRunner.execute_model does this; our override must do it
@@ -4317,10 +4256,10 @@ class TPUModelRunner(GPUModelRunner):
             if has_kv_transfer_group()
             else None
         )
-        while chunk_index < target_num_chunks:
-            if start_index >= self.input_batch.num_reqs:
-                assert self._dp_target_bucket is not None
-                self._run_dp_dummy_chunk(self._dp_target_bucket)
+        while chunk_index < step.num_forwards:
+            if chunk_index >= len(step.chunks):
+                assert step.dp.bucket is not None
+                self._run_dp_dummy_chunk(step.dp.bucket)
                 chunk_index += 1
                 continue
 
@@ -4335,9 +4274,7 @@ class TPUModelRunner(GPUModelRunner):
                 spec_decode_metadata,
                 request_major_input_ids,
                 draft_sequence_layout_plan,
-            ) = self._prepare_inputs(
-                scheduler_output, start_index, num_decode_reqs, num_windowed_reqs
-            )
+            ) = self._prepare_inputs(scheduler_output, step, step.chunks[chunk_index])
 
             # Seed newly-advanced mamba state blocks before the forward reads
             # them (chunk boundaries, decode crossings, prefix-cache resumes).
@@ -5739,7 +5676,7 @@ class TPUModelRunner(GPUModelRunner):
             )
             # Read by SrptPrefillScheduler.update_from_output.
             # pyrefly: ignore[missing-attribute]
-            model_runner_output.other_rank_decoding = self._dp_step_other_decode
+            model_runner_output.other_rank_decoding = self._dp_step.other_decode
 
             async_output = AsyncTPUModelRunnerOutput(
                 model_runner_output=model_runner_output,
@@ -6270,7 +6207,7 @@ class TPUModelRunner(GPUModelRunner):
                 if self._prefill_ckpt_units is not None
                 else None
             )
-            self._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+            dummy_ctx = AttentionMetadataBuilderContext(
                 num_reqs=num_reqs,
                 start_index=0,
                 use_max_model_len=use_max_model_len,
@@ -6285,6 +6222,7 @@ class TPUModelRunner(GPUModelRunner):
                 mamba_prefill_ckpt_offsets=dummy_prefill_ckpt_offsets,
                 sequence_layout_descriptor=dummy_layout_plan.descriptor,
             )
+            self._attn_metadata_builder_ctx = dummy_ctx
             slot_mappings = self.empty_slot_mappings
             per_layer_attn_metadata, _unused_spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
@@ -6294,6 +6232,7 @@ class TPUModelRunner(GPUModelRunner):
                     num_tokens_padded=num_tokens,
                     num_reqs_padded=num_reqs,
                     slot_mappings=slot_mappings,
+                    ctx=dummy_ctx,
                 )
             )
         else:
@@ -8931,7 +8870,7 @@ class TPUModelRunner(GPUModelRunner):
         which _dp_coordinated_step all-reduces on busy and idle ranks alike.
         No chunk's padded request count exceeds it."""
         return _get_padded_num_reqs_with_upper_limit(
-            self._dp_step_max_reqs, self.max_num_reqs
+            self._dp_step.max_reqs, self.max_num_reqs
         )
 
     def _logits_at_dp_vocab_rows(

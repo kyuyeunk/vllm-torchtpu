@@ -458,7 +458,7 @@ class PcpSequenceLayoutPlanner:
             num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
             num_tokens_paddings=runner.num_tokens_paddings,
             max_num_tokens=runner.max_num_tokens,
-            dp_target_bucket=runner._dp_target_bucket,
+            dp_target_bucket=runner._dp_step.bucket,
         )
 
     def padded_num_tokens(
@@ -662,7 +662,7 @@ def prepare_pcp_sequence_layout(
             num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
             num_tokens_paddings=runner.num_tokens_paddings,
             max_num_tokens=runner.max_num_tokens,
-            dp_target_bucket=runner._dp_target_bucket,
+            dp_target_bucket=runner._dp_step.bucket,
         )
     PcpSequenceLayoutEligibility.require_mode(decision, PcpSequenceLayoutMode.STREAMING)
 

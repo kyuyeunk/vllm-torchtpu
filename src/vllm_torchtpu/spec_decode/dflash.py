@@ -361,8 +361,7 @@ class DFlashProposer:
         assert self._draft_attn_layer_names is not None, (
             "load_model() must run before draft attention metadata is built"
         )
-        saved_ctx = runner._attn_metadata_builder_ctx
-        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+        ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=start_index,
             use_max_model_len=use_max_model_len,
@@ -371,15 +370,12 @@ class DFlashProposer:
             request_distribution=request_distribution,
             position_ids_override=position_ids_override,
         )
-        try:
-            # Only the draft layers' KV cache groups. The full build walks
-            # every group in the deployment and we would discard all but
-            # these — see `build_attention_metadata_for_layers`.
-            return runner.build_attention_metadata_for_layers(
-                self._draft_attn_layer_names, padded_num_reqs
-            )
-        finally:
-            runner._attn_metadata_builder_ctx = saved_ctx
+        # Only the draft layers' KV cache groups. The full build walks every
+        # group in the deployment and we would discard all but these — see
+        # `build_attention_metadata_for_layers`.
+        return runner.build_attention_metadata_for_layers(
+            self._draft_attn_layer_names, padded_num_reqs, ctx
+        )
 
     def _build_draft_attn_metadata(
         self,
@@ -581,7 +577,7 @@ class DFlashProposer:
             self._require_aux_hidden_states(chunk)
         extra_chunks = 0
         if self._dp_lockstep_sharded():
-            extra_chunks = max(0, self.runner._dp_step_num_chunks - len(chunks))
+            extra_chunks = max(0, self.runner._dp_step.num_forwards - len(chunks))
         for chunk in chunks:
             self._update_draft_kv_cache_from_target(chunk)
         for _ in range(extra_chunks):
@@ -924,7 +920,7 @@ class DFlashProposer:
 
     def _dp_draft_bucket(self, local_num_reqs: int = 0) -> int:
         """Draft-forward token bucket every lockstep rank runs this step."""
-        num_reqs = dp_lockstep_num_reqs(self.runner._dp_step_max_reqs, local_num_reqs)
+        num_reqs = dp_lockstep_num_reqs(self.runner._dp_step.max_reqs, local_num_reqs)
         return self._get_padded_len(num_reqs * self.block_size)
 
     @torch.no_grad()
@@ -932,8 +928,8 @@ class DFlashProposer:
         """One padding KV-update pass at the DP-coordinated target bucket.
         Runs on the decode path, so it must not wait on the host."""
         runner = self.runner
-        bucket = runner._dp_target_bucket
-        assert bucket is not None, "_dp_target_bucket unset in lockstep step"
+        bucket = runner._dp_step.bucket
+        assert bucket is not None, "DP bucket unset in lockstep step"
         self._dummy_precompute_and_update_kv_cache(
             num_tokens=bucket,
             num_reqs=runner.num_reqs_max_model_len,

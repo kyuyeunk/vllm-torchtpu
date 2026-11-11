@@ -53,6 +53,7 @@ from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.step_plan import StepPlan
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
@@ -705,8 +706,8 @@ class TPUWorker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         """Run an idle DP step with the same collective pattern as active DP."""
         runner = self.model_runner
-        bucket, target_num_chunks = runner._dp_coordinated_step(0, 0)
-        if bucket is None:
+        dp = runner._dp_coordinated_step(0, 0)
+        if dp.bucket is None:
             # TPU compiles exact token buckets, so the idle-engine dummy must
             # use one of the precompiled model-forward shapes.
             dummy_tokens = runner.num_tokens_paddings[0]
@@ -719,7 +720,7 @@ class TPUWorker(WorkerBase):
             return
         # Single DP-EP pairing entry: all target dummy forwards, then all draft
         # dummy forwards, in the runner that owns the state.
-        runner._run_dp_idle_pairing(bucket, target_num_chunks)
+        runner._run_dp_idle_pairing(StepPlan.idle(dp))
 
     def profile(
         self,

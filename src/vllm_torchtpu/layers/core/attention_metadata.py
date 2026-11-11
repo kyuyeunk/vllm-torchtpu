@@ -520,9 +520,14 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 )
         return block_table_obj, target_num_blocks
 
-    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+    def build(
+        self,
+        common_prefix_len,
+        common_attn_metadata,
+        ctx: AttentionMetadataBuilderContext,
+        fast_build=False,
+    ):
         runner = self.runner
-        ctx = runner._attn_metadata_builder_ctx
         target_num_reqs = common_attn_metadata.num_reqs
         block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
 

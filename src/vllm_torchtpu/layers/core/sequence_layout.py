@@ -302,7 +302,7 @@ def _all_padded_num_tokens(runner: Any, total_num_scheduled_tokens: int) -> int:
     padded_num_tokens = _first_ge(
         runner.num_tokens_paddings, int(total_num_scheduled_tokens)
     )
-    dp_target_bucket = runner._dp_target_bucket
+    dp_target_bucket = runner._dp_step.bucket
     if dp_target_bucket is not None and dp_target_bucket > padded_num_tokens:
         padded_num_tokens = int(dp_target_bucket)
     return padded_num_tokens

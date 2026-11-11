@@ -1349,7 +1349,7 @@ class Eagle3Proposer:
         # rank's real chunks for that step, never all at the end.
         num_dp_pad_chunks = 0
         if self._dp_lockstep_sharded():
-            num_dp_pad_chunks = max(0, runner._dp_step_num_chunks - len(chunks))
+            num_dp_pad_chunks = max(0, runner._dp_step.num_forwards - len(chunks))
         dp_dummy = self._build_dp_dummy_draft() if num_dp_pad_chunks else None
 
         def pad_dp_draft_step(step: int) -> None:
@@ -1985,8 +1985,7 @@ class Eagle3Proposer:
             if runner._has_mamba_state
             else None
         )
-        saved_ctx = runner._attn_metadata_builder_ctx
-        runner._attn_metadata_builder_ctx = AttentionMetadataBuilderContext(
+        draft_ctx = AttentionMetadataBuilderContext(
             num_reqs=num_reqs,
             start_index=chunk.start_index,
             use_max_model_len=use_max_model_len,
@@ -2000,18 +1999,15 @@ class Eagle3Proposer:
             position_ids_override=chunk.attn_ctx.position_ids_override,
             sequence_layout_descriptor=(chunk.attn_ctx.sequence_layout_descriptor),
         )
-        try:
-            slot_mappings = runner.empty_slot_mappings
-            per_layer_attn_metadata, _ = runner._build_attention_metadata(
-                num_tokens=effective_num_tokens,
-                num_reqs=kernel_num_reqs,
-                max_query_len=max_query_len,
-                num_tokens_padded=effective_num_tokens,
-                num_reqs_padded=kernel_num_reqs,
-                slot_mappings=slot_mappings,
-            )
-        finally:
-            runner._attn_metadata_builder_ctx = saved_ctx
+        per_layer_attn_metadata, _ = runner._build_attention_metadata(
+            num_tokens=effective_num_tokens,
+            num_reqs=kernel_num_reqs,
+            max_query_len=max_query_len,
+            num_tokens_padded=effective_num_tokens,
+            num_reqs_padded=kernel_num_reqs,
+            slot_mappings=runner.empty_slot_mappings,
+            ctx=draft_ctx,
+        )
 
         assert self._draft_attn_layer_names is not None, (
             "draft attn layer names were not captured during load_model"
@@ -2235,7 +2231,7 @@ class Eagle3Proposer:
 
         runner = self.runner
         if self._dp_lockstep_sharded():
-            num_reqs = dp_lockstep_num_reqs(runner._dp_step_max_reqs, num_reqs)
+            num_reqs = dp_lockstep_num_reqs(runner._dp_step.max_reqs, num_reqs)
         return _get_padded_token_len(runner.num_tokens_paddings, num_reqs)
 
     def _precompile_combine_hidden_states(self) -> None:
@@ -2355,8 +2351,8 @@ class Eagle3Proposer:
         """Inputs for EP-DP padding chunks at the step's coordinated shapes,
         shared by every padding chunk and draft step."""
         runner = self.runner
-        bucket = runner._dp_target_bucket
-        assert bucket is not None, "_dp_target_bucket unset in lockstep step"
+        bucket = runner._dp_step.bucket
+        assert bucket is not None, "DP bucket unset in lockstep step"
         num_reqs = runner.num_reqs_max_model_len
         input_ids = torch.zeros(bucket, dtype=torch.int32, device=runner.device)
         # Two consumers, two ranks. The draft forward takes mrope-shaped
