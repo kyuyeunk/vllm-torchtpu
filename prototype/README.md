@@ -1,7 +1,8 @@
+**Records group** (`prototype/records/`). Backs DATA_CONTRACTS.md section 5.4 (Figure 23) and Appendix A.4's #211. Siblings: `prototype/records/step-plan`.
+
 # Prototype: the pool's layout as a staged record
 
-Backs DATA_CONTRACTS.md section 5.4 (Figure 23) and Appendix A.4's
-#211. Today the pool's block size is written into `cache_config` by the
+Today the pool's block size is written into `cache_config` by the
 platform and copied or re-read by each reader; nothing says when the value
 is final. In #211 the runner copied `block_size` 16 in `__init__`, the worker
 raised it to 2048 after `load_model`, and the mamba seed-copy collector
