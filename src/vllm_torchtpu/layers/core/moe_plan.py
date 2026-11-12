@@ -761,6 +761,54 @@ def plan_combine(
     return MoeCombinePlan(combine=Combine.TENSORCORE)
 
 
+def _sparse_core_kernel_runs(
+    version: GatherReduceVersion, out: GmmOutSpec, target: "pltpu.TpuInfo | None"
+) -> bool:
+    if target is None or target.sparse_core is None:
+        return False
+    if version is not GatherReduceVersion.V3:
+        return True
+    return v3.v3_capable(rows=out.rows, hidden=out.hidden, dtype=out.dtype, chip=target)
+
+
+def combine_capable(
+    plan: MoeCombinePlan,
+    op: MoeOpIn,
+    out: GmmOutSpec,
+    target: "pltpu.TpuInfo | None",
+) -> bool:
+    """Whether the combine `plan` names can run on this call at all.
+
+    Capability only: the preferences `plan_combine` adds on top (the one-hot
+    threshold, the VMEM cutoff of the SparseCore kernels, the top-8 and
+    padding rules of local v3) are left out, so a plan they reject but this
+    accepts must still produce the same output. A plan this rejects must fail
+    loudly when forced.
+
+    Args:
+        plan: The combine plan to run.
+        op: This call's shapes.
+        out: The combine's input facts.
+        target: The chip, or None without a TPU description.
+
+    Returns:
+        True when the combine can run.
+    """
+    match plan.combine:
+        case Combine.TENSORCORE | Combine.EP_ONEHOT | Combine.EP_RAGGED_TC_FALLBACK:
+            return True
+        case Combine.EP_RAGGED_SC:
+            assert plan.ep_gather_reduce_version is not None
+            return _sparse_core_kernel_runs(plan.ep_gather_reduce_version, out, target)
+        case Combine.LOCAL_V3:
+            # Route-pair metadata needs at least two routes.
+            return op.topk >= 2 and _sparse_core_kernel_runs(
+                GatherReduceVersion.V3, out, target
+            )
+        case Combine.EP_OWNER_ONEHOT:
+            return owner_onehot_admits(op, out, target)
+
+
 def plan_bucket(
     process: MoeProcessPlan,
     op: MoeOpIn,

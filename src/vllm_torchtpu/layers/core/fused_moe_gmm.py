@@ -521,70 +521,37 @@ def prepare_routed_gmm_inputs(
     )
 
 
-def moe_gmm(
-    x: jax.Array,
-    w1: jax.Array,
-    w1_scale: jax.Array | None,
-    w1_bias: jax.Array | None,
-    w2: jax.Array,
-    w2_scale: jax.Array | None,
-    w2_bias: jax.Array | None,
-    group_sizes: jax.Array,
+def combine_facts(
+    gmm2_res: jax.Array,
     argsort_revert_indices: jax.Array,
     topk_weights_flat: jax.Array,
-    valid_mask_flat: jax.Array,
     token_indices_sorted: jax.Array,
     *,
-    activation: str,
     num_tokens: int,
     topk: int,
+    local_num_experts: int,
     use_ep: bool,
-    use_sparse_core: bool,
-    onehot_moe_permute_threshold: int = 0,
-    rhs_quant_dtype: jnp.dtype | None = None,
-) -> jax.Array:
-    """Run grouped GEMM for routed tokens and reduce back to tokens.
+) -> tuple[moe_plan.MoeOpIn, moe_plan.GmmOutSpec]:
+    """The static facts the combine plan is decided from.
 
-    The valid-mask gating below is a no-op for non-EP runs (mask is all
-    True) and keeps the single code path uniform for both EP and non-EP.
-    EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
+    Args:
+        gmm2_res: Second GMM output, one row per sorted route.
+        argsort_revert_indices: Sorted position of each flat route.
+        topk_weights_flat: Routing weight of each flat route.
+        token_indices_sorted: Token of each sorted position.
+        num_tokens: Local token rows.
+        topk: Experts per token.
+        local_num_experts: Experts held by this shard.
+        use_ep: Expert-parallel routing.
+
+    Returns:
+        The call's shapes and the combine's input facts.
     """
-    group_offset = jnp.array([0], dtype=jnp.int32)
-
-    gmm1_res = gmm_wrapper(
-        x,
-        w1,
-        w1_scale,
-        w1_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
-        fuse_act=activation,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
-    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
-    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
-
-    topk_weights = topk_weights_flat.reshape((num_tokens, topk))
-    valid_mask = valid_mask_flat.reshape((num_tokens, topk))
-
-    gmm2_res = gmm_wrapper(
-        gmm1_res,
-        w2,
-        w2_scale,
-        w2_bias,
-        group_sizes,
-        group_offset,
-        zero_initialize=False,
-        preferred_element_type=x.dtype,
-        rhs_quant_dtype=rhs_quant_dtype,
-    )
-    process = _moe_process_plan(
-        use_sparse_core=use_sparse_core,
-        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
-    )
     op = moe_plan.MoeOpIn(
-        num_tokens=num_tokens, topk=topk, local_num_experts=w1.shape[0], use_ep=use_ep
+        num_tokens=num_tokens,
+        topk=topk,
+        local_num_experts=local_num_experts,
+        use_ep=use_ep,
     )
     out = moe_plan.GmmOutSpec(
         routes=argsort_revert_indices.size,
@@ -595,6 +562,45 @@ def moe_gmm(
         token_indices_dtype=token_indices_sorted.dtype,
         topk_weights_shape=tuple(topk_weights_flat.shape),
         topk_weights_dtype=topk_weights_flat.dtype,
+    )
+    return op, out
+
+
+def resolve_combine_plan(
+    gmm2_res: jax.Array,
+    argsort_revert_indices: jax.Array,
+    topk_weights_flat: jax.Array,
+    token_indices_sorted: jax.Array,
+    *,
+    num_tokens: int,
+    topk: int,
+    local_num_experts: int,
+    use_ep: bool,
+    use_sparse_core: bool,
+    onehot_moe_permute_threshold: int,
+) -> moe_plan.MoeCombinePlan:
+    """The combine plan `moe_gmm` resolves for its second GMM output.
+
+    Reads the chip and TPU_MOE_OWNER_OUTPUT_MODE only where the plan needs
+    them, as `moe_plan.combine_target_need` says. Arguments are those of
+    `combine_facts`, plus the two process knobs.
+
+    Returns:
+        The combine plan.
+    """
+    process = _moe_process_plan(
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+    )
+    op, out = combine_facts(
+        gmm2_res,
+        argsort_revert_indices,
+        topk_weights_flat,
+        token_indices_sorted,
+        num_tokens=num_tokens,
+        topk=topk,
+        local_num_experts=local_num_experts,
+        use_ep=use_ep,
     )
     # Read only on the EP one-hot combine, as before: the getter validates
     # the value, so reading it on every bucket would fail earlier on a bad one.
@@ -610,8 +616,42 @@ def moe_gmm(
             target = _tpu_info_or_none()
         case TargetNeed.REQUIRED:
             target = _runtime_tpu_info()
-    plan = moe_plan.plan_combine(process, op, out, target, owner_output=owner_output)
+    return moe_plan.plan_combine(process, op, out, target, owner_output=owner_output)
 
+
+def moe_combine(
+    gmm2_res: jax.Array,
+    group_sizes: jax.Array,
+    argsort_revert_indices: jax.Array,
+    topk_weights_flat: jax.Array,
+    valid_mask_flat: jax.Array,
+    token_indices_sorted: jax.Array,
+    *,
+    plan: moe_plan.MoeCombinePlan,
+    num_tokens: int,
+    topk: int,
+    out_dtype: jnp.dtype,
+) -> jax.Array:
+    """Sums the top-k expert outputs back per token, the way `plan` says.
+
+    Args:
+        gmm2_res: Second GMM output, one row per sorted route; rows past
+            `group_sizes.sum()` were never written.
+        group_sizes: Routed rows per local expert.
+        argsort_revert_indices: Sorted position of each flat route.
+        topk_weights_flat: Routing weight of each flat route.
+        valid_mask_flat: Whether each flat route is computed on this shard.
+        token_indices_sorted: Token of each sorted position.
+        plan: The combine plan.
+        num_tokens: Local token rows.
+        topk: Experts per token.
+        out_dtype: Output dtype.
+
+    Returns:
+        The `(num_tokens, hidden)` combined output.
+    """
+    topk_weights = topk_weights_flat.reshape((num_tokens, topk))
+    valid_mask = valid_mask_flat.reshape((num_tokens, topk))
     match plan.combine:
         case Combine.LOCAL_V3:
             return ragged_gather_reduce_v3(
@@ -621,7 +661,7 @@ def moe_gmm(
                 valid_mask_flat,
                 reduce_group_size=topk,
                 tc_fallback=False,
-            ).astype(x.dtype)
+            ).astype(out_dtype)
         case Combine.EP_OWNER_ONEHOT | Combine.EP_ONEHOT:
             # Use onehot + matmul for unpermutation, which can be faster
             # for small batch size.
@@ -647,7 +687,7 @@ def moe_gmm(
                     topk_weights_sorted,
                     valid_count,
                     num_tokens=num_tokens,
-                ).astype(x.dtype)
+                ).astype(out_dtype)
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
@@ -662,7 +702,7 @@ def moe_gmm(
             combine = (onehot * topk_weights[..., None] * valid_mask[..., None]).sum(
                 axis=1
             )
-            return (combine @ gmm2_res).astype(x.dtype)
+            return (combine @ gmm2_res).astype(out_dtype)
         case Combine.EP_RAGGED_SC | Combine.EP_RAGGED_TC_FALLBACK:
             return ragged_gather_reduce(
                 gmm2_res,
@@ -671,7 +711,7 @@ def moe_gmm(
                 valid_mask_flat,
                 reduce_group_size=topk,
                 tc_fallback=plan.combine is Combine.EP_RAGGED_TC_FALLBACK,
-            ).astype(x.dtype)
+            ).astype(out_dtype)
         case Combine.TENSORCORE:
             token_hidden = gmm2_res[argsort_revert_indices]
             token_topk_hidden = token_hidden.reshape(
@@ -682,7 +722,93 @@ def moe_gmm(
             )
             token_topk_hidden = jnp.where(valid_mask[:, :, None], token_topk_hidden, 0)
             # FP32 top-k weights can promote BF16 outputs; keep the custom-op dtype.
-            return token_topk_hidden.sum(axis=1).astype(x.dtype)
+            return token_topk_hidden.sum(axis=1).astype(out_dtype)
+
+
+def moe_gmm(
+    x: jax.Array,
+    w1: jax.Array,
+    w1_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2: jax.Array,
+    w2_scale: jax.Array | None,
+    w2_bias: jax.Array | None,
+    group_sizes: jax.Array,
+    argsort_revert_indices: jax.Array,
+    topk_weights_flat: jax.Array,
+    valid_mask_flat: jax.Array,
+    token_indices_sorted: jax.Array,
+    *,
+    activation: str,
+    num_tokens: int,
+    topk: int,
+    use_ep: bool,
+    use_sparse_core: bool,
+    onehot_moe_permute_threshold: int = 0,
+    rhs_quant_dtype: jnp.dtype | None = None,
+    combine_plan: moe_plan.MoeCombinePlan | None = None,
+) -> jax.Array:
+    """Run grouped GEMM for routed tokens and reduce back to tokens.
+
+    The valid-mask gating below is a no-op for non-EP runs (mask is all
+    True) and keeps the single code path uniform for both EP and non-EP.
+    EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
+
+    `combine_plan`, test-only, replaces the resolved combine plan, as the
+    plan-invariance check does; None resolves it.
+    """
+    group_offset = jnp.array([0], dtype=jnp.int32)
+
+    gmm1_res = gmm_wrapper(
+        x,
+        w1,
+        w1_scale,
+        w1_bias,
+        group_sizes,
+        group_offset,
+        zero_initialize=False,
+        fuse_act=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    packing_factor = get_packing_factor(w2.dtype, rhs_quant_dtype)
+    gmm1_res = gmm1_res[:, : w2.shape[1] * packing_factor]
+
+    gmm2_res = gmm_wrapper(
+        gmm1_res,
+        w2,
+        w2_scale,
+        w2_bias,
+        group_sizes,
+        group_offset,
+        zero_initialize=False,
+        preferred_element_type=x.dtype,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    if combine_plan is None:
+        combine_plan = resolve_combine_plan(
+            gmm2_res,
+            argsort_revert_indices,
+            topk_weights_flat,
+            token_indices_sorted,
+            num_tokens=num_tokens,
+            topk=topk,
+            local_num_experts=w1.shape[0],
+            use_ep=use_ep,
+            use_sparse_core=use_sparse_core,
+            onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+        )
+    return moe_combine(
+        gmm2_res,
+        group_sizes,
+        argsort_revert_indices,
+        topk_weights_flat,
+        valid_mask_flat,
+        token_indices_sorted,
+        plan=combine_plan,
+        num_tokens=num_tokens,
+        topk=topk,
+        out_dtype=x.dtype,
+    )
 
 
 @functools.partial(
