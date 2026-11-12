@@ -251,7 +251,7 @@ def counts() -> list[str]:
     for what, items in PR_3096.items():
         print(f"    #3096 {what}: {len(items)}")
     print(
-        "    here: 1 plan value (fused_norm_add_qkv), 6 declarations, "
+        "    here: 1 plan value (FusedNormProjection), 6 declarations, "
         "1 conformance check (norm_attn.conform)"
     )
     return []

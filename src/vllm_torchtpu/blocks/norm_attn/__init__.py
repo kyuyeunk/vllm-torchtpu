@@ -24,6 +24,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from vllm.model_executor.layers.linear import LinearBase
 
 from vllm_torchtpu.blocks import (
     BlockDeclaration,
@@ -33,7 +34,11 @@ from vllm_torchtpu.blocks import (
 )
 from vllm_torchtpu.blocks import conformance as conf
 from vllm_torchtpu.blocks.norm_attn import plan as plan_mod
-from vllm_torchtpu.blocks.norm_attn.forward import NormThenAttentionBlock
+from vllm_torchtpu.blocks.norm_attn.forward import (
+    AddOnly,
+    FusedNormProjection,
+    install_fused_qkv,
+)
 from vllm_torchtpu.blocks.norm_attn.pattern import (
     NormAttnRoles,
     check_roles,
@@ -44,10 +49,6 @@ from vllm_torchtpu.blocks.norm_attn.pattern import (
 _PATTERN = "norm_then_attention"
 _TOKENS = 8
 _conformed: dict[tuple[object, ...], NormAttnRoles] = {}
-
-
-class _Handoff(Exception):  # noqa: N818 - control flow, not an error
-    pass
 
 
 def _fail(layer: nn.Module, why: str) -> conf.BlockConformanceError:
@@ -79,9 +80,9 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnRoles:
     """Checks a declared layer against norm_then_attention; returns its roles.
 
     Three checks, all on the meta device: the roles are the right kinds; with
-    the roles opaque, the layer's forward computes the pattern's graph; and
-    attention hands its input straight to its QKV projection, so the fused
-    value can project for it.
+    the roles opaque, the layer's forward computes the pattern's graph (so the
+    normed tokens reach nothing but attention); and attention's input reaches
+    nothing but its QKV projection, so the fused value can normalize there.
 
     Raises:
         BlockConformanceError: Naming the role, edge and source line.
@@ -163,26 +164,59 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnRoles:
         if isinstance(v, torch.Tensor)
     )
 
-    # The handoff: attention's first use of its input is its QKV projection.
+    # Attention's input reaches nothing but its QKV projection: run attention
+    # on the meta device with the projection and the attention core opaque,
+    # and record every other op that touches the input.
     (qkv_name,) = qkv_proj_of(attn, hidden)
+    proj = attn.get_submodule(qkv_name)
     probe = torch.empty(_TOKENS, hidden, **meta)
     by_source = {"normed": probe, hidden_p: probe, residual_p: args[1]}
     by_source[positions_p] = args[2]
     call = {k: by_source[src] for k, src in attention_args}
+    width = int(proj.output_size_per_partition)
+    used: list[str] = []
+    projected: list[bool] = []
 
     def projection(t: torch.Tensor) -> Any:  # noqa: ANN401
-        raise _Handoff(t is probe)
+        projected.append(t is probe)
+        out = torch.empty(_TOKENS, width, **meta)
+        return (out, None) if getattr(proj, "return_bias", True) else out
 
-    try:
-        with conf.opaque(attn.get_submodule(qkv_name), projection):
+    def core(q: torch.Tensor, *a: Any, **k: Any) -> torch.Tensor:  # noqa: ANN401
+        return torch.empty_like(q)
+
+    class _Uses(torch.overrides.TorchFunctionMode):
+        def __torch_function__(self, func, types, a=(), k=None):  # noqa: ANN001, ANN204
+            k = k or {}
+            if any(x is probe for x in (*a, *k.values())):
+                used.append(getattr(func, "__name__", str(func)))
+            return func(*a, **k)
+
+    cores = [m for m in attn.modules() if isinstance(m, conf_core_types())]
+    linears = [m for m in attn.modules() if isinstance(m, LinearBase) and m is not proj]
+
+    def linear_stub(m: nn.Module):  # noqa: ANN202
+        def stub(x: torch.Tensor, *a: Any, **k: Any) -> Any:  # noqa: ANN401
+            out = x.new_empty((*x.shape[:-1], int(m.output_size_per_partition)))
+            return (out, None) if getattr(m, "return_bias", True) else out
+
+        return stub
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(conf.opaque(proj, projection))
+        for m in cores:
+            stack.enter_context(conf.opaque(m, core))
+        for m in linears:
+            stack.enter_context(conf.opaque(m, linear_stub(m)))
+        stack.enter_context(_Uses())
+        try:
             attn(**call)
-    except _Handoff as handed:
-        if not handed.args[0]:
-            raise _fail(
-                layer, f"attention changes its input before {qkv_name}"
-            ) from None
-    else:
-        raise _fail(layer, f"attention never calls {qkv_name}")
+        except Exception as e:  # noqa: BLE001 - a forward that will not run here
+            raise _fail(layer, f"attention does not run on meta: {e}") from e
+    if projected != [True]:
+        raise _fail(layer, f"attention does not pass its input to {qkv_name} once")
+    if used:
+        raise _fail(layer, f"attention also reads its input in {sorted(set(used))}")
 
     roles = NormAttnRoles(
         input_norm=binding["in_norm"],
@@ -199,15 +233,12 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnRoles:
     return roles
 
 
-_block_classes: dict[type, type] = {}
+def conf_core_types() -> tuple[type, ...]:
+    from vllm.model_executor.layers.attention_layer_base import (  # noqa: PLC0415
+        AttentionLayerBase,
+    )
 
-
-def _block_class(cls: type) -> type:
-    if cls not in _block_classes:
-        block = type(cls.__name__, (NormThenAttentionBlock, cls), {})
-        block.__qualname__ = cls.__qualname__
-        _block_classes[cls] = block
-    return _block_classes[cls]
+    return (AttentionLayerBase,)
 
 
 @block_implementation(norm_then_attention)
@@ -226,12 +257,8 @@ class NormThenAttention:
         cls = type(layer).__qualname__
         if plan.input_proj == "unfused":
             return Installed(name, cls, f"conforms; input_proj=unfused ({source})")
-        if type(layer) in _block_classes.values() or hasattr(layer, "_block_roles"):
-            # Nesting under an installed attn_then_moe block forward is not
-            # shown here: that forward would call this one's front half.
-            return Installed(name, cls, "conforms; outer block owns the forward")
-        order = tuple(inspect.signature(layer.forward).parameters)
-        layer.__class__ = _block_class(type(layer))
-        layer._subblock_roles = roles
-        layer._subblock_order = order
+        if isinstance(layer.get_submodule(roles.input_norm), AddOnly):
+            return Installed(name, cls, "already installed")
+        install_fused_qkv(layer, roles.input_norm, roles.qkv_proj)
+        assert isinstance(layer.get_submodule(roles.qkv_proj), FusedNormProjection)
         return Installed(name, cls, f"installed; input_proj=fused_qkv ({source})")
