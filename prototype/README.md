@@ -1,7 +1,8 @@
+**Checks group** (`prototype/checks/`). Backs DATA_CONTRACTS.md section 5.7 (the hierarchy checks), section 3 ("Decisions flow down the scopes") and Table 12, rule 1 (d) and (e). Siblings: `prototype/checks/reach-in-lints`, `prototype/checks/moe-plan-invariance`.
+
 # Prototype: each level owns its decisions
 
-Backs DATA_CONTRACTS.md section 5.7 (the hierarchy checks), section 3 ("Decisions
-flow down the scopes") and Table 12, rule 1 (d) and (e). Decisions flow from the model scope through
+Decisions flow from the model scope through
 block and family scopes to kernels, and each level's plan becomes the
 contract of the level below. Each level owns its decisions; three checks stop
 a lower level from reaching up or re-deciding what it was handed:
