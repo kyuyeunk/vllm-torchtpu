@@ -26,7 +26,6 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
 from vllm_torchtpu.kernels.megablox.gmm_v2 import get_packing_factor, gmm_v2
 from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
-    can_use_blockwise_onehot_unpermute,
 )
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import (
     ragged_gather_reduce as ragged_gather_reduce_v1,
@@ -37,10 +36,16 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v2.wrapper import (
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
     ragged_gather_reduce as ragged_gather_reduce_v3,
 )
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
-    token_block_alignment,
-)
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+from vllm_torchtpu.layers.core import moe_plan
+from vllm_torchtpu.layers.core.moe_plan import (
+    Combine,
+    MoePath,
+    OwnerOutputMode,
+    Permute,
+    SortForm,
+    TargetNeed,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -58,9 +63,11 @@ def _select_ragged_gather_reduce(version: str):
 # EP combine remains fixed for the process lifetime. The default is v2; set
 # RAGGED_GATHER_REDUCE_VERSION=v3 to select the destination-major kernel for EP.
 # The non-EP combine in moe_gmm selects that kernel directly.
+_EP_GATHER_REDUCE_VERSION = moe_plan.gather_reduce_version(
+    envs.RAGGED_GATHER_REDUCE_VERSION
+)
 ragged_gather_reduce = _select_ragged_gather_reduce(envs.RAGGED_GATHER_REDUCE_VERSION)
 
-_ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 # Fixed at import: build the MoE permutation from one packed sort.
@@ -69,21 +76,32 @@ _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
 # non-ragged paths (EP one-hot permute and non-EP TP). Off, those paths run
 # the packed single sort or the three-sort form; ragged permute is unaffected.
 _COUNTING_SORT = envs.TPU_MOE_COUNTING_SORT
-# Routed-row cap for the one-hot EP permute and non-EP paths. Up to here the
-# counting sort (or, where it declines, the packed single sort) replaces the
-# three-sort form; above it the three sorts stay. Past this point the single
-# sort's inverse-permutation scatter costs more than the sorts it replaces,
-# and the counting sort's rank contraction does too at 256+ local experts.
-_SINGLE_SORT_MAX_ROWS = 2048
-# Rows per block of the counting sort's rank contraction: the triangular
-# matmul is B x B, so this trades that against the number of blocks.
-_COUNTING_SORT_BLOCK = 512
-# Up to one counting-sort block on non-ragged paths, scattering token ids
-# through the counting sort's positions is cheaper than the packed value sort
-# it replaces and leaves the decode routing prep with no comparison sort.
-# Ragged permute keeps the packed sort so SparseCore gather overlap is
-# unchanged, and past one block the scatter costs more than that sort.
-_COUNTING_SORT_SCATTER_MAX_ROWS = _COUNTING_SORT_BLOCK
+# The row caps that pick among the sort forms are documented with the rule in
+# moe_plan; they are plan inputs, named here so tests can patch them.
+_SINGLE_SORT_MAX_ROWS = moe_plan.SINGLE_SORT_MAX_ROWS
+_COUNTING_SORT_BLOCK = moe_plan.COUNTING_SORT_BLOCK
+_COUNTING_SORT_SCATTER_MAX_ROWS = moe_plan.COUNTING_SORT_SCATTER_MAX_ROWS
+
+
+def _moe_process_plan(
+    *, use_sparse_core: bool, onehot_moe_permute_threshold: int
+) -> moe_plan.MoeProcessPlan:
+    """The process-wide MoE knobs as one plan input.
+
+    The only place this module turns its import-time selectors into a plan
+    input. They are looked up at call time so a test that patches a module
+    selector (e.g. `_SINGLE_SORT`) still steers the plan.
+    """
+    return moe_plan.MoeProcessPlan(
+        use_sparse_core=use_sparse_core,
+        onehot_threshold=onehot_moe_permute_threshold,
+        single_sort=_SINGLE_SORT,
+        counting_sort=_COUNTING_SORT,
+        dense_expert_threshold=_DENSE_EXPERT_THRESHOLD,
+        ep_gather_reduce_version=_EP_GATHER_REDUCE_VERSION,
+        single_sort_max_rows=_SINGLE_SORT_MAX_ROWS,
+        counting_scatter_max_rows=_COUNTING_SORT_SCATTER_MAX_ROWS,
+    )
 
 
 def _runtime_tpu_info() -> pltpu.TpuInfo:
@@ -105,7 +123,7 @@ def resolve_onehot_permute_threshold(target: pltpu.TpuInfo | None = None) -> int
     one-hot matmuls instead of the SparseCore gather/reduce kernels.
 
     Auto (env unset/empty/negative) resolves to ``min(SC block rows - 1,
-    _ONEHOT_AUTO_CAP)`` on SparseCore TPUs and 0 elsewhere. An explicit
+    moe_plan.ONEHOT_AUTO_CAP)`` on SparseCore TPUs and 0 elsewhere. An explicit
     ``ONEHOT_MOE_PERMUTE_THRESHOLD`` wins: 0 disables the one-hot path, a
     positive value forces that threshold.
 
@@ -118,13 +136,7 @@ def resolve_onehot_permute_threshold(target: pltpu.TpuInfo | None = None) -> int
         return explicit
     if target is None:
         target = _tpu_info_or_none()
-    sc_info = target.sparse_core if target is not None else None
-    if sc_info is None:
-        return 0
-    block_rows = sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores
-    threshold = min(block_rows - 1, _ONEHOT_AUTO_CAP)
-
-    return threshold
+    return moe_plan.auto_onehot_permute_threshold(target)
 
 
 def unpack_fp4_to_e2m1(w_packed: jax.Array) -> jax.Array:
@@ -252,7 +264,7 @@ def gmm_wrapper(
 
 def _counting_sort_positions(
     sort_keys: jax.Array, num_buckets: int
-) -> tuple[jax.Array | None, jax.Array | None]:
+) -> tuple[jax.Array, jax.Array]:
     """Stable counting sort: row -> its position in the sorted order.
 
     `jnp.argsort(jnp.argsort(keys))` spends a second comparison sort over M
@@ -261,14 +273,12 @@ def _counting_sort_positions(
     from a triangular matmul on the one-hot block -- MXU work proportional to
     M*block*num_buckets instead of a length-M sort -- and the bucket totals
     fall out of the same histogram, which is exactly `group_sizes`.
+    Callers must hold `moe_plan.counting_sort_accepts` (more buckets than
+    block rows is the region XLA miscompiles).
     """
     m = sort_keys.shape[0]
     block = min(_COUNTING_SORT_BLOCK, m)
-    if num_buckets > block:
-        # XLA miscompiles the rank matmul here on jaxlib 0.10.2 + libtpu
-        # 0.0.44.1: under jit the positions come back not a permutation. Only
-        # num_buckets > block is affected, so that is the excluded region.
-        return None, None
+    assert num_buckets <= block, "moe_plan.counting_sort_accepts must hold"
     pad = -m % block
     if pad:
         # The sentinel bucket sorts after every real one, so padding into it
@@ -345,6 +355,17 @@ def _single_sort_permutation(
     return sorted_indices, revert, sorted_indices // topk
 
 
+def _onehot_group_sizes(
+    topk_indices_flat: jax.Array, valid_mask: jax.Array, local_num_experts: int
+) -> jax.Array:
+    """`group_sizes` by a masked one-hot count (the non-counting-sort forms)."""
+    topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
+    group_sizes_local = jax.nn.one_hot(
+        topk_indices_for_count, local_num_experts, dtype=jnp.int32
+    ) * valid_mask[:, None].astype(jnp.int32)
+    return group_sizes_local.sum(axis=0)
+
+
 def prepare_routed_gmm_inputs(
     hidden_states_local: jax.Array,
     topk_indices_local: jax.Array,
@@ -370,6 +391,16 @@ def prepare_routed_gmm_inputs(
     topk_indices_flat = topk_indices_local.flatten()
     topk_weights_flat = topk_weights_local.flatten()
     token_indices_flat = jnp.arange(num_tokens_local, dtype=jnp.int32).repeat(topk)
+    process = _moe_process_plan(
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+    )
+    op = moe_plan.MoeOpIn(
+        num_tokens=num_tokens_local,
+        topk=topk,
+        local_num_experts=local_num_experts,
+        use_ep=use_ep,
+    )
 
     if skip_padded_tokens:
         # Padded tokens keep their selected expert ids, but carry zero
@@ -380,109 +411,94 @@ def prepare_routed_gmm_inputs(
         valid_mask = topk_indices_flat >= 0
     sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
     # The keys take only `local_num_experts + 1` values, so a counting sort
-    # gives the positions and `group_sizes` without a second comparison sort:
-    # on the ragged permute at any row count (as before), and -- unless
-    # TPU_MOE_COUNTING_SORT stands it down -- on the one-hot and non-EP paths
-    # within the single sort's envelope, where it replaces that sort. On
-    # non-ragged paths within `_COUNTING_SORT_SCATTER_MAX_ROWS`, scattering
-    # `token_indices_flat` by those positions also removes the packed value
-    # sort.
-    ragged_permute = (
-        use_ep
-        and use_sparse_core
-        and token_indices_flat.shape[0] > onehot_moe_permute_threshold
-    )
-    counting_sort = ragged_permute or (
-        _COUNTING_SORT and token_indices_flat.shape[0] <= _SINGLE_SORT_MAX_ROWS
-    )
-    argsort_revert_indices, bucket_counts = (
-        _counting_sort_positions(sort_keys, local_num_experts + 1)
-        if counting_sort
-        else (None, None)
-    )
-    token_bits = max(1, (num_tokens_local - 1).bit_length())
-    packable = (local_num_experts + 1).bit_length() + token_bits < 31
-    flat_bits = max(1, (token_indices_flat.shape[0] - 1).bit_length())
-    single_sort = (
-        _SINGLE_SORT
-        and argsort_revert_indices is None
-        and not ragged_permute
-        and token_indices_flat.shape[0] <= _SINGLE_SORT_MAX_ROWS
-        and (local_num_experts + 1).bit_length() + flat_bits < 31
-    )
+    # gives the positions and `group_sizes` without a second comparison sort
+    # (see moe_plan.SortForm for every form and moe_plan.plan_routing for when
+    # each is chosen).
+    routing = moe_plan.plan_routing(process, op)
+    argsort_revert_indices: jax.Array | None = None
+    bucket_counts: jax.Array | None = None
+    if routing.uses_counting_sort:
+        argsort_revert_indices, bucket_counts = _counting_sort_positions(
+            sort_keys, local_num_experts + 1
+        )
     token_indices_sorted: jax.Array | None = None
-    if (
-        argsort_revert_indices is not None
-        and not ragged_permute
-        and token_indices_flat.shape[0] <= _COUNTING_SORT_SCATTER_MAX_ROWS
-    ):
+    sorted_indices: jax.Array | None = None
+    if routing.sort is SortForm.COUNTING_SCATTER:
         token_indices_sorted = (
             jnp.zeros_like(token_indices_flat)
             .at[argsort_revert_indices]
             .set(token_indices_flat, unique_indices=True)
         )
-    sorted_indices = (
-        jnp.argsort(sort_keys)
-        if token_indices_sorted is None
-        and not single_sort
-        and (argsort_revert_indices is None or not packable)
-        else None
-    )
+    if routing.argsorts_keys:
+        sorted_indices = jnp.argsort(sort_keys)
 
-    if argsort_revert_indices is not None:
-        group_sizes_local = bucket_counts[:local_num_experts]
-    else:
-        if single_sort:
+    match routing.sort:
+        case (
+            SortForm.COUNTING_SCATTER
+            | SortForm.COUNTING_PACKED
+            | SortForm.COUNTING_ARGSORT
+        ):
+            assert bucket_counts is not None
+            group_sizes_local = bucket_counts[:local_num_experts]
+        case SortForm.SINGLE_SORT:
             logger.info_once("MoE permutation runs as one packed sort.")
             sorted_indices, argsort_revert_indices, token_indices_sorted = (
-                _single_sort_permutation(sort_keys, topk, flat_bits)
+                _single_sort_permutation(sort_keys, topk, routing.flat_bits)
             )
-        else:
+            group_sizes_local = _onehot_group_sizes(
+                topk_indices_flat, valid_mask, local_num_experts
+            )
+        case SortForm.ARGSORT_PACKED | SortForm.ARGSORT_GATHER:
+            assert sorted_indices is not None
             argsort_revert_indices = jnp.argsort(sorted_indices)
-        topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
-        group_sizes_local = jax.nn.one_hot(
-            topk_indices_for_count, local_num_experts, dtype=jnp.int32
-        ) * valid_mask[:, None].astype(jnp.int32)
-        group_sizes_local = group_sizes_local.sum(axis=0)
+            group_sizes_local = _onehot_group_sizes(
+                topk_indices_flat, valid_mask, local_num_experts
+            )
 
-    if token_indices_sorted is None:
-        if packable:
+    match routing.sort:
+        case SortForm.COUNTING_PACKED | SortForm.ARGSORT_PACKED:
             # Packing (key, token) into one int32 keeps the payload out of the sort
             # and drops the follow-up gather. Equal packed values carry the same
             # token id, so their order cannot matter.
             packed = jax.lax.sort(
-                jnp.left_shift(sort_keys, token_bits) | token_indices_flat,
+                jnp.left_shift(sort_keys, routing.token_bits) | token_indices_flat,
                 is_stable=False,
             )
-            token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
-        else:
+            token_indices_sorted = jnp.bitwise_and(
+                packed, (1 << routing.token_bits) - 1
+            )
+        case SortForm.COUNTING_ARGSORT | SortForm.ARGSORT_GATHER:
+            assert sorted_indices is not None
             token_indices_sorted = token_indices_flat[sorted_indices]
+        case SortForm.COUNTING_SCATTER | SortForm.SINGLE_SORT:
+            pass
+    assert argsort_revert_indices is not None and token_indices_sorted is not None
 
-    if use_ep and use_sparse_core:
-        if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
+    match routing.permute:
+        case Permute.ONEHOT_FROM_POSITIONS:
             # Use one-hot matmul for permutation, which can be faster for small
-            # batch size. When `argsort_revert_indices` came from the counting
-            # sort, build the `[M, T]` permutation directly from it so
+            # batch size. With `argsort_revert_indices` from the counting sort,
+            # build the `[M, T]` permutation directly from it so
             # `fused_moe_gmm` does not depend on `token_indices_sorted` (letting
             # XLA DCE its scatter unless owner-output combine uses it).
-            if bucket_counts is not None:
-                onehot = (
-                    jax.nn.one_hot(
-                        argsort_revert_indices.reshape(num_tokens_local, topk),
-                        argsort_revert_indices.size,
-                        dtype=hidden_states_local.dtype,
-                    )
-                    .sum(axis=1)
-                    .T
-                )
-            else:
-                onehot = jax.nn.one_hot(
-                    token_indices_sorted,
-                    num_tokens_local,
+            onehot = (
+                jax.nn.one_hot(
+                    argsort_revert_indices.reshape(num_tokens_local, topk),
+                    argsort_revert_indices.size,
                     dtype=hidden_states_local.dtype,
                 )
+                .sum(axis=1)
+                .T
+            )
             x = onehot @ hidden_states_local
-        else:
+        case Permute.ONEHOT_FROM_TOKENS:
+            onehot = jax.nn.one_hot(
+                token_indices_sorted,
+                num_tokens_local,
+                dtype=hidden_states_local.dtype,
+            )
+            x = onehot @ hidden_states_local
+        case Permute.RAGGED_SC:
             # Match uLLM/reference EP routing: materialize the valid local
             # expert prefix through SparseCore ragged_gather. Invalid
             # non-local rows are sorted after the valid prefix.
@@ -493,8 +509,8 @@ def prepare_routed_gmm_inputs(
                 jnp.array([0], dtype=jnp.int32),
                 valid_count[None],
             )
-    else:
-        x = hidden_states_local[token_indices_sorted]
+        case Permute.GATHER:
+            x = hidden_states_local[token_indices_sorted]
     return (
         x,
         group_sizes_local,
@@ -563,52 +579,50 @@ def moe_gmm(
         preferred_element_type=x.dtype,
         rhs_quant_dtype=rhs_quant_dtype,
     )
-    # The destination-major kernel packs source indices into 20 bits and
-    # processes 16-lane SparseCore tiles.
-    use_local_ragged_combine = (
-        # Local SparseCore path; route-pair metadata needs at least two routes.
-        use_sparse_core
-        and not use_ep
-        and topk >= 2
-        # TensorCore combine handles top-8 batches.
-        and topk != 8
-        # Honor the configured SparseCore dispatch cutoff.
-        and argsort_revert_indices.size > onehot_moe_permute_threshold
-        # BF16 kernel input.
-        and gmm2_res.dtype == jnp.bfloat16
-        # Packed source-index capacity.
-        and gmm2_res.shape[0] <= 1 << 20
+    process = _moe_process_plan(
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
     )
-    if use_local_ragged_combine:
-        try:
-            tpu_info = pltpu.get_tpu_info()
-        except ValueError:
-            # get_tpu_info raises for unsupported device kinds (e.g. CPU hosts).
-            tpu_info = None
-        sc_info = tpu_info.sparse_core if tpu_info is not None else None
-        # Lane-aligned width, 16-lane SparseCore, and v3's own cutoff (two
-        # BF16 buffers use at least 60% of VMEM).
-        if (
-            sc_info is not None
-            and sc_info.num_lanes == 16
-            and gmm2_res.shape[-1] % tpu_info.num_lanes == 0
-            and gmm2_res.size * 4 >= tpu_info.vmem_capacity_bytes * 0.6
-        ):
-            # The kernel pads destination tokens to one 64-token block per
-            # SparseCore row partition: require at least one full block and
-            # padding of at most half the batch.
-            alignment = token_block_alignment(gmm2_res.shape[-1], tpu_info)
-            padded_tokens = -(-num_tokens // alignment) * alignment
-            if num_tokens >= alignment and padded_tokens * 2 <= num_tokens * 3:
-                return ragged_gather_reduce_v3(
-                    gmm2_res,
-                    argsort_revert_indices,
-                    topk_weights_flat,
-                    valid_mask_flat,
-                    reduce_group_size=topk,
-                ).astype(x.dtype)
-    if use_ep and use_sparse_core:
-        if argsort_revert_indices.size <= onehot_moe_permute_threshold:
+    op = moe_plan.MoeOpIn(
+        num_tokens=num_tokens, topk=topk, local_num_experts=w1.shape[0], use_ep=use_ep
+    )
+    out = moe_plan.GmmOutSpec(
+        routes=argsort_revert_indices.size,
+        rows=gmm2_res.shape[0],
+        hidden=gmm2_res.shape[-1],
+        dtype=gmm2_res.dtype,
+        token_indices_shape=tuple(token_indices_sorted.shape),
+        token_indices_dtype=token_indices_sorted.dtype,
+        topk_weights_shape=tuple(topk_weights_flat.shape),
+        topk_weights_dtype=topk_weights_flat.dtype,
+    )
+    # Read only on the EP one-hot combine, as before: the getter validates
+    # the value, so reading it on every bucket would fail earlier on a bad one.
+    owner_output = (
+        moe_plan.combine_reads_owner_mode(process, op, out)
+        and moe_plan.owner_output_mode(envs.TPU_MOE_OWNER_OUTPUT_MODE)
+        is OwnerOutputMode.ON
+    )
+    match moe_plan.combine_target_need(process, op, out, owner_output=owner_output):
+        case TargetNeed.NONE:
+            target = None
+        case TargetNeed.OPTIONAL:
+            target = _tpu_info_or_none()
+        case TargetNeed.REQUIRED:
+            target = _runtime_tpu_info()
+    plan = moe_plan.plan_combine(process, op, out, target, owner_output=owner_output)
+
+    match plan.combine:
+        case Combine.LOCAL_V3:
+            return ragged_gather_reduce_v3(
+                gmm2_res,
+                argsort_revert_indices,
+                topk_weights_flat,
+                valid_mask_flat,
+                reduce_group_size=topk,
+                tc_fallback=False,
+            ).astype(x.dtype)
+        case Combine.EP_OWNER_ONEHOT | Combine.EP_ONEHOT:
             # Use onehot + matmul for unpermutation, which can be faster
             # for small batch size.
             # `argsort_revert_indices` is the inverse of the sort, so scattering
@@ -619,16 +633,7 @@ def moe_gmm(
                 .set(topk_weights_flat)
             )
             valid_count = group_sizes.sum(dtype=jnp.int32)[None]
-            if (
-                envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() == "on"
-                and can_use_blockwise_onehot_unpermute(
-                    gmm2_res,
-                    token_indices_sorted,
-                    topk_weights_sorted,
-                    valid_count,
-                    num_tokens=num_tokens,
-                )
-            ):
+            if plan.combine is Combine.EP_OWNER_ONEHOT:
                 logger.info_once(
                     "Selected owner_output blockwise one-hot unpermute: "
                     "routes=%d hidden=%d tokens=%d",
@@ -658,20 +663,26 @@ def moe_gmm(
                 axis=1
             )
             return (combine @ gmm2_res).astype(x.dtype)
-        return ragged_gather_reduce(
-            gmm2_res,
-            argsort_revert_indices,
-            topk_weights_flat,
-            valid_mask_flat,
-            reduce_group_size=topk,
-        ).astype(x.dtype)
-
-    token_hidden = gmm2_res[argsort_revert_indices]
-    token_topk_hidden = token_hidden.reshape((num_tokens, topk, gmm2_res.shape[-1]))
-    token_topk_hidden = token_topk_hidden * jnp.expand_dims(topk_weights, axis=-1)
-    token_topk_hidden = jnp.where(valid_mask[:, :, None], token_topk_hidden, 0)
-    # FP32 top-k weights can promote BF16 outputs; keep the custom-op dtype.
-    return token_topk_hidden.sum(axis=1).astype(x.dtype)
+        case Combine.EP_RAGGED_SC | Combine.EP_RAGGED_TC_FALLBACK:
+            return ragged_gather_reduce(
+                gmm2_res,
+                argsort_revert_indices,
+                topk_weights_flat,
+                valid_mask_flat,
+                reduce_group_size=topk,
+                tc_fallback=plan.combine is Combine.EP_RAGGED_TC_FALLBACK,
+            ).astype(x.dtype)
+        case Combine.TENSORCORE:
+            token_hidden = gmm2_res[argsort_revert_indices]
+            token_topk_hidden = token_hidden.reshape(
+                (num_tokens, topk, gmm2_res.shape[-1])
+            )
+            token_topk_hidden = token_topk_hidden * jnp.expand_dims(
+                topk_weights, axis=-1
+            )
+            token_topk_hidden = jnp.where(valid_mask[:, :, None], token_topk_hidden, 0)
+            # FP32 top-k weights can promote BF16 outputs; keep the custom-op dtype.
+            return token_topk_hidden.sum(axis=1).astype(x.dtype)
 
 
 @functools.partial(
@@ -749,7 +760,34 @@ def fused_moe_func(
     # callers return FP32 weights and would otherwise promote downstream.
     topk_weights = topk_weights.astype(hidden_states.dtype)
 
-    if use_ep and use_sparse_core and num_tokens * topk <= onehot_moe_permute_threshold:
+    process = _moe_process_plan(
+        use_sparse_core=use_sparse_core,
+        onehot_moe_permute_threshold=onehot_moe_permute_threshold,
+    )
+    op = moe_plan.MoeOpIn(
+        num_tokens=num_tokens, topk=topk, local_num_experts=w1.shape[0], use_ep=use_ep
+    )
+    # The kernel's admission reads only shapes and dtypes, which the masking
+    # below does not change; it is asked only when the token threshold holds.
+    dense_expert_admitted = moe_plan.dense_expert_candidate(
+        process, op
+    ) and can_use_dense_expert(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        activation=activation,
+        rhs_quant_dtype=rhs_quant_dtype,
+        skip_padded_tokens=skip_padded_tokens,
+    )
+    entry = moe_plan.plan_entry(
+        process, op, dense_expert_admitted=dense_expert_admitted
+    )
+
+    if entry.scrub_nonfinite:
         # The one-hot permute and unpermute are matmuls across all tokens, and
         # 0 * NaN == NaN: one token with a non-finite hidden state or routing
         # weight would turn every token's output into NaN. Zero those values
@@ -763,20 +801,7 @@ def fused_moe_func(
         topk_weights = jnp.where(valid, topk_weights, jnp.zeros_like(topk_weights))
         topk_ids = jnp.where(valid, local_ids, jnp.full_like(local_ids, -1))
 
-    # Decode services also compile large prefill buckets. Apply the token
-    # threshold before kernel admission so those buckets retain routed GMM.
-    if 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD and can_use_dense_expert(
-        hidden_states,
-        w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        w1_bias,
-        w2_bias,
-        activation=activation,
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
-    ):
+    if entry.path is MoePath.DENSE_EXPERT:
         logger.info_once("Selected experimental dense-expert decode MoE")
         return dense_expert_moe(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids

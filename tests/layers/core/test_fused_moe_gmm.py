@@ -14,7 +14,6 @@
 """Tests for the local-routing fused MoE GMM wrapper."""
 
 import dataclasses
-import types
 from unittest.mock import patch
 
 import jax
@@ -190,20 +189,23 @@ def test_moe_gmm_uses_selected_ragged_gather_reduce(
     indices = jnp.arange(routes, dtype=jnp.int32)
     weights = jnp.full((routes,), 0.125, dtype=jnp.bfloat16)
     valid = jnp.ones((routes,), dtype=jnp.bool_)
+    assert _TPU_7X.sparse_core is not None
     sc_info = (
         None
         if sc_lanes in (None, "no-tpu-info")
-        else types.SimpleNamespace(num_lanes=sc_lanes, num_cores=2, num_subcores=16)
+        else dataclasses.replace(
+            _TPU_7X.sparse_core, num_lanes=sc_lanes, num_cores=2, num_subcores=16
+        )
     )
+    # TPU7x has 128 TensorCore lanes and 64 MiB of VMEM.
+    chip = dataclasses.replace(_TPU_7X, sparse_core=sc_info)
 
-    def get_tpu_info():
+    def runtime_tpu_info():
         if sc_lanes == "no-tpu-info":
             raise ValueError("unsupported device kind")
-        return types.SimpleNamespace(
-            sparse_core=sc_info, num_lanes=128, vmem_capacity_bytes=64 << 20
-        )
+        return chip
 
-    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", get_tpu_info)
+    monkeypatch.setattr(fused_moe_gmm, "_runtime_tpu_info", runtime_tpu_info)
     monkeypatch.setattr(fused_moe_gmm, "get_packing_factor", lambda *args, **kwargs: 1)
     calls = []
 
@@ -496,8 +498,8 @@ def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):
             side_effect=[gmm1_res, gmm2_res],
         ),
         patch.object(
-            fused_moe_gmm,
-            "can_use_blockwise_onehot_unpermute",
+            fused_moe_gmm.moe_plan,
+            "owner_onehot_admits",
             return_value=True,
         ) as support_check,
         patch.object(
@@ -1272,9 +1274,7 @@ def test_prepare_routed_counting_sort_eliminates_redundant_sorts(
 
     with monkeypatch.context() as m:
         m.setattr(fused_moe_gmm, "_COUNTING_SORT_SCATTER_MAX_ROWS", 0)
-        m.setattr(
-            fused_moe_gmm, "_counting_sort_positions", lambda *a, **kw: (None, None)
-        )
+        m.setattr(fused_moe_gmm.moe_plan, "counting_sort_accepts", lambda op: False)
         ref_out = prepare_routed_gmm_inputs(
             hidden_states, topk_indices, topk_weights, **common
         )
