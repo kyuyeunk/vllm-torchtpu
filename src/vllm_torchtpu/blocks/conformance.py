@@ -173,7 +173,7 @@ def _const(arg: Any) -> object:  # noqa: ANN401
 
 def _operands(node: fx.Node) -> list[fx.Node]:
     found: list[fx.Node] = []
-    fx.node.map_arg((node.args, node.kwargs), found.append)
+    fx.map_arg((node.args, node.kwargs), found.append)
     return found
 
 
@@ -248,7 +248,7 @@ def canonicalize(
         outs = tuple(i for i, a in enumerate(out_args) if a is n)
         bwd[n] = _h(fwd[n], outs, tuple(sorted((bwd[u], i) for u, i in users[n])))
     output = _h("output", tuple(fwd[a] for a in out_args))
-    return Canon(kept, {n: fwd[n] for n in kept}, bwd, output, set(roles))
+    return Canon(kept, {n: fwd[n] for n in kept}, bwd, output, {str(r) for r in roles})
 
 
 def site(node: fx.Node) -> str:

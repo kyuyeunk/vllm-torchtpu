@@ -33,6 +33,7 @@ from jax.experimental.pallas import tpu as pltpu
 from torch import nn
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 
+from vllm_torchtpu.blocks.parts import require
 from vllm_torchtpu.layers.core.plan_marker import plan_of
 from vllm_torchtpu.layers.core.resolution import require_no_default
 from vllm_torchtpu.tpu_info import has_fp8_matmul
@@ -81,6 +82,7 @@ def fused_qkv_supports(
     head_dim: int | None = None,
     num_heads: int | None = None,
     num_kv_heads: int | None = None,
+    output_gate: bool | None = None,
 ) -> str | None:
     """Why ``fused_qkv`` cannot serve this attention, or None: its capability.
 
@@ -118,7 +120,9 @@ def fused_qkv_supports(
     kv_heads = num_kv_heads or getattr(attention, "num_kv_heads", None)
     if q_heads and kv_heads and (q_heads // kv_heads) % 2:  # gqa/config.py:146
         return f"{q_heads // kv_heads} query heads per KV head (bf16 Q packs 2)"
-    if getattr(attention, "attn_output_gate", False) and head_dim and head_dim % 128:
+    if output_gate is None:  # Callers with the declared parts pass it.
+        output_gate = bool(require(attention, "attn_output_gate", "attention"))
+    if output_gate and head_dim and head_dim % 128:
         return "an output gate needs head_dim % 128 == 0 (gqa/config.py:149)"
     for name in ("q_norm", "k_norm"):
         norm = getattr(attention, name, None)
@@ -138,7 +142,7 @@ def fused_qkv_supports(
     rotary = getattr(attention, "rotary_emb", None)
     # The kernel rotates NeoX-style pairs only (common/model_config.py:59-71,
     # common/rope.py:17); #3096's adapter does not check this.
-    if rotary is not None and not getattr(rotary, "is_neox_style", True):
+    if rotary is not None and not require(rotary, "is_neox_style", "rotary"):
         return "GPT-J-style RoPE; fused_qkv rotates NeoX-style pairs"
     qkv = getattr(attention, "qkv_proj", None)
     method = type(getattr(qkv, "quant_method", None)).__name__
@@ -170,10 +174,11 @@ def unreduced_output_supports(
     output has no point to add it at. ``fused_qkv`` also needs its op to
     honour the flag (``fused_unreduced``, the op author's declaration).
     """
-    o_proj = getattr(attention, "o_proj", None)
-    if o_proj is None or not getattr(o_proj, "input_is_parallel", False):
+    o_proj = require(attention, "o_proj", "attention")
+    if not require(o_proj, "input_is_parallel", "o_proj"):
         return "the output projection does not take a TP-split input"
-    if getattr(o_proj, "bias", None) is not None and not o_proj.skip_bias_add:
+    bias = require(o_proj, "bias", "o_proj")
+    if bias is not None and not require(o_proj, "skip_bias_add", "o_proj"):
         return "the output projection adds a bias, which TPU adds after the all-reduce"
     if plan.input_proj == "fused_qkv" and not fused_unreduced:
         return "the fused op always all-reduces its output"
@@ -209,6 +214,7 @@ def choose(
     chip: str = "",
     kv_cache_dtype: str = "",
     where: str = "",
+    output_gate: bool | None = None,
     output_reduced: bool = True,
     fused_unreduced: bool = True,
 ) -> tuple[NormAttnPlan, frozenset[str], list[str]]:
@@ -234,7 +240,11 @@ def choose(
         why = None
         if plan.input_proj == "fused_qkv":
             why = fused_qkv_supports(
-                attention, matmul=plan.matmul, chip=chip, kv_cache_dtype=kv_cache_dtype
+                attention,
+                matmul=plan.matmul,
+                chip=chip,
+                kv_cache_dtype=kv_cache_dtype,
+                output_gate=output_gate,
             )
         if why is None and not output_reduced:
             why = unreduced_output_supports(

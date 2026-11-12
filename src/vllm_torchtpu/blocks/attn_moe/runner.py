@@ -47,6 +47,7 @@ from vllm.distributed import (
 )
 
 from vllm_torchtpu.blocks.attn_moe.plan import OVERLAP, BlockPlanTable
+from vllm_torchtpu.blocks.parts import require
 from vllm_torchtpu.blocks.stream import StreamParams
 from vllm_torchtpu.compilation import shape_variants
 
@@ -158,6 +159,8 @@ class AttnMoERunner(nn.Module):
         for name, part in refs.items():
             object.__setattr__(self, name, part)  # a reference, not a child
         self.layer_name = layer_name
+        # A vLLM linear returns (output, bias) unless built with return_bias=False.
+        self.router_returns_bias = bool(require(parts.router, "return_bias", "router"))
         self.table = table
         self.tp = tp
         self.stream = stream
@@ -231,7 +234,7 @@ class AttnMoERunner(nn.Module):
     def _logits(self, h: torch.Tensor) -> torch.Tensor:
         out = self.router(h)
         # A vLLM linear returns (output, bias) unless built with return_bias=False.
-        return out[0] if getattr(self.router, "return_bias", True) else out
+        return out[0] if self.router_returns_bias else out
 
     def _count(self, value: str) -> None:
         if not torch.compiler.is_compiling():

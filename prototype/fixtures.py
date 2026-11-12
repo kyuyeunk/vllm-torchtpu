@@ -26,8 +26,10 @@ own forward, so only the wiring differs from upstream:
 
 import torch
 from torch import nn
+from vllm.model_executor.layers.linear import RowParallelLinear
 
 from vllm_torchtpu.blocks.attn_moe.pattern import AttnMoEParts
+from vllm_torchtpu.blocks.parts import as_kind
 
 
 class _Children(nn.Module):
@@ -89,6 +91,7 @@ def renamed_parts(layer: _Children) -> AttnMoEParts:
     return AttnMoEParts(
         input_norm=layer.pre_norm,
         attention=layer.mixer,
+        out_proj=as_kind(layer.mixer.get_submodule("o_proj"), RowParallelLinear),
         post_norm=layer.mid_norm,
         moe=layer.ffn,
         router=layer.ffn.get_submodule("gate"),

@@ -22,4 +22,4 @@ from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnParts, pre_norm_parts
 @declare_block(Qwen3DecoderLayer)
 def qwen3_attention(layer: Qwen3DecoderLayer) -> NormAttnParts:
     """The pre-norm attention sub-block (norm_then_attention)."""
-    return pre_norm_parts(layer, layer.self_attn)
+    return pre_norm_parts(layer, layer.self_attn, output_gate=False)

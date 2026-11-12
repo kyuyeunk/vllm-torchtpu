@@ -27,4 +27,6 @@ def llama_attention(layer: LlamaDecoderLayer) -> NormAttnParts:
     Llama builds ``self_attn`` from a class parameter (``attn_layer_type``),
     so the binding names the class it covers.
     """
-    return pre_norm_parts(layer, as_kind(layer.self_attn, LlamaAttention))
+    return pre_norm_parts(
+        layer, as_kind(layer.self_attn, LlamaAttention), output_gate=False
+    )

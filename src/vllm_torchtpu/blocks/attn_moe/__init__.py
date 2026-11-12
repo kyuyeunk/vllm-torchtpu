@@ -27,6 +27,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 
 from vllm_torchtpu.blocks import (
     BlockDeclaration,
@@ -48,12 +49,11 @@ from vllm_torchtpu.blocks.attn_moe.pattern import (
     block_key,
     moe_explicit_router,
     moe_runner_router,
-    out_proj_of,
 )
 from vllm_torchtpu.blocks.attn_moe.runner import AttnMoERunner, ModelAttention
 from vllm_torchtpu.blocks.norm_attn import plan as subblock_plan
 from vllm_torchtpu.blocks.norm_attn.pattern import norm_then_attention
-from vllm_torchtpu.blocks.parts import attribute_of
+from vllm_torchtpu.blocks.parts import as_kind, attribute_of
 from vllm_torchtpu.blocks.stream import StreamParams, route
 from vllm_torchtpu.logger import init_logger
 
@@ -130,7 +130,8 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> AttnMoERoles:
     if cache_key in _conformed:
         return _conformed[cache_key]
     hidden_p, residual_p, positions_p = _stream_params(layer)
-    moe, runner, router = parts.moe, parts.experts, parts.router
+    moe, runner = parts.moe, parts.experts
+    router = as_kind(parts.router, GateLinear)
     runner_name = attribute_of(moe, runner, "experts")
     router_name = attribute_of(moe, router, "router")
     width = int(router.output_size)
@@ -198,7 +199,7 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> AttnMoERoles:
     runner_holds_router = runner.gate is router
     with contextlib.ExitStack() as stack:
         # A vLLM linear returns (output, bias) unless built with return_bias=False.
-        tupled = getattr(router, "return_bias", True)
+        tupled = as_kind(router, GateLinear).return_bias
         stack.enter_context(
             conf.opaque(
                 router,
@@ -251,7 +252,7 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> AttnMoERoles:
         input_norm=binding["input_norm"],
         post_norm=binding["post_norm"],
         attention=binding["attention"],
-        out_proj=f"{binding['attention']}.{out_proj_of(attn, hidden)}",
+        out_proj=attribute_of(layer, parts.out_proj, "out_proj"),
         moe=binding["moe"],
         experts=f"{binding['moe']}.{runner_name}",
         router=f"{binding['moe']}.{router_name}",
@@ -333,7 +334,7 @@ def apply_block(
     """
     bind_child_contracts(
         name,
-        None if attention is not None else layer.get_submodule(roles.out_proj),
+        None if attention is not None else parts.out_proj,
         parts.experts,
         _MOE_CONTRACTS,
         source=_summary(table),

@@ -341,24 +341,22 @@ def guess_parts(layer: nn.Module) -> NormAttnParts:
     """The parts under vLLM's usual names, for the survey (not a declaration).
 
     A model owner's binding function reads its own class's attributes; the
-    survey runs over many classes, so it tries the common names and finds
-    attention's parts by kind.
+    survey runs over many classes, so it tries the common names.
     """
-    norm = _child(layer, "input_layernorm")
     attention = _child(layer, "self_attn", "attn")
-    names, _ = norm_attn.attention_parts(attention, int(norm.weight.shape[0]))
-    found = {k: attention.get_submodule(v) for k, v in names.items()}
+    norms = [getattr(attention, n, None) for n in ("q_norm", "k_norm")]
     return NormAttnParts(
-        input_norm=norm,
-        qkv_proj=found["qkv_proj"],
-        attn=found["attn"],
-        o_proj=found["o_proj"],
-        rotary=found["rotary"],
-        q_norm=found.get("q_norm"),
-        k_norm=found.get("k_norm"),
+        input_norm=_child(layer, "input_layernorm"),
+        qkv_proj=_child(attention, "qkv_proj"),
+        attn=_child(attention, "attn"),
+        o_proj=_child(attention, "o_proj"),
+        rotary=_child(attention, "rotary_emb"),
+        q_norm=norms[0],
+        k_norm=norms[1],
         attention=attention,
         post_norm=_child(layer, "post_attention_layernorm"),
         mlp=_child(layer, "mlp", "block_sparse_moe", "feed_forward"),
+        output_gate=bool(getattr(attention, "attn_output_gate", False)),
     )
 
 

@@ -33,9 +33,11 @@ def qwen3_5_block(layer: Qwen3_5DecoderLayer) -> AttnMoEParts | None:
     """The attention-then-MoE block, for either attention kind."""
     if not isinstance(layer.mlp, Qwen3NextSparseMoeBlock):  # Dense Qwen3.5.
         return None
-    full = layer.layer_type == "full_attention"
-    attention = layer.self_attn if full else layer.linear_attn
-    return pre_norm_moe_parts(layer, attention, layer.mlp)
+    if layer.layer_type == "full_attention":
+        attention = layer.self_attn
+        return pre_norm_moe_parts(layer, attention, attention.o_proj, layer.mlp)
+    attention = layer.linear_attn  # Gated DeltaNet
+    return pre_norm_moe_parts(layer, attention, attention.out_proj, layer.mlp)
 
 
 @declare_block(Qwen3_5DecoderLayer)
@@ -43,4 +45,5 @@ def qwen3_5_attention(layer: Qwen3_5DecoderLayer) -> NormAttnParts | None:
     """The pre-norm attention sub-block, on full-attention layers."""
     if layer.layer_type != "full_attention":
         return None
-    return pre_norm_parts(layer, layer.self_attn)
+    attention = layer.self_attn
+    return pre_norm_parts(layer, attention, output_gate=attention.attn_output_gate)

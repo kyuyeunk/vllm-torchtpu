@@ -26,6 +26,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from vllm.model_executor.layers.linear import LinearBase, QKVParallelLinear
 
 from vllm_torchtpu.blocks import (
     BlockDeclaration,
@@ -39,7 +40,6 @@ from vllm_torchtpu.blocks.norm_attn.pattern import (
     NormAttnParts,
     NormAttnRoles,
     norm_then_attention,
-    qkv_proj_of,
 )
 from vllm_torchtpu.blocks.norm_attn.runner import (
     AttentionParts,
@@ -48,7 +48,7 @@ from vllm_torchtpu.blocks.norm_attn.runner import (
     FusedOp,
     reference_fused_qkv,
 )
-from vllm_torchtpu.blocks.parts import attribute_of
+from vllm_torchtpu.blocks.parts import as_kind, attribute_of, require
 from vllm_torchtpu.blocks.stream import StreamParams
 from vllm_torchtpu.logger import init_logger
 
@@ -134,7 +134,7 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnRoles:
     if cache_key in _conformed:
         return _conformed[cache_key]
     hidden_p, residual_p, positions_p = _stream_params(layer)
-    hidden = int(declared.input_norm.weight.shape[0])
+    hidden = as_kind(declared.qkv_proj, QKVParallelLinear).input_size
     attn = declared.attention
     attn_params = list(inspect.signature(attn.forward).parameters)
     attn_input = next(
@@ -211,18 +211,28 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnRoles:
     attn_positions = next(k for k, src in attention_args if src == positions_p)
 
     # Attention's own forward against the runner's composition.
-    parts, config = conform_attention(
-        attn, hidden, attn_hidden, attn_positions, f" on {type(layer).__qualname__}"
+    # The declared parts are opaque there, so a forward that calls another
+    # module than the one declared computes another graph.
+    config = conform_attention(
+        attn,
+        declared,
+        declared.output_gate,
+        attn_hidden,
+        attn_positions,
+        f" on {type(layer).__qualname__}",
     )
-    for field, name in parts.items():
-        part = getattr(declared, field)
-        if part is not attn.get_submodule(name):
-            where = attribute_of(attn, part, field) if part is not None else "None"
-            raise _fail(
-                layer,
-                f"it declares {field}={binding['attention']}.{where}, but "
-                f"attention's forward calls {binding['attention']}.{name}",
-            )
+    parts = {
+        field: attribute_of(attn, part, field)
+        for field, part in (
+            ("qkv_proj", declared.qkv_proj),
+            ("attn", declared.attn),
+            ("o_proj", declared.o_proj),
+            ("rotary", declared.rotary),
+            ("q_norm", declared.q_norm),
+            ("k_norm", declared.k_norm),
+        )
+        if part is not None
+    }
 
     roles = NormAttnRoles(
         input_norm=binding["input_norm"],
@@ -248,63 +258,47 @@ def _missing(where: str, what: str) -> conf.BlockConformanceError:
     )
 
 
-def attention_parts(
-    attn: nn.Module, hidden: int, where: str = ""
-) -> tuple[dict[str, str], AttnConfig]:
-    """The attention role's parts (child names) and the properties the runner reads.
+def attention_config(
+    parts: AttentionParts, output_gate: bool, where: str = ""
+) -> AttnConfig:
+    """The properties the runner's composition reads, from the declared parts.
 
-    The parts are vLLM's shared building blocks, found by kind: the QKV
-    projection from the hidden size, ``o_proj``, ``rotary_emb``, the attention
-    core and, together or not at all, per-head ``q_norm`` and ``k_norm``.
+    The parts are declared (the binding function); this reads the sizes the
+    split needs from the QKV projection and checks the per-head norms' width.
 
     Raises:
-        BlockConformanceError: A part or property the runner needs is missing,
-            or present in a form it does not implement.
+        BlockConformanceError: A property the runner needs is missing, or
+            present in a form it does not implement.
     """
-    (qkv_name,) = qkv_proj_of(attn, hidden)
-    cores = [n for n, m in attn.named_modules() if isinstance(m, conf_core_types())]
-    if len(cores) != 1:
-        raise _missing(where, f"one attention core, found {len(cores)}")
-    parts = {"qkv_proj": qkv_name, "attn": cores[0]}
-    for part, name in (("o_proj", "o_proj"), ("rotary", "rotary_emb")):
-        if getattr(attn, name, None) is None:
-            raise _missing(where, f"{name}")
-        parts[part] = name
-    norms = [n for n in ("q_norm", "k_norm") if getattr(attn, n, None) is not None]
-    if len(norms) == 1:
-        raise _missing(where, f"{norms[0]} without its pair")
-    # The projection holds this rank's head counts (qkv_proj_of found it by
-    # kind); attention's sizes would be a second copy of them. Its query
-    # heads include an output gate's copies.
-    qkv = attn.get_submodule(qkv_name)
-    output_gate = bool(getattr(attn, "attn_output_gate", False))
+    # The projection holds this rank's head counts; its query heads include
+    # the declared output gate's copies.
+    qkv = as_kind(parts.qkv_proj, QKVParallelLinear)
     head_dim = qkv.head_size
-    for n in norms:
-        width = int(getattr(attn, n).weight.numel())
-        if width != head_dim:
+    for name, norm in (("q_norm", parts.q_norm), ("k_norm", parts.k_norm)):
+        weight = None if norm is None else require(norm, "weight", name)
+        if isinstance(weight, torch.Tensor) and weight.numel() != head_dim:
             raise _missing(
                 where,
-                f"{n} over {width} values; the runner implements a per-head "
-                f"norm over head_dim {head_dim}",
+                f"{name} over {weight.numel()} values; the runner implements a "
+                f"per-head norm over head_dim {head_dim}",
             )
-        parts[n] = n
-    config = AttnConfig(
+    return AttnConfig(
         num_heads=qkv.num_heads // 2 if output_gate else qkv.num_heads,
         num_kv_heads=qkv.num_kv_heads,
         head_dim=head_dim,
-        qk_norm=bool(norms),
+        qk_norm=parts.q_norm is not None,
         output_gate=output_gate,
     )
-    return parts, config
 
 
 def conform_attention(
     attn: nn.Module,
-    hidden: int,
+    parts: AttentionParts,
+    output_gate: bool,
     hidden_param: str,
     positions_param: str,
     where: str = "",
-) -> tuple[dict[str, str], AttnConfig]:
+) -> AttnConfig:
     """Checks that attention's forward is the runner's composition of its parts.
 
     With every part opaque, attention's own forward must export to the same
@@ -314,15 +308,27 @@ def conform_attention(
     Raises:
         BlockConformanceError: Naming the role, edge and source line.
     """
-    parts, config = attention_parts(attn, hidden, where)
-    mod = {k: attn.get_submodule(v) for k, v in parts.items()}
+    config = attention_config(parts, output_gate, where)
+    mod = {
+        field: part
+        for field, part in (
+            ("qkv_proj", parts.qkv_proj),
+            ("attn", parts.attn),
+            ("o_proj", parts.o_proj),
+            ("rotary", parts.rotary),
+            ("q_norm", parts.q_norm),
+            ("k_norm", parts.k_norm),
+        )
+        if part is not None
+    }
+    hidden = as_kind(parts.qkv_proj, LinearBase).input_size
 
     def projection(m: nn.Module, role: str):  # noqa: ANN202
-        width = int(m.output_size_per_partition)
+        width = as_kind(m, LinearBase).output_size_per_partition
 
         def stub(x: torch.Tensor, *a: Any, **k: Any) -> Any:  # noqa: ANN401
             out = conf.ops.project(x, width, role)
-            return (out, None) if getattr(m, "return_bias", True) else out
+            return (out, None) if require(m, "return_bias", role) else out
 
         return stub
 
@@ -373,18 +379,10 @@ def conform_attention(
         want = conf.canonicalize(conf.export(runner_fn, args, None), names)
     if error := conf.compare(_PATTERN, got, want, f" (attention{where})"):
         raise conf.BlockConformanceError(error)
-    return parts, config
+    return config
 
 
 logger = init_logger(__name__)
-
-
-def conf_core_types() -> tuple[type, ...]:
-    from vllm.model_executor.layers.attention_layer_base import (  # noqa: PLC0415
-        AttentionLayerBase,
-    )
-
-    return (AttentionLayerBase,)
 
 
 class NormAttnDecoder(nn.Module):
@@ -486,6 +484,7 @@ def resolve_runner(
         chip=context.chip,
         kv_cache_dtype=context.kv_cache_dtype,
         where=where,
+        output_gate=roles.config.output_gate,
         output_reduced=output_reduced,
         fused_unreduced=fused_unreduced,
     )

@@ -35,7 +35,7 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 
 from vllm_torchtpu.blocks.norm_attn.runner import AttentionParts, AttnConfig
-from vllm_torchtpu.blocks.parts import BlockParts
+from vllm_torchtpu.blocks.parts import BlockParts, as_kind
 
 Norm = Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
 Op = Callable[[torch.Tensor], torch.Tensor]
@@ -95,7 +95,7 @@ def is_residual_norm(module: nn.Module) -> bool:
 
 def norm_scale(norm: nn.Module) -> torch.Tensor:
     """The multiplier the norm applies after normalizing: w, or 1 + w."""
-    weight = norm.weight.float()
+    weight = as_kind(norm.weight, torch.Tensor).float()
     return 1.0 + weight if isinstance(norm, GemmaRMSNorm) else weight
 
 
@@ -114,13 +114,16 @@ class NormAttnParts(AttentionParts, BlockParts):
 
     The runner's parts (``AttentionParts``) plus the layer's other roles:
     ``attention`` (the module holding the runner's parts, whose forward
-    conformance compares with the runner's composition), and the rest of the
-    layer (``post_norm``, ``mlp``), which stays opaque.
+    conformance compares with the runner's composition), the rest of the
+    layer (``post_norm``, ``mlp``), which stays opaque, and ``output_gate``:
+    whether the projection also emits a per-head gate (stated, not guessed;
+    conformance holds the forward to it).
     """
 
     attention: nn.Module
     post_norm: nn.Module
     mlp: nn.Module
+    output_gate: bool
 
     pattern = staticmethod(norm_then_attention)
 
@@ -200,7 +203,9 @@ class PreNormLayer(Protocol):
     def mlp(self) -> nn.Module: ...
 
 
-def pre_norm_parts(layer: PreNormLayer, attention: PreNormAttention) -> NormAttnParts:
+def pre_norm_parts(
+    layer: PreNormLayer, attention: PreNormAttention, *, output_gate: bool
+) -> NormAttnParts:
     """The parts of a layer and attention that use vLLM's usual names.
 
     Per-head q/k norms are optional in vLLM's attentions, so they are read if
@@ -217,4 +222,5 @@ def pre_norm_parts(layer: PreNormLayer, attention: PreNormAttention) -> NormAttn
         attention=attention,  # type: ignore[arg-type]  # a Protocol over an nn.Module
         post_norm=layer.post_attention_layernorm,
         mlp=layer.mlp,
+        output_gate=output_gate,
     )

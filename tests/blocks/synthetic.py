@@ -107,6 +107,7 @@ class Linear(nn.Module):
         self.weight = nn.Parameter(torch.randn(n_out, n_in) / n_in**0.5)
         self.bias = nn.Parameter(0.1 * torch.randn(n_out)) if bias else None
         self.quant_method: object = UnquantizedLinearMethod()
+        self.return_bias = True  # vLLM's linears return (out, bias) by default.
         # RowParallelLinear's fields the unreduced-output capability reads.
         self.input_is_parallel = True
         self.skip_bias_add = False

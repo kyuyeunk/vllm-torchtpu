@@ -281,7 +281,9 @@ def planted() -> list[str]:
 
 def _llama_parts(layer: LlamaDecoderLayer) -> NormAttnParts:
     """The planted layers' binding function (they reuse Llama's children)."""
-    return pre_norm_parts(layer, as_kind(layer.self_attn, LlamaAttention))
+    return pre_norm_parts(
+        layer, as_kind(layer.self_attn, LlamaAttention), output_gate=False
+    )
 
 
 def _planted(planted_cls: type, where: str) -> list[str]:

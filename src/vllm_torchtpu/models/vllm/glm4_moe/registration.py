@@ -25,10 +25,11 @@ def glm4_moe_block(layer: Glm4MoeDecoderLayer) -> AttnMoEParts | None:
     """The attention-then-MoE block (attn_then_moe), on the MoE layers."""
     if not isinstance(layer.mlp, Glm4MoE):  # The first_k_dense_replace layers.
         return None
-    return pre_norm_moe_parts(layer, layer.self_attn, layer.mlp)
+    attention = layer.self_attn
+    return pre_norm_moe_parts(layer, attention, attention.o_proj, layer.mlp)
 
 
 @declare_block(Glm4MoeDecoderLayer)
 def glm4_moe_attention(layer: Glm4MoeDecoderLayer) -> NormAttnParts:
     """The pre-norm attention sub-block (norm_then_attention), nested in the block."""
-    return pre_norm_parts(layer, layer.self_attn)
+    return pre_norm_parts(layer, layer.self_attn, output_gate=False)

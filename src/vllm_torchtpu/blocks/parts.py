@@ -115,3 +115,20 @@ def as_kind[T](module: object, kind: type[T]) -> T:
             f"expected a {kind.__qualname__}, found a {type(module).__qualname__}"
         )
     return module
+
+
+def require(obj: object, attribute: str, field: str) -> Any:  # noqa: ANN401 - the attribute's own type
+    """``obj.attribute``, raising a conformance error naming ``field`` if absent.
+
+    For a property read off an untyped part, where a default would turn a
+    missing attribute into a silent guess.
+
+    Raises:
+        BlockConformanceError: ``obj`` has no ``attribute``.
+    """
+    try:
+        return getattr(obj, attribute)
+    except AttributeError:
+        raise BlockConformanceError(
+            f"{field} is a {type(obj).__qualname__} without {attribute}"
+        ) from None

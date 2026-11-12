@@ -33,16 +33,13 @@ from typing import Literal, Protocol
 
 import torch
 from torch import nn
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
-from vllm.model_executor.layers.fused_moe.runner.moe_runner_interface import (
-    MoERunnerInterface,
-)
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 from vllm.model_executor.layers.linear import RowParallelLinear
 
 from vllm_torchtpu.blocks.attn_moe.runner import MoEParts
-from vllm_torchtpu.blocks.parts import BlockParts
+from vllm_torchtpu.blocks.parts import BlockParts, as_kind
 
 Norm = Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
 Op = Callable[[torch.Tensor], torch.Tensor]
@@ -121,25 +118,13 @@ class AttnMoERoles:
     positions_param: str
 
 
-def out_proj_of(attn: nn.Module, hidden: int) -> str | None:
-    """The last RowParallelLinear to ``hidden`` in attention's subtree."""
-    found = None
-    for name, sub in attn.named_modules():
-        if isinstance(sub, RowParallelLinear) and sub.output_size == hidden:
-            found = name
-    return found
-
-
 def block_key(parts: "AttnMoEParts", tp: int, dtype: str) -> BlockKey:
     """The plan's key, read from the declared parts."""
-    runner, router = parts.experts, parts.router
+    runner = as_kind(parts.experts, MoERunner)
+    router = as_kind(parts.router, GateLinear)
     cfg = runner.moe_config
-    sp = bool(getattr(cfg, "is_sequence_parallel", False))
-    kind = next(
-        type(m).__name__
-        for m in parts.attention.modules()
-        if isinstance(m, AttentionLayerBase)
-    )
+    sp = bool(cfg.is_sequence_parallel)
+    kind = type(parts.attention).__qualname__
     return BlockKey(
         kind="attn_then_moe",
         tp=tp,
@@ -147,7 +132,7 @@ def block_key(parts: "AttnMoEParts", tp: int, dtype: str) -> BlockKey:
         dtype=dtype,
         attention_kind=kind,
         router_mode="fused_in_experts" if runner.gate is router else "explicit",
-        has_shared_experts=getattr(runner, "shared_experts", None) is not None,
+        has_shared_experts=runner.shared_experts is not None,
         sp_moe=sp,
         # The runner answers for this layer: the fused EP kernel is armed per
         # layer, so a process-wide flag would let one armed layer answer for
@@ -155,7 +140,7 @@ def block_key(parts: "AttnMoEParts", tp: int, dtype: str) -> BlockKey:
         fused_output_reduced=runner._fused_output_is_reduced,  # noqa: SLF001 - no public accessor  # pyright: ignore[reportPrivateUsage]
         moe_path=(
             "all2all"
-            if getattr(cfg, "use_all2all_kernels", False)
+            if cfg.moe_parallel_config.use_all2all_kernels
             else "sequence_parallel"
             if sp
             else "late_all_reduce"
@@ -174,13 +159,16 @@ class AttnMoEParts(MoEParts, BlockParts):
     """A declared layer's parts for attn_then_moe.
 
     The runner's parts (``MoEParts``: post norm, router, experts) plus the
-    layer's other roles: the input norm, the attention child (the front half,
-    run whole or through the nested ``AttentionRunner``) and the MoE child
-    that owns the router and the experts.
+    layer's other roles: the input norm, the attention child (run whole, or
+    through the nested ``AttentionRunner``), attention's output projection
+    (declared, so the block never searches for it; only a layer without a
+    nested sub-block needs it, for the interim unreduced write) and the MoE
+    child that owns the router and the experts.
     """
 
     input_norm: nn.Module
     attention: nn.Module
+    out_proj: RowParallelLinear
     moe: nn.Module
 
     pattern = staticmethod(attn_then_moe)
@@ -202,11 +190,18 @@ class AttnMoEParts(MoEParts, BlockParts):
             )
             if not _is_residual_norm(norm)
         ]
-        if not any(isinstance(m, AttentionLayerBase) for m in self.attention.modules()):
-            problems.append(("attention", "holds no attention layer"))
+        if not isinstance(self.out_proj, RowParallelLinear):
+            problems.append(
+                (
+                    "out_proj",
+                    f"is a {type(self.out_proj).__name__}, not a RowParallelLinear",
+                )
+            )
+        if not any(m is self.out_proj for m in self.attention.modules()):
+            problems.append(("out_proj", "is not a module of attention"))
         kinds = (
             ("router", GateLinear, "a GateLinear"),
-            ("experts", MoERunnerInterface, "a MoE runner"),
+            ("experts", MoERunner, "a MoE runner"),
         )
         children = list(self.moe.children())
         for name, kind, words in kinds:
@@ -219,10 +214,14 @@ class AttnMoEParts(MoEParts, BlockParts):
         if (
             not problems
             and isinstance(router, GateLinear)
-            and out_proj_of(self.attention, int(router.input_size)) is None
+            and self.out_proj.output_size != router.input_size
         ):
             problems.append(
-                ("attention", "has no RowParallelLinear to the hidden size")
+                (
+                    "out_proj",
+                    f"projects to {self.out_proj.output_size}, not the "
+                    f"hidden size {router.input_size}",
+                )
             )
         return problems
 
@@ -246,12 +245,16 @@ class PreNormMoELayer(Protocol):
 
 
 def pre_norm_moe_parts(
-    layer: PreNormMoELayer, attention: nn.Module, moe: RoutedMoE
+    layer: PreNormMoELayer,
+    attention: nn.Module,
+    out_proj: RowParallelLinear,
+    moe: RoutedMoE,
 ) -> AttnMoEParts:
     """The parts of a layer, its attention and its MoE, under vLLM's usual names."""
     return AttnMoEParts(
         input_norm=layer.input_layernorm,
         attention=attention,
+        out_proj=out_proj,
         post_norm=layer.post_attention_layernorm,
         moe=moe,  # type: ignore[arg-type]  # a Protocol over an nn.Module
         router=moe.gate,

@@ -27,4 +27,4 @@ def gpt_oss_attention(layer: TransformerBlock) -> NormAttnParts:
     gpt-oss builds ``attn`` from a class attribute (``attention_cls``), so
     the binding names the class it covers.
     """
-    return pre_norm_parts(layer, as_kind(layer.attn, OAIAttention))
+    return pre_norm_parts(layer, as_kind(layer.attn, OAIAttention), output_gate=False)
