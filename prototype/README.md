@@ -41,10 +41,10 @@ kernel; section B below routes #3096's kernel itself behind it.
 | Install, declining a mismatch | [`NormThenAttention.install`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L248-L264) |
 | Scopes nest: several patterns per class | [`declarations_for`](../src/vllm_torchtpu/blocks/__init__.py#L84-L86) |
 | One call per model | [Llama](../src/vllm_torchtpu/models/vllm/llama/registration.py#L21), [Mistral](../src/vllm_torchtpu/models/vllm/mistral/registration.py#L21), [Qwen3](../src/vllm_torchtpu/models/vllm/qwen3/registration.py#L21), [gpt-oss](../src/vllm_torchtpu/models/vllm/gpt_oss/registration.py#L21-L25), [Qwen3-MoE](../src/vllm_torchtpu/models/vllm/qwen3_moe/registration.py#L21), [Qwen3.5](../src/vllm_torchtpu/models/vllm/qwen3_5/registration.py#L43-L48) |
-| Per model: conforms, fused value matches upstream | [`family`](check_subblock.py#L150-L180), [`new_models`](check_subblock.py#L182-L190) |
+| Per model: conforms, fused value matches upstream | [`family`](check_subblock.py#L152-L180), [`new_models`](check_subblock.py#L182-L190) |
 | The planted mismatch | [`ScaledAttention`](check_subblock.py#L84-L92), [`planted`](check_subblock.py#L193-L220) |
 | The count against #3096 | [`PR_3096`](check_subblock.py#L224-L247) |
-| Reach over current models, from real configs | [`CANDIDATES`](subblock_reach.py#L60-L190), [`check`](subblock_reach.py#L263-L288) |
+| Reach over current models, from real configs | [`CANDIDATES`](subblock_reach.py#L61-L191), [`check`](subblock_reach.py#L269-L282) |
 | The startup override | `TPU_SUBBLOCK_PLAN` in `envs.py`, passed by the runner's `_install_blocks` |
 
 ## Running it

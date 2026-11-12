@@ -15,8 +15,9 @@
 
 For each candidate, only its Hugging Face ``config.json`` is fetched (no
 weights). The config's structural fields are kept (q/k norms, partial RoPE,
-biases, sliding windows, layer types, MLA ranks) and its sizes shrunk; the
-decoder layer is then built on the meta device with vLLM v0.33.0's own class
+biases, sliding windows, layer types, MLA ranks) and its sizes shrunk except
+the attention heads, which capability reads from the built layer; the
+decoder layer is built on the meta device with vLLM v0.33.0's own class
 and checked against the pattern with vLLM's usual child names. #3096's
 targets are marked.
 
@@ -190,13 +191,15 @@ CANDIDATES = (
     ),
 )
 
-_SHRINK = dict(
-    hidden_size=64,
-    intermediate_size=128,
-    moe_intermediate_size=32,
+_SHRINK_HEADS = dict(
+    hidden_size=128,
     num_attention_heads=4,
     num_key_value_heads=2,
-    head_dim=16,
+    head_dim=128,
+)
+_SHRINK = dict(
+    intermediate_size=256,
+    moe_intermediate_size=32,
     num_hidden_layers=2,
     vocab_size=128,
     max_position_embeddings=128,
@@ -204,7 +207,8 @@ _SHRINK = dict(
 _EXPERTS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
 
 
-def _config(c: Candidate):  # noqa: ANN202
+def _config(c: Candidate, *, shrink_heads: bool = True):  # noqa: ANN202
+    """The real config, shrunk; ``shrink_heads=False`` keeps the head geometry."""
     raw = json.load(open(hf_hub_download(c.repo, "config.json")))  # noqa: SIM115
     if c.text_config:
         raw = raw.get("text_config", raw)
@@ -212,6 +216,8 @@ def _config(c: Candidate):  # noqa: ANN202
     drop = ("architectures", "auto_map", "model_type", "quantization_config")
     data = {k: v for k, v in raw.items() if k not in drop}
     data.update(_SHRINK)
+    if shrink_heads:
+        data.update(_SHRINK_HEADS)
     for key in _EXPERTS:
         if key in data:
             data[key] = 8
@@ -263,7 +269,7 @@ def _config(c: Candidate):  # noqa: ANN202
 
 def check(c: Candidate) -> tuple[str, str]:
     try:
-        cfg = _config(c)
+        cfg = _config(c, shrink_heads=False)
         spec = _build.Spec(
             c.repo, lambda: cfg, c.module, c.layer_class, c.extra, c.model
         )

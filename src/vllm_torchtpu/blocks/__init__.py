@@ -164,9 +164,9 @@ def install(model: nn.Module, context: InstallContext) -> list[Installed]:
 
     A declaration is the model owner's explicit claim, so a layer that does
     not conform to its declared pattern stops startup, naming the edge and
-    line. A plan value whose capability does not cover a conforming layer is
-    a plan choice (the default runs), logged once per class; the closing
-    summary lists, per declared class, what runs and why.
+    line. A pinned plan value whose capability does not cover a conforming
+    layer stops startup too; a value the rule picked falls back to the next
+    capable one (the default) quietly.
     """
     from vllm_torchtpu.blocks import attn_moe, norm_attn  # noqa: F401 - register
 
@@ -190,7 +190,4 @@ def install(model: nn.Module, context: InstallContext) -> list[Installed]:
         counts[item.outcome] = counts.get(item.outcome, 0) + 1
     for outcome, count in sorted(counts.items()):
         logger.info("block install: %d layer(s): %s", count, outcome)
-    summary = sorted({(i.layer_class, i.outcome) for i in report})
-    for layer_class, outcome in summary:
-        logger.info("block summary: %s: %s", layer_class, outcome)
     return report

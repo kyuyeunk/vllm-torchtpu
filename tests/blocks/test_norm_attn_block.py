@@ -43,7 +43,23 @@ def test_mismatch_stops_startup() -> None:
     assert not check_subblock.planted()
 
 
-def test_capability_mismatch_runs_unfused_and_says_so() -> None:
-    """gpt-oss conforms, but fused_qkv cannot serve sinks: unfused, logged."""
+def test_capability_mismatch_falls_back_unless_pinned() -> None:
+    """gpt-oss conforms, but fused_qkv cannot serve sinks: the rule falls back."""
     (c,) = [m for m in check_subblock.NEW_MODELS if m.repo == "openai/gpt-oss-20b"]
     assert not check_subblock.family(check_subblock._spec(c), declines=True)  # noqa: SLF001
+
+
+def test_pin_that_cannot_run_stops_startup() -> None:
+    """A user pin to fused_qkv on gpt-oss (sinks) is a startup error."""
+    (c,) = [m for m in check_subblock.NEW_MODELS if m.repo == "openai/gpt-oss-20b"]
+    spec = check_subblock._spec(c)  # noqa: SLF001
+    layer = _build.build(spec)
+    blocks.load_declarations()
+    declaration = blocks.DECLARATIONS[(type(layer), norm_then_attention)]
+    impl = blocks.IMPLEMENTATIONS[norm_then_attention]
+    context = check_subblock._context("input_proj=fused_qkv")  # noqa: SLF001
+    with (
+        set_current_vllm_config(_build.current_config()),
+        pytest.raises(ValueError, match="sinks"),
+    ):
+        impl.install("l", layer, declaration, context)

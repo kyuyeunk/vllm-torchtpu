@@ -26,6 +26,7 @@ attention and the second norm is declined with the edge and line. Exits 1 if
 anything is not as expected.
 """
 
+import dataclasses
 import sys
 
 import torch
@@ -50,15 +51,33 @@ PLANT_MISMATCH = False
 
 TOLERANCE = 1e-5  # float32 on a CPU; the fused value only reorders one add.
 
-FAMILIES = (
-    _build.Spec(
-        "Llama (dense)",
-        _build._cfg("LlamaConfig"),  # noqa: SLF001 - the shared tiny sizes
-        "vllm.model_executor.models.llama",
-        "LlamaDecoderLayer",
-    ),
-    next(s for s in _build.SPECS if s.name == "Qwen3-MoE"),
-    _build.SPECS[0],  # Qwen3.5-MoE, full attention
+HIDDEN, HEAD_DIM = 128, 128  # head_dim 128: every condition of fused_qkv holds
+
+
+def _sized(spec: _build.Spec) -> _build.Spec:
+    """The spec with hidden 128 and head_dim 128 (4 query, 2 KV heads)."""
+    make = spec.config
+
+    def config():  # noqa: ANN202
+        cfg = make()
+        cfg.hidden_size, cfg.head_dim = HIDDEN, HEAD_DIM
+        return cfg
+
+    return dataclasses.replace(spec, config=config)
+
+
+FAMILIES = tuple(
+    _sized(s)
+    for s in (
+        _build.Spec(
+            "Llama (dense)",
+            _build._cfg("LlamaConfig"),  # noqa: SLF001 - the shared tiny sizes
+            "vllm.model_executor.models.llama",
+            "LlamaDecoderLayer",
+        ),
+        next(s for s in _build.SPECS if s.name == "Qwen3-MoE"),
+        _build.SPECS[0],  # Qwen3.5-MoE, full attention
+    )
 )
 
 
@@ -131,7 +150,7 @@ def _runnable(spec: _build.Spec) -> nn.Module:
         if isinstance(m, LinearBase):
             m.cpu_linear = lambda x, w, b: F.linear(x, w, b)
         if isinstance(m, AttentionLayerBase):
-            m.forward = _core(4, 2, 16)
+            m.forward = _core(4, 2, HEAD_DIM)
     layer.mlp.forward = lambda x, *a, **k: torch.tanh(x)
     return layer
 
@@ -160,7 +179,7 @@ def family(spec: _build.Spec, declines: bool = False) -> list[str]:
     torch.set_default_dtype(torch.float32)
     layer = _runnable(spec)
     t = 6
-    hidden, residual = torch.randn(t, 64), torch.randn(t, 64)
+    hidden, residual = torch.randn(t, HIDDEN), torch.randn(t, HIDDEN)
     call = {"positions": torch.arange(t), "hidden_states": hidden, "residual": residual}
     with set_current_vllm_config(_build.current_config()), torch.no_grad():
         want = layer(**call)
