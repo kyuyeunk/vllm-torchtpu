@@ -1,6 +1,7 @@
 # Prototype: the attention layer boundary is the only contract
 
-This prototype applies DATA_CONTRACTS sections 3 and 5.1 to 5.3 to one upstream
+Backs DATA_CONTRACTS.md section 5.3 (the tree in miniature) and section 5.10 (the
+guards). This prototype applies sections 3 and 5.1 to 5.3 to one upstream
 layer, vLLM's `Qwen3NextAttention`. It shows that once the layer is registered
 as an expansion point, only its boundary is a contract:
 
@@ -9,6 +10,21 @@ as an expansion point, only its boundary is a contract:
   crosses the boundary.
 - **Plan**: everything inside the boundary. One frozen `AttentionLayerPlan` is
   resolved once in `__init__`, and the forward matches on it.
+
+## Where to look
+
+| Claim | Code |
+|---|---|
+| The model-local layer, the tree in miniature | [`TpuQwen3NextAttention`](../src/vllm_torchtpu/models/vllm/qwen3_next_attention.py#L198-L289) in `qwen3_next_attention.py` (L198-L289) |
+| The contract is the boundary | [`AttentionLayerContract, layer_contract`](../src/vllm_torchtpu/layers/attention_layer_plan.py#L162-L199) in `attention_layer_plan.py` (L162-L199) |
+| The plan types | [`ActivationFormat ... AttentionLayerPlan`](../src/vllm_torchtpu/layers/attention_layer_plan.py#L206-L228) in `attention_layer_plan.py` (L206-L228) |
+| Capability, with reasons | [`supports_fused_*`](../src/vllm_torchtpu/layers/attention_layer_plan.py#L278-L324) in `attention_layer_plan.py` (L278-L324) |
+| Precedence | [`resolve_plan`](../src/vllm_torchtpu/layers/attention_layer_plan.py#L578-L623) in `attention_layer_plan.py` (L578-L623) |
+| The forward follows the plan | [`_apply_gate, forward`](../src/vllm_torchtpu/models/vllm/qwen3_next_attention.py#L123-L289) in `qwen3_next_attention.py` (L123-L289) |
+| Guards (section 5.10) | [`_guard_signatures, check_parameter_names`](../src/vllm_torchtpu/layers/expansion.py#L61-L80) in `expansion.py` (L61-L80) |
+|  | [`expansion_point`](../src/vllm_torchtpu/layers/expansion.py#L123-L134) in `expansion.py` (L123-L134) |
+| The owner registry | [`ExpansionPoint, ExpansionKey, EXPANSION_POINTS`](../src/vllm_torchtpu/patch_registry.py#L177-L210) in `patch_registry.py` (L177-L210) |
+| Planted checks | [`PLANTED, check_outside_write`](../prototype/check_attention.py#L44-L151) in `check_attention.py` (L44-L151) |
 
 It writes no new kernel. The whole layer as one fused kernel is a plan value
 (`layer=fused`) whose `supports()` declines with "no fused attention-layer
@@ -147,6 +163,11 @@ plan values
            - fused_sigmoid_gate_mul: fused_sigmoid_gate_mul is not in this vLLM (added after v0.33.0)
            - o_proj does not accept fp8_static_tensor_sym input
 
+```
+
+<details><summary>Three more configs: CUDA description, no output gate, FP8 o_proj input (newer vLLM)</summary>
+
+```
 === gated output, CUDA description
 contract
   positions      (num_tokens) int64, replicated
@@ -229,6 +250,11 @@ plan values
            hands down: attn output bfloat16/none; gate fused_mul_quant; o_proj input float8_e4m3fn/fp8_static_tensor_sym @o_proj.input_scale
            - fused_sigmoid_gate_mul: fused_sigmoid_gate_mul is not in this vLLM (added after v0.33.0)
 
+```
+
+</details>
+
+```
 === overrides, gated output, TPU
   user='gate=eager_mul' model plan=''
     layer=unfused,qk_norm_rope_gate=eager,gate=eager_mul,o_proj_input=none
