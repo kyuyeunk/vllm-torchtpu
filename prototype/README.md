@@ -1,6 +1,6 @@
 # Prototype: the step plan
 
-Backs DATA_CONTRACTS.md Figure 26 and Appendix J. Today the runner makes
+Backs DATA_CONTRACTS.md Figure 24 (section 5.4) and Appendix J. Today the runner makes
 each step's decisions in several places and leaves them on itself:
 
 - the chunk split is computed three times (`_count_input_chunks`,
@@ -13,6 +13,20 @@ each step's decisions in several places and leaves them on itself:
 - the attention metadata builders read their context from
   `runner._attn_metadata_builder_ctx`, which dflash and eagle3 save,
   overwrite and restore around their own builds.
+
+## Where to look
+
+| Claim | Code |
+|---|---|
+| The data-parallel agreement is one frozen record | [`DpStep`](../src/vllm_torchtpu/runner/step_plan.py#L36-L52) in `step_plan.py` (L36-L52) |
+| The plan record and the idle plan | [`StepPlan`](../src/vllm_torchtpu/runner/step_plan.py#L81-L108) in `step_plan.py` (L81-L108) |
+| One chunk split | [`split_chunks`](../src/vllm_torchtpu/runner/step_plan.py#L111-L156) in `step_plan.py` (L111-L156) |
+| The only producer | [`plan_step`](../src/vllm_torchtpu/runner/step_plan.py#L158-L205) in `step_plan.py` (L158-L205) |
+| The single DpStep writer | [`_dp_coordinated_step`](../src/vllm_torchtpu/runner/tpu_runner.py#L3921-L3976) in `tpu_runner.py` (L3921-L3976) |
+| The plan is built once per step | [`plan_step call in execute_model`](../src/vllm_torchtpu/runner/tpu_runner.py#L4143-L4157) in `tpu_runner.py` (L4143-L4157) |
+| A stage receives its chunk | [`_prepare_inputs`](../src/vllm_torchtpu/runner/tpu_runner.py#L3282-L3286) in `tpu_runner.py` (L3282-L3286) |
+| The builder takes its context as an argument | [`AttentionMetadataBuilder.build`](../src/vllm_torchtpu/layers/core/attention_metadata.py#L523-L529) in `attention_metadata.py` (L523-L529) |
+| Single-writer and stash ratchet tests | [`test_dp_step_has_one_writer, test_builder_context_stash_ratchet`](../tests/runner/test_step_plan.py#L120-L143) in `test_step_plan.py` (L120-L143) |
 
 This branch holds the same decisions in two frozen values
 (`src/vllm_torchtpu/runner/step_plan.py`):
@@ -109,7 +123,7 @@ most-model-len capacity because no remaining request exceeds 1024 tokens.
 
 ## On a TPU
 
-The project's golden workload (`data_contracts_proto/gate/run_golden.sh`, a
+The project's golden workload (a harness kept outside this branch, a
 TPU v6e, cold caches) on this branch against `main` at `c350823af`:
 
 ```
