@@ -278,12 +278,15 @@ def _patch_moe_explicit_pcp_collectives() -> None:
         assert upstream_getter is not None
 
         def use_all2all_kernels(self):
-            if (
-                self.use_ep
-                and self.pcp_size > 1
-                and self.dp_size == 1
-                and not self.is_sequence_parallel
-                and envs.TPU_MOE_COLLECTION_CHUNK_SIZE <= 0
+            from vllm_torchtpu.layers.core.moe_collective_plan import (
+                disables_all2all_for_explicit_pcp,
+            )
+
+            if disables_all2all_for_explicit_pcp(
+                use_ep=self.use_ep,
+                pcp_size=self.pcp_size,
+                dp_size=self.dp_size,
+                is_sequence_parallel=self.is_sequence_parallel,
             ):
                 return False
             return upstream_getter(self)

@@ -134,6 +134,7 @@ from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
     apply_top_k_top_p,
 )
+from vllm_torchtpu.layers.core import moe_collective_plan
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilder,
@@ -5585,7 +5586,10 @@ class TPUModelRunner(GPUModelRunner):
             )
             for module in self.model.modules()
         )
-        if envs.TPU_MOE_SKIP_PADDED_TOKENS or uses_mxfp4_moe:
+        if moe_collective_plan.needs_token_padding_state(
+            skip_padded_tokens=moe_collective_plan.skip_padded_tokens_from_envs(),
+            uses_mxfp4_moe=uses_mxfp4_moe,
+        ):
             max_padded_tokens = self.max_num_tokens
             if isinstance(self.drafter, DFlashProposer):
                 # A DFlash draft forward can outgrow the largest target

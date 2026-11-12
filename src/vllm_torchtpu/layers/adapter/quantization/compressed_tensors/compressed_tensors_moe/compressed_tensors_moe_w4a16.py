@@ -41,6 +41,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     prebuild_fused_moe_kernel,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+    collective_plan_for,
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
@@ -50,6 +51,7 @@ from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_ten
     requantize_int4_to_fp4_weights,
     requantize_int4_weights,
 )
+from vllm_torchtpu.layers.core.moe_collective_plan import CollectiveRule
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.utils import (  # noqa: E501
@@ -60,6 +62,11 @@ if TYPE_CHECKING:
 
 class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
     """TPU compressed-tensors packed-weight W4 MoE implementation."""
+
+    # The collective rule for this method's family; see
+    # moe_collective_plan.collective_plan. Its own methods name the
+    # class, not type(self): they are also asked of stand-in objects.
+    collective_rule = CollectiveRule.PIPELINING_ONLY
 
     _PACKED_WEIGHT_NAMES = (
         "w13_weight_packed",
@@ -134,7 +141,11 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
     def supports_internal_mk(self) -> bool:
         # We need to take control of collective communication (AllGather/ReduceScatter)
         # to pipeline them with MoE computation when chunking is enabled.
-        return enable_pipelined_collective_and_compute()
+        return collective_plan_for(
+            VllmCompressedTensorsW4A16MoEMethod.collective_rule,
+            self,
+            chunk_pipelining=enable_pipelined_collective_and_compute(),
+        ).claims_collectives
 
     @staticmethod
     def _loaded_data(parameter: torch.nn.Parameter) -> torch.Tensor:
@@ -399,7 +410,11 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
             "activation": activation_str,
             "rhs_quant_dtype": getattr(layer, "_rhs_quant_dtype", jnp.int4),
         }
-        if enable_pipelined_collective_and_compute():
+        if collective_plan_for(
+            VllmCompressedTensorsW4A16MoEMethod.collective_rule,
+            self,
+            chunk_pipelining=enable_pipelined_collective_and_compute(),
+        ).stages_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)

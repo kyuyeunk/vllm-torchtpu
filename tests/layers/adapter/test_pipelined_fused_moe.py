@@ -24,7 +24,6 @@ import torch
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
-    calculate_moe_chunks,
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
@@ -40,6 +39,7 @@ from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4MoEMethod
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedFusedMoEMethod,
 )
+from vllm_torchtpu.layers.core.moe_collective_plan import calculate_moe_chunks
 
 
 def _make_mock_moe_config():
@@ -1085,23 +1085,23 @@ def test_pipelined_moe_four_stage_pipeline():
 
 
 def test_fixed_chunk_count_honors_the_chunk_size_at_the_largest_bucket():
-    from vllm_torchtpu.layers.adapter import pipelined_fused_moe as pfm
+    from vllm_torchtpu.layers.core import moe_collective_plan as mcp
 
     # PCP8, 4096 tokens per rank at the top: 32768 gathered, 4096 per chunk.
     buckets = [512, 1024, 1536, 2048, 4096]
-    assert pfm.fixed_chunk_count(buckets, 8, 4096) == 8
+    assert mcp.fixed_chunk_count(buckets, 8, 4096) == 8
     # A count the buckets cannot all split into rises to the next common
     # divisor, so the largest gather stays under the chunk size: 8 chunks of
     # 512 and 768 gathered tokens, not 4 of 1024 and 1536.
-    assert pfm.fixed_chunk_count([512, 768], 8, 1024) == 8
+    assert mcp.fixed_chunk_count([512, 768], 8, 1024) == 8
     # 24 chunks are needed and 32 is the next count both buckets split into.
-    assert pfm.fixed_chunk_count([256, 384], 8, 128) == 32
+    assert mcp.fixed_chunk_count([256, 384], 8, 128) == 32
     # No common divisor is large enough (384 needed, 128 at most): the
     # greatest one is used and the largest gather exceeds the chunk size.
-    assert pfm.fixed_chunk_count([256, 384], 8, 8) == 128
-    assert pfm.fixed_chunk_count(buckets, 1, 4096) == 1
-    assert pfm.fixed_chunk_count(buckets, 8, 0) == 1
-    assert pfm.fixed_chunk_count([], 8, 4096) == 1
+    assert mcp.fixed_chunk_count([256, 384], 8, 8) == 128
+    assert mcp.fixed_chunk_count(buckets, 1, 4096) == 1
+    assert mcp.fixed_chunk_count(buckets, 8, 0) == 1
+    assert mcp.fixed_chunk_count([], 8, 4096) == 1
 
 
 def test_fixed_chunk_collection_splits_every_bucket_alike(monkeypatch):

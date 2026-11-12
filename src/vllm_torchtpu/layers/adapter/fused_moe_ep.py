@@ -66,6 +66,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     token_gather_smem_bytes,
 )
 from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.core import moe_collective_plan
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
@@ -592,7 +593,7 @@ def fused_moe_ep(
     router_logits, score_bias, hash_ids = _simulated_routing_operands(
         router_logits, score_bias, hash_ids
     )
-    if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+    if moe_collective_plan.skip_padded_tokens_from_envs():
         router_logits = token_padding.mask_router_logits_for_padding(router_logits)
     extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
@@ -972,12 +973,12 @@ def prebuild_fused_moe_ep(
     # Chunked collection stops applying the moment this arms: the fused call
     # returns before `apply_monolithic` reaches the chunked path, and the
     # kernel exchanges inside its own program.
-    if envs.TPU_MOE_COLLECTION_CHUNK_SIZE:
+    if chunk_size := moe_collective_plan.chunk_size_from_envs():
         logger.warning_once(
             "Fused EP MoE armed, so TPU_MOE_COLLECTION_CHUNK_SIZE=%s is not "
             "in effect for this layer: the kernel routes and exchanges inside "
             "its own program.",
-            envs.TPU_MOE_COLLECTION_CHUNK_SIZE,
+            chunk_size,
         )
     return op
 

@@ -32,6 +32,7 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     requant_load_kmajor_fp4,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+    collective_plan_for,
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
@@ -39,6 +40,7 @@ from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_ten
     get_cpu_weight_loader_hook,
     release_memory_to_os,
 )
+from vllm_torchtpu.layers.core.moe_collective_plan import CollectiveRule
 from vllm_torchtpu.layers.core.quantization import e8m0_to_fp32_bits
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
@@ -54,6 +56,11 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
     Accommodates both W4A4 and W4A16.
     """
 
+    # The collective rule for this method's family; see
+    # moe_collective_plan.collective_plan. Its own methods name the
+    # class, not type(self): they are also asked of stand-in objects.
+    collective_rule = CollectiveRule.ALWAYS_SKIP_PADDED
+
     @property
     def is_monolithic(self) -> bool:
         return True
@@ -62,7 +69,11 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
     def supports_internal_mk(self) -> bool:
         # We need to take control of collective communication (AllGather/ReduceScatter)
         # to pipeline them with MoE computation when chunking is enabled.
-        return enable_pipelined_collective_and_compute()
+        return collective_plan_for(
+            VllmCompressedTensorsW4ANMxfp4MoEMethod.collective_rule,
+            self,
+            chunk_pipelining=enable_pipelined_collective_and_compute(),
+        ).claims_collectives
 
     @staticmethod
     def _loaded_data(parameter: torch.nn.Parameter) -> torch.Tensor:
@@ -269,7 +280,11 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=use_ep,
-            skip_padded_tokens=True,
+            skip_padded_tokens=collective_plan_for(
+                VllmCompressedTensorsW4ANMxfp4MoEMethod.collective_rule,
+                self,
+                chunk_pipelining=enable_pipelined_collective_and_compute(),
+            ).kernel_skip_padded_tokens,
         )
 
     def apply_monolithic(
@@ -289,7 +304,11 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             x,
             topk_weights,
             topk_ids,
-            pipelined=enable_pipelined_collective_and_compute(),
+            pipelined=collective_plan_for(
+                VllmCompressedTensorsW4ANMxfp4MoEMethod.collective_rule,
+                self,
+                chunk_pipelining=enable_pipelined_collective_and_compute(),
+            ).stages_collectives,
         )
 
     def apply_with_routing(
@@ -315,9 +334,15 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
         topk_ids = topk_ids.to(torch.int32)
         topk_weights = topk_weights.to(x.dtype)
 
-        topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
-            topk_ids, topk_weights, is_local_tensor=pipelined
+        collectives = collective_plan_for(
+            VllmCompressedTensorsW4ANMxfp4MoEMethod.collective_rule,
+            self,
+            chunk_pipelining=pipelined,
         )
+        if collectives.zero_padded_routing_weights:
+            topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                topk_ids, topk_weights, is_local_tensor=collectives.stages_collectives
+            )
 
         kwargs = {
             "hidden_states": x,
@@ -333,9 +358,9 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
             "rhs_quant_dtype": None,
-            "skip_padded_tokens": True,
+            "skip_padded_tokens": collectives.kernel_skip_padded_tokens,
         }
-        if pipelined:
+        if collectives.stages_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
 
         # Execute GMM Kernel with native fp4 weights and scales

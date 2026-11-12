@@ -73,10 +73,12 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     quantize_native_fp4_kmajor,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+    collective_plan_for,
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
+from vllm_torchtpu.layers.core.moe_collective_plan import CollectiveRule
 from vllm_torchtpu.layers.core.quant_methods import MXFP4, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import (
     dequantize_mxfp4_packed,
@@ -214,6 +216,11 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
     but bypasses its __init__ to avoid the GPU backend assertion.
     """
 
+    # The collective rule for this method's family; see
+    # moe_collective_plan.collective_plan. Its own methods name the
+    # class, not type(self): they are also asked of stand-in objects.
+    collective_rule = CollectiveRule.PIPELINING_ONLY
+
     # Upstream Mxfp4MoEMethod.__init__ defines is_k3_situ_aiter for GPU AITER kernels.
     # Since __init__ is bypassed on TPU, explicitly define it here as False.
     is_k3_situ_aiter: bool = False
@@ -226,7 +233,11 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
     def supports_internal_mk(self) -> bool:
         # We need to take control of collective communication (AllGather/ReduceScatter)
         # to pipeline them with MoE computation when chunking is enabled.
-        return enable_pipelined_collective_and_compute()
+        return collective_plan_for(
+            VllmMxfp4MoEMethod.collective_rule,
+            self,
+            chunk_pipelining=enable_pipelined_collective_and_compute(),
+        ).claims_collectives
 
     def __init__(self, moe: FusedMoEConfig):
         # Skip Mxfp4MoEMethod.__init__ (GPU backend assertion)
@@ -356,7 +367,11 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
             "activation": activation_str,
             "rhs_quant_dtype": self.rhs_quant_dtype,
         }
-        if enable_pipelined_collective_and_compute():
+        if collective_plan_for(
+            VllmMxfp4MoEMethod.collective_rule,
+            self,
+            chunk_pipelining=enable_pipelined_collective_and_compute(),
+        ).stages_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)
@@ -372,15 +387,22 @@ REQUANTIZED_BLOCK_SIZE = (
 class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
     """DeepSeek-V4 MXFP4 MoE quantization and weight loading method."""
 
+    # The collective rule for this method's family; see
+    # moe_collective_plan.collective_plan. Its own methods name the
+    # class, not type(self): they are also asked of stand-in objects.
+    collective_rule = CollectiveRule.FUSED_EP_KERNEL
+
     rhs_quant_dtype = jnp.float4_e2m1fn
 
     @property
     def supports_internal_mk(self) -> bool:
         # An armed layer owns its own dispatch and combine, so vLLM must not
         # bracket it with an all-gather/reduce-scatter of its own.
-        from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
-
-        return enable_pipelined_collective_and_compute() or fused_moe_ep_supported(self)
+        return collective_plan_for(
+            VllmDeepseekV4Mxfp4MoEMethod.collective_rule,
+            self,
+            chunk_pipelining=enable_pipelined_collective_and_compute(),
+        ).claims_collectives
 
     def _prebuild_w4a8(
         self,

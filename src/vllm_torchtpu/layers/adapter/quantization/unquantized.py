@@ -65,6 +65,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     WEIGHT_FLIPPED_ATTR,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+    collective_plan_for,
     enable_pipelined_collective_and_compute,
     pipelined_fused_moe_gmm,
 )
@@ -72,6 +73,7 @@ from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
     should_quantize_on_load,
 )
+from vllm_torchtpu.layers.core.moe_collective_plan import CollectiveRule
 from vllm_torchtpu.layers.core.quant_methods import UNQUANTIZED, get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
@@ -239,6 +241,11 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
     CUDA-only router.select_experts() path.
     """
 
+    # The collective rule for this method's family; see
+    # moe_collective_plan.collective_plan. Its own methods name the
+    # class, not type(self): they are also asked of stand-in objects.
+    collective_rule = CollectiveRule.PIPELINING_ONLY
+
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
         # Parent sets _is_monolithic=False on TPU and skips wiring
@@ -253,7 +260,11 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
     def supports_internal_mk(self) -> bool:
         # We need to take control of collective communication (AllGather/ReduceScatter)
         # to pipeline them with MoE computation when chunking is enabled.
-        return enable_pipelined_collective_and_compute()
+        return collective_plan_for(
+            VllmUnquantizedFusedMoEMethod.collective_rule,
+            self,
+            chunk_pipelining=enable_pipelined_collective_and_compute(),
+        ).claims_collectives
 
     def _select_monolithic(self):
         return self._forward_monolithic_tpu
@@ -376,7 +387,11 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
         }
-        if enable_pipelined_collective_and_compute():
+        if collective_plan_for(
+            VllmUnquantizedFusedMoEMethod.collective_rule,
+            self,
+            chunk_pipelining=enable_pipelined_collective_and_compute(),
+        ).stages_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)

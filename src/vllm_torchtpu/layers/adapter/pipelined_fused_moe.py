@@ -19,16 +19,15 @@ collective communications (AllGather and ReduceScatter) with MoE computation.
 """
 
 import contextlib
-import math
 from collections.abc import Sequence
 from typing import cast
 
 import torch
 from vllm.distributed.parallel_state import get_dp_group
 
-import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.pcp import get_pcp_group
 from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm
+from vllm_torchtpu.layers.core import moe_collective_plan
 from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
 
@@ -47,9 +46,9 @@ def fixed_moe_collection_chunks(buckets: Sequence[int]):
     The chunk count is otherwise a function of the token count, and a graph
     traced once over symbolic token counts keeps the branch it was traced
     with. The MTP draft is traced that way, so its collection runs the count
-    ``fixed_chunk_count`` derives from the token ``buckets`` the draft is
-    padded to: the configured chunk size still bounds the gather at the
-    largest bucket.
+    ``moe_collective_plan.fixed_chunk_count`` derives from the token
+    ``buckets`` the draft is padded to: the configured chunk size still bounds
+    the gather at the largest bucket.
     """
     global _fixed_chunk_buckets
     previous = _fixed_chunk_buckets
@@ -60,46 +59,53 @@ def fixed_moe_collection_chunks(buckets: Sequence[int]):
         _fixed_chunk_buckets = previous
 
 
-def fixed_chunk_count(
-    buckets: Sequence[int], parallel_size: int, chunk_size: int
-) -> int:
-    """Chunk count that keeps every gather at or under ``chunk_size``.
-
-    Every bucket must split into equal chunks, so the count is the smallest
-    common divisor of the buckets that is at least what the largest bucket
-    needs. When no common divisor is that large, the greatest one is used
-    and the largest bucket's gather exceeds ``chunk_size``.
-    """
-    if chunk_size <= 0 or parallel_size <= 1 or not buckets:
-        return 1
-    needed = -(-max(buckets) * parallel_size // chunk_size)
-    common = math.gcd(*buckets)
-    count = needed
-    while count < common and common % count:
-        count += 1
-    return min(count, common)
-
-
 def collection_chunks(seq_len: int, parallel_size: int) -> tuple[int, int]:
     """Chunk count and local chunk size for this rank's ``seq_len`` tokens."""
-    if _fixed_chunk_buckets is not None and parallel_size > 1:
-        num_chunks = fixed_chunk_count(
-            _fixed_chunk_buckets, parallel_size, envs.TPU_MOE_COLLECTION_CHUNK_SIZE
-        )
-        return num_chunks, seq_len // num_chunks
-    return calculate_moe_chunks(
-        seq_len, parallel_size, envs.TPU_MOE_COLLECTION_CHUNK_SIZE
+    return moe_collective_plan.collection_chunks(
+        seq_len,
+        parallel_size,
+        chunk_size=moe_collective_plan.chunk_size_from_envs(),
+        fixed_buckets=_fixed_chunk_buckets,
     )
 
 
-def enable_pipelined_collective_and_compute() -> bool:
-    """Check whether collective communication and compute pipelining is enabled.
+# True when TPU_MOE_COLLECTION_CHUNK_SIZE > 0.
+enable_pipelined_collective_and_compute = moe_collective_plan.chunk_pipelining_from_envs
+
+
+def collective_plan_for(
+    rule: moe_collective_plan.CollectiveRule, method: object, *, chunk_pipelining: bool
+) -> moe_collective_plan.CollectivePlan:
+    """One MoE quant method's collective plan.
+
+    A function of the method object, not a method on it: `supports_internal_mk`
+    is also asked of stand-in objects. Callers pass their own module's
+    `enable_pipelined_collective_and_compute()` so per-module test patches of
+    that name still steer the plan.
+
+    Args:
+        rule: The method class's `collective_rule`.
+        method: The layer's quant method (where prebuild records arming).
+        chunk_pipelining: Chunk pipelining is on.
 
     Returns:
-        bool: True if `envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0`, False otherwise.
-
+        The plan.
     """
-    return envs.TPU_MOE_COLLECTION_CHUNK_SIZE > 0
+    from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
+        adaptive_fused_moe_supported,
+    )
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+
+    return moe_collective_plan.collective_plan(
+        moe_collective_plan.MoeLayerInfo(
+            rule=rule,
+            ep_fused_supported=fused_moe_ep_supported(method),
+            adaptive_supported=adaptive_fused_moe_supported(method),
+        ),
+        moe_collective_plan.collective_overrides_from_envs(
+            chunk_pipelining=chunk_pipelining
+        ),
+    )
 
 
 # Alias for alternative naming convention
@@ -120,41 +126,6 @@ def _quantized_all_gather(
         ag_rows.view(torch.float8_e4m3fn), ag_scale, axis=-1, out_dtype=out_dtype
     )
     return ag_hidden_states
-
-
-def calculate_moe_chunks(
-    seq_len: int, parallel_size: int, chunk_size: int
-) -> tuple[int, int]:
-    """Calculate the number of chunks and local chunk size for MoE chunk pipelining.
-
-    Uses ceiling division so `chunk_size` acts as a maximum global chunk threshold:
-        num_chunks = ceil((seq_len * parallel_size) / chunk_size)
-        chunk_size_local = seq_len // num_chunks
-
-    Args:
-        seq_len: Number of local tokens on this rank (S).
-        parallel_size: World size of the active DP or PCP collective group.
-        chunk_size: Maximum post-gather chunk size threshold in tokens (C).
-
-    Returns:
-        tuple[int, int]: (num_chunks N_chunk, chunk_size_local S_chunk).
-
-    Raises:
-        ValueError: If local sequence length is not divisible by chunk count.
-    """
-    if chunk_size <= 0 or parallel_size <= 1 or seq_len <= 0:
-        return 1, seq_len
-
-    total_tokens = seq_len * parallel_size
-    num_chunks = (total_tokens + chunk_size - 1) // chunk_size
-    if seq_len % num_chunks != 0:
-        raise ValueError(
-            f"Local sequence length ({seq_len}) is not divisible by chunk count "
-            f"({num_chunks})."
-        )
-
-    chunk_size_local = seq_len // num_chunks
-    return num_chunks, chunk_size_local
 
 
 def _get_moe_collective_group():
@@ -185,7 +156,7 @@ def _log_active_chunk_pipeline() -> None:
         "MoE multi-chunk pipeline branch active: group=%s, world_size=%d, threshold=%d",
         collective_kind,
         parallel_size,
-        envs.TPU_MOE_COLLECTION_CHUNK_SIZE,
+        moe_collective_plan.chunk_size_from_envs(),
     )
 
 
@@ -251,7 +222,7 @@ def pipelined_fused_moe_gmm(
 
     # There is no gather to make cheaper on a single rank, so quantizing there
     # would only round the activations for nothing.
-    quantize_ag = parallel_size > 1 and envs.TPU_MOE_FP8_ALL_GATHER
+    quantize_ag = parallel_size > 1 and moe_collective_plan.fp8_all_gather_from_envs()
 
     if num_chunks == 1 or parallel_size == 1:
         if parallel_size > 1:
