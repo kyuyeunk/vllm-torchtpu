@@ -62,6 +62,13 @@ _CAPABLE = {
         Combine.GATHER_REDUCE_V3,
         "the route-pair metadata needs two routes per token",
     ),
+    "v4 at top-8": (
+        _ON,
+        _TPU7X,
+        _call(16, 8),
+        Combine.GATHER_REDUCE_V4,
+        "top-k above 4",
+    ),
     "SparseCore off": (
         _OFF,
         _TPU7X,

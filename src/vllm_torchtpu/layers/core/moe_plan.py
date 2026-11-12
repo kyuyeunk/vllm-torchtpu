@@ -35,6 +35,7 @@ from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute_supports,
 )
 from vllm_torchtpu.kernels.sparse_core import ragged_gather_reduce_v3 as v3
+from vllm_torchtpu.kernels.sparse_core import ragged_gather_reduce_v4 as v4
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import (
     ragged_gather_reduce as ragged_gather_reduce_v1,
 )
@@ -53,6 +54,7 @@ class Combine(enum.Enum):
     - `onehot`: a dense one-hot matmul.
     - `owner_onehot`: the blockwise one-hot unpermute kernel.
     - `gather_reduce_v1`, `_v2`, `_v3`: the SparseCore gather-reduce kernels.
+    - `gather_reduce_v4`: a SparseCore gather-reduce for top-k up to 4.
     """
 
     TENSORCORE = "tensorcore"
@@ -61,6 +63,7 @@ class Combine(enum.Enum):
     GATHER_REDUCE_V1 = "gather_reduce_v1"
     GATHER_REDUCE_V2 = "gather_reduce_v2"
     GATHER_REDUCE_V3 = "gather_reduce_v3"
+    GATHER_REDUCE_V4 = "gather_reduce_v4"
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -279,6 +282,11 @@ VARIANTS: dict[Combine, Variant] = {
     Combine.GATHER_REDUCE_V3: Variant(
         run=_gather_reduce(v3.ragged_gather_reduce),
         supports=_gather_reduce_supports(v3.ragged_gather_reduce_supports),
+        sparse_core=True,
+    ),
+    Combine.GATHER_REDUCE_V4: Variant(
+        run=_gather_reduce(v4.ragged_gather_reduce),
+        supports=_gather_reduce_supports(v4.ragged_gather_reduce_supports),
         sparse_core=True,
     ),
 }
