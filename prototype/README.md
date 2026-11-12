@@ -1,7 +1,7 @@
 # Prototype: each level owns its decisions
 
-Backs DATA_CONTRACTS.md section 3 ("Decisions flow down the scopes") and
-Table 12, rule 1 (d) and (e). Decisions flow from the model scope through
+Backs DATA_CONTRACTS.md section 5.7 (the hierarchy checks), section 3 ("Decisions
+flow down the scopes") and Table 12, rule 1 (d) and (e). Decisions flow from the model scope through
 block and family scopes to kernels, and each level's plan becomes the
 contract of the level below. Each level owns its decisions; three checks stop
 a lower level from reaching up or re-deciding what it was handed:
@@ -11,6 +11,19 @@ a lower level from reaching up or re-deciding what it was handed:
 | Reach up: import a higher scope | import-linter `layers` contracts in `.importlinter` |
 | Re-decide: accept a decision nobody made | resolved types (`resolution.require_no_default`) and `prototype/check_handoff.py` |
 | Ignore: drop a decision it was handed | `prototype/check_dead_fields.py` |
+
+## Where to look
+
+| Claim | Code |
+|---|---|
+| Scopes import downward, with a ratchet of 9 edges | [`scopes-top-down`](../.importlinter#L14-L35) in `.importlinter` (L14-L35) |
+| The decider never imports the executor | [`family-decides-below-executor`](../.importlinter#L39-L46) in `.importlinter` (L39-L46) |
+| Resolved types carry no defaults | [`require_no_default`](../src/vllm_torchtpu/layers/core/resolution.py#L28-L40) in `resolution.py` (L28-L40) |
+| The resolved plan | [`MoeCombinePlan`](../src/vllm_torchtpu/layers/core/moe_plan.py#L71-L88) in `moe_plan.py` (L71-L88) |
+| It decides once | [`plan_combine`](../src/vllm_torchtpu/layers/core/moe_plan.py#L91-L170) in `moe_plan.py` (L91-L170) |
+| The executor runs the plan only | [`moe_combine`](../src/vllm_torchtpu/layers/core/fused_moe_gmm.py#L573-L665) in `fused_moe_gmm.py` (L573-L665) |
+| No X | None reaches a child | [`main`](../prototype/check_handoff.py#L40-L55) in `check_handoff.py` (L40-L55) |
+| Dead-field report | [`traced, main`](../prototype/check_dead_fields.py#L64-L108) in `check_dead_fields.py` (L64-L108) |
 
 The branch applies them to the MoE combine. It moves the combine decision out
 of `moe_gmm` into `layers/core/moe_plan.py`: `plan_combine` decides once and
