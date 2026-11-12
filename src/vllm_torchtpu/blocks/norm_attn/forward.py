@@ -28,8 +28,6 @@ from typing import Any
 import torch
 from torch import nn
 
-from vllm_torchtpu.blocks.norm_attn.pattern import norm_scale
-
 FUSED_CALLS: dict[str, int] = {}
 """Fused projections run, per layer class (eager runs only)."""
 
@@ -37,8 +35,9 @@ FUSED_CALLS: dict[str, int] = {}
 class AddOnly(nn.Module):
     """The input norm's role under ``fused_qkv``: add the residual, nothing else.
 
-    Returns the float32 sum to attention (its projection normalizes it, as the
-    norm would have) and the sum in the stream's dtype as the new residual.
+    Rounds the sum to the stream's dtype, as the platform's fused add-norm
+    does, and returns it both to attention (its projection normalizes it) and
+    as the new residual.
     """
 
     def forward(
@@ -46,8 +45,8 @@ class AddOnly(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is None:  # The first layer: the stream is its own residual.
             return x
-        added = x.float() + residual.float()
-        return added, added.to(x.dtype)
+        added = (x.float() + residual.float()).to(x.dtype)
+        return added, added
 
 
 class FusedNormProjection(nn.Module):
@@ -64,14 +63,11 @@ class FusedNormProjection(nn.Module):
         self.owner = owner
 
     def forward(self, x: torch.Tensor) -> Any:  # noqa: ANN401 - whatever proj returns
-        x32 = x.float()
-        normed = x32 * torch.rsqrt(
-            x32.pow(2).mean(dim=-1, keepdim=True) + self.norm.variance_epsilon
-        )
-        normed = (normed * norm_scale(self.norm)).to(self.norm.weight.dtype)
         if not torch.compiler.is_compiling():
             FUSED_CALLS[self.owner] = FUSED_CALLS.get(self.owner, 0) + 1
-        return self.proj(normed)
+        # The norm's own op on the rounded sum, so the platform's rounding
+        # points are kept; a kernel fuses these two calls into one.
+        return self.proj(self.norm(x))
 
 
 def install_fused_qkv(layer: nn.Module, input_norm: str, qkv_proj: str) -> None:
