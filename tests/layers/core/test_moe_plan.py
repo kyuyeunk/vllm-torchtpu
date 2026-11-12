@@ -13,6 +13,8 @@
 # limitations under the License.
 """Which combines can run a call and which one runs, on CPU, for JAX's chips."""
 
+import dataclasses
+
 import pytest
 from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
@@ -36,6 +38,12 @@ def _call(
     op = moe_plan.MoeOpIn(num_tokens=tokens, topk=topk, local_num_experts=64)
     out = moe_plan.GmmOut(hidden=4096, dtype=_BF16, weights_dtype=weights)
     return op, out
+
+
+def _counted(tokens: int, topk: int) -> tuple[moe_plan.MoeOpIn, moe_plan.GmmOut]:
+    """A call whose routing passes its per-token count of local routes."""
+    op, out = _call(tokens, topk)
+    return op, dataclasses.replace(out, token_local_routes_shape=(tokens,))
 
 
 # (process, chip, call, variant, the reason the variant cannot run or None).
@@ -69,6 +77,20 @@ _CAPABLE = {
         _call(16, 8),
         Combine.GATHER_REDUCE_V4,
         "top-k above 4",
+    ),
+    "skip_empty with route counts": (
+        _ON,
+        _V6E,
+        _counted(256, 8),
+        Combine.SKIP_EMPTY,
+        None,
+    ),
+    "skip_empty without": (
+        _ON,
+        _V6E,
+        _call(256, 8),
+        Combine.SKIP_EMPTY,
+        "needs routing's per-token count of local routes",
     ),
     "SparseCore off": (
         _OFF,

@@ -23,6 +23,7 @@ Nothing here reads the runtime: the chip is passed in as a `pltpu.TpuInfo`.
 
 import dataclasses
 import enum
+import functools
 from collections.abc import Callable
 from typing import Any
 
@@ -34,6 +35,7 @@ from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     blockwise_onehot_unpermute_supports,
 )
+from vllm_torchtpu.kernels.sparse_core import ragged_gather_reduce_skip_empty as skip
 from vllm_torchtpu.kernels.sparse_core import ragged_gather_reduce_v3 as v3
 from vllm_torchtpu.kernels.sparse_core import ragged_gather_reduce_v4 as v4
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import (
@@ -56,6 +58,8 @@ class Combine(enum.Enum):
     - `gather_reduce_v1`, `_v2`, `_v3`: the SparseCore gather-reduce kernels.
     - `gather_reduce_v4`: a SparseCore gather-reduce for top-k up to 4.
     - `segment_sum`: an XLA scatter-add of the weighted rows, in expert order.
+    - `skip_empty`: a SparseCore gather-reduce that skips tokens with no route
+      on this shard; it reads routing's per-token count of local routes.
     """
 
     TENSORCORE = "tensorcore"
@@ -66,6 +70,7 @@ class Combine(enum.Enum):
     GATHER_REDUCE_V3 = "gather_reduce_v3"
     GATHER_REDUCE_V4 = "gather_reduce_v4"
     SEGMENT_SUM = "segment_sum"
+    SKIP_EMPTY = "skip_empty"
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
@@ -148,11 +153,14 @@ class GmmOut:
         hidden: Width of the GMM output.
         dtype: GMM output dtype.
         weights_dtype: Top-k weights dtype.
+        token_local_routes_shape: Shape of routing's per-token count of
+            routes on this shard, or None where routing did not pass it.
     """
 
     hidden: int
     dtype: jnp.dtype
     weights_dtype: jnp.dtype
+    token_local_routes_shape: tuple[int, ...] | None = None
 
 
 def combine_args(op: MoeOpIn, out: GmmOut) -> tuple[jax.ShapeDtypeStruct, ...]:
@@ -275,6 +283,41 @@ def _no_limits(*args, chip, **statics) -> str | None:
     return None
 
 
+def _skip_empty(
+    g,
+    group_sizes,
+    revert,
+    weights,
+    mask,
+    token_indices,
+    *,
+    num_tokens,
+    topk,
+    token_local_routes,
+):
+    del group_sizes, token_indices, num_tokens
+    return skip.ragged_gather_reduce(g, revert, weights, mask, token_local_routes, topk)
+
+
+def _skip_empty_supports(
+    g,
+    group_sizes,
+    revert,
+    weights,
+    mask,
+    token_indices,
+    *,
+    num_tokens,
+    topk,
+    chip,
+    token_local_routes,
+):
+    del group_sizes, token_indices, num_tokens
+    return skip.ragged_gather_reduce_supports(
+        g, revert, weights, mask, token_local_routes, topk, chip=chip
+    )
+
+
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class Variant:
     """One way to run the combine.
@@ -283,11 +326,14 @@ class Variant:
         run: Computes the combine.
         supports: A hard limit the call breaks, or None.
         sparse_core: Runs on the SparseCore.
+        reads_token_local_routes: Also takes routing's per-token count of
+            local routes, as the `token_local_routes` keyword.
     """
 
     run: Callable[..., jax.Array]
     supports: Callable[..., str | None]
     sparse_core: bool = False
+    reads_token_local_routes: bool = False
 
 
 VARIANTS: dict[Combine, Variant] = {
@@ -315,6 +361,12 @@ VARIANTS: dict[Combine, Variant] = {
         sparse_core=True,
     ),
     Combine.SEGMENT_SUM: Variant(run=_segment_sum, supports=_segment_sum_supports),
+    Combine.SKIP_EMPTY: Variant(
+        run=_skip_empty,
+        supports=_skip_empty_supports,
+        sparse_core=True,
+        reads_token_local_routes=True,
+    ),
 }
 DEFAULT = Combine.TENSORCORE
 
@@ -327,9 +379,20 @@ def combine_capable(
     return {
         name: "SparseCore is off"
         if v.sparse_core and not process.use_sparse_core
-        else v.supports(*args, num_tokens=op.num_tokens, topk=op.topk, chip=chip)
+        else _optional_inputs(v, out)(
+            *args, num_tokens=op.num_tokens, topk=op.topk, chip=chip
+        )
         for name, v in VARIANTS.items()
     }
+
+
+def _optional_inputs(variant: Variant, out: GmmOut) -> Callable[..., str | None]:
+    """`variant.supports`, with the optional inputs it reads bound as shapes."""
+    if not variant.reads_token_local_routes:
+        return variant.supports
+    shape = out.token_local_routes_shape
+    routes = None if shape is None else jax.ShapeDtypeStruct(shape, jnp.int32)
+    return functools.partial(variant.supports, token_local_routes=routes)
 
 
 class Pick(enum.Enum):

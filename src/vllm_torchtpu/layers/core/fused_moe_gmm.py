@@ -552,6 +552,7 @@ def moe_combine(
     num_tokens: int,
     topk: int,
     use_sparse_core: bool,
+    token_local_routes: jax.Array | None = None,
 ) -> jax.Array:
     """Sums the second GMM's routed rows back into one row per token.
 
@@ -565,6 +566,8 @@ def moe_combine(
         num_tokens: Tokens in the batch.
         topk: Experts per token.
         use_sparse_core: Token movement may use the SparseCore.
+        token_local_routes: Per token, its routes on this shard, if routing
+            counted them.
 
     Returns:
         `[num_tokens, hidden]` in `gmm2_res`'s dtype.
@@ -579,10 +582,17 @@ def moe_combine(
             hidden=gmm2_res.shape[1],
             dtype=gmm2_res.dtype,
             weights_dtype=topk_weights_flat.dtype,
+            token_local_routes_shape=None
+            if token_local_routes is None
+            else token_local_routes.shape,
         ),
         chip,
     )
-    out = moe_plan.VARIANTS[plan.combine].run(
+    variant = moe_plan.VARIANTS[plan.combine]
+    run = variant.run
+    if variant.reads_token_local_routes:
+        run = functools.partial(run, token_local_routes=token_local_routes)
+    out = run(
         gmm2_res,
         group_sizes,
         argsort_revert_indices,
