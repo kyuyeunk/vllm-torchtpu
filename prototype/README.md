@@ -59,10 +59,10 @@ weights and contract, and the plan is the runner's.
 | The fused value's reference (stands in for #3096's kernel) | [`reference_fused_qkv`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L188-L206) |
 | Conformance: the layer's wiring | [`conform`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L96-L213) |
 | Conformance: attention's forward is the runner's composition; a variant the runner does not implement is a stated missing property | [`attention_parts`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L223-L270), [`conform_attention`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L273-L346) |
-| A non-conforming declaration stops startup | [`install`](../src/vllm_torchtpu/blocks/__init__.py#L164-L195) |
-| The plan and the kernel's capability | [`NormAttnPlan`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L47-L54), [`rule` and fallbacks](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L62-L70), [`fused_qkv_supports`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L73-L142), [`resolve`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L145-L164); the chip fact [`has_fp8_matmul`](../src/vllm_torchtpu/tpu_info.py#L90-L99) |
-| Install: capability consulted (automatic falls back, a pin that cannot run raises), runner built from the layer's parts, the layer routed through it | [`NormThenAttention`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L423-L480), [`build_runner`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L394-L416), [`NormAttnDecoder`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L360-L380) |
-| Scopes nest: inside `attn_then_moe`'s block, the block runs its front half through the runner | [`AttentionMoEBlock.forward`](../src/vllm_torchtpu/blocks/attn_moe/forward.py#L82-L94), [`test_scopes_nest_on_qwen3_5`](../tests/blocks/test_norm_attn_block.py#L109-L126) |
+| A non-conforming declaration stops startup | [`install`](../src/vllm_torchtpu/blocks/__init__.py#L168-L199) |
+| The plan and the kernel's capability | [`NormAttnPlan`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L49-L56), [`rule` and fallbacks](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L64-L72), [`fused_qkv_supports`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L75-L157), [`resolve`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L160-L179), [`choose`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L182-L214); the chip fact [`has_fp8_matmul`](../src/vllm_torchtpu/tpu_info.py#L90-L99) |
+| Install: capability consulted (automatic falls back, a pin that cannot run raises), runner built from the layer's parts, the layer routed through it | [`NormThenAttention`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L423-L471), [`build_runner`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L394-L416), [`NormAttnDecoder`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L360-L380) |
+| Scopes nest: inside `attn_then_moe`'s block, the block runs its front half through the runner | [`AttentionMoEBlock.forward`](../src/vllm_torchtpu/blocks/attn_moe/forward.py#L82-L94), [`test_scopes_nest_on_qwen3_5`](../tests/blocks/test_norm_attn_integration.py#L238-L255) |
 | Scopes nest: several patterns per class | [`declarations_for`](../src/vllm_torchtpu/blocks/__init__.py#L84-L86) |
 | One call per model | [GLM-4.5/4.6](../src/vllm_torchtpu/models/vllm/glm4_moe/registration.py#L21), [Mistral](../src/vllm_torchtpu/models/vllm/mistral/registration.py#L21), [Llama](../src/vllm_torchtpu/models/vllm/llama/registration.py#L21), [Qwen3](../src/vllm_torchtpu/models/vllm/qwen3/registration.py#L21), [gpt-oss](../src/vllm_torchtpu/models/vllm/gpt_oss/registration.py#L21-L25), [Qwen3-MoE](../src/vllm_torchtpu/models/vllm/qwen3_moe/registration.py#L21), [Qwen3.5](../src/vllm_torchtpu/models/vllm/qwen3_5/registration.py#L43-L48) |
 | Per model: A (runner unfused vs upstream) and B (the rule's value through the runner) | [`family`](check_subblock.py#L211-L244), [`_install_and_run`](check_subblock.py#L190-L208), [`new_models`](check_subblock.py#L256-L264) |
@@ -74,7 +74,7 @@ weights and contract, and the plan is the runner's.
 
 ## The kernel's capability, as its author would declare it
 
-`fused_qkv_supports(attention, matmul=, chip=)` returns why #3096's fused_qkv cannot serve an
+`fused_qkv_supports(attention, matmul=, chip=, kv_cache_dtype=)` returns why #3096's fused_qkv cannot serve an
 attention role, or None. The chip is the third description, after the model's and the kernel's.
 Each condition is read from #3096's code (paths in
 its diff, `d2d5ded6e`; "adapter" is `layers/adapter/fused_attn_proj.py`):
@@ -87,11 +87,12 @@ its diff, `d2d5ded6e`; "adapter" is `layers/adapter/fused_attn_proj.py`):
 | head_dim a multiple of 32 (8 sublanes x 4 FP8 values) | gqa/config.py:147 | attention role |
 | An even number of query heads per KV head (bf16 Q packs 2) | gqa/config.py:146 | attention role |
 | An output gate only with head_dim a multiple of 128 | gqa/config.py:149 | attention role |
-| q/k norms per head: RMSNorm, (1 + w) or weightless | adapter:74-82 | attention role |
+| q/k norms per head (over head_dim, not TP-wide over the projection): RMSNorm, (1 + w) or weightless | adapter:74-82 | attention role |
 | NeoX-style RoPE (partial RoPE fine) | common/model_config.py:59-71, common/rope.py:17; #3096's adapter does not check this | attention role |
 | QKV weights unquantized or FP8 per channel, after the platform's requantization (block FP8 is requantized on load unless `REQUANTIZE_BLOCK_SIZE` is set) | adapter:88-103 | attention role; the platform fact when the kernel is built |
 | Batched-RPA attention backend, no DCP | adapter:242-244 | platform, when the kernel is built |
-| FP8 KV cache, bf16 queries | gqa/config.py:142-143 | platform, when the kernel is built |
+| FP8 (e4m3) KV cache | gqa/config.py:143 | the platform's `kv_cache_dtype` (empty, unchecked, while the fused value is the plain-torch reference, which writes no KV cache) |
+| bf16 queries | gqa/config.py:142 | platform, when the kernel is built |
 | Weights stored (K, N) | adapter:101 | platform, when the kernel is built |
 | **fp8 variant: a chip with FP8 matmul** (v7x; v6e runs an fp8 x fp8 dot only at the bf16 rate). Without it the bf16 variant applies: automatic falls back, a pin raises | none: `common/quantized_matmul.py:111-112, 164` run the fp8 x fp8 dot on any chip | the chip, from JAX's chip table (`tpu_info.has_fp8_matmul`) |
 | No `layer_scale`, no sequence-parallel input | adapter:457-459 | this pattern's conformance check |
@@ -173,6 +174,43 @@ vLLM main checkout), for classes the static scan listed as plain pre-norm:
   attention forward copied verbatim into 17 classes (Llama's, in DeepSeek,
   ERNIE, Gemma, GLM-4, Mixtral, Qwen2-MoE and others).
 
+## Two kinds of test
+
+The runner splits the tests in two. With per-model patches the fusion and the
+model are one function, so every model needs its own numerics test of every
+fusion; here they are separate objects with a contract between them.
+
+- **Execution, model-free** ([`test_attention_runner.py`](../tests/blocks/test_attention_runner.py)):
+  `AttentionRunner` built from synthetic parts written in the test (an
+  RMSNorm with the `(x, residual)` contract, linears returning `(out, bias)`,
+  a NeoX rotary, a causal GQA core). Over every role configuration (per-head
+  q/k norm, output gate, GQA 1/4/8, head_dim 64/128, QKV bias, full or
+  partial RoPE, first layer or not): `_unfused` equals a straight-line
+  reference, and `_fused_qkv` equals `_unfused` (bit for bit for the
+  reference op). Also: the plan's choice (rule, fallback, pin, a pin that
+  cannot run raises) and `fused_qkv_supports` over synthetic attentions,
+  chips (v6e, 7x) and KV cache dtypes. It imports nothing from
+  `vllm.model_executor.models`, and `test_imports_no_model` checks that.
+- **Integration, per model** ([`test_norm_attn_integration.py`](../tests/blocks/test_norm_attn_integration.py)):
+  layers built on the meta device from tiny configs, for each declared
+  family. The declaration conforms (a layer that does not is named with
+  its edge and line, or the role property it lacks), the runner holds the
+  model's own part objects (`runner.qkv_proj is attention.qkv_proj`, no
+  copies, an unchanged `state_dict`), and the decoder routes through the
+  runner. Numerics: one smoke check, Llama against upstream.
+
+The argument is compositional: the runner correct for every role
+configuration, plus the model conforming, gives the model correct under
+every plan value, so test cost grows with fusions + models, not
+fusions x models.
+
+```text
+$ python -m pytest tests/blocks/test_attention_runner.py -q
+419 passed, 16 warnings in 8.41s
+$ python -m pytest tests/blocks/test_norm_attn_integration.py -q
+34 passed, 62 warnings in 17.03s
+```
+
 ## Running it
 
 On a CPU against vLLM v0.33.0 (`<vllm>`); nothing loads libtpu.
@@ -250,10 +288,11 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 JAX_PLATFORMS=cpu python -m pytest tests/blocks
 - **gpt-oss** conforms, and `fused_qkv` declines it (sinks): the runner runs
   unfused.
 - **CI.** Comment in `PLANT_MISMATCH = True` and the command exits 1.
-- **pytest.** `17 passed` (with the declared-blocks tests), including a
-  non-conforming declaration stopping startup, gpt-oss falling back
-  automatically, a pin to `fused_qkv` on gpt-oss stopping startup, the
-  source lookup, and the two scopes nesting on Qwen3.5.
+- **pytest.** `458 passed` in `tests/blocks` (with the declared-blocks
+  tests); the two kinds of test above, including a non-conforming
+  declaration stopping startup, gpt-oss falling back automatically, a pin
+  to `fused_qkv` on gpt-oss stopping startup, the source lookup, and the
+  two scopes nesting on Qwen3.5.
 
 ## On a TPU (v6e-8)
 
