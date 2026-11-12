@@ -105,6 +105,13 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnRoles:
     )
     meta = {"device": "meta", "dtype": torch.bfloat16}
     x = torch.empty(_TOKENS, hidden, **meta)
+    # The attention probe below runs attention's own children (RoPE, q/k
+    # norms), so its tensors live where attention's weights do.
+    param = next(attn.parameters(), None)
+    live = {
+        "device": param.device if param is not None else "meta",
+        "dtype": torch.bfloat16,
+    }
     args = (
         x,
         torch.empty_like(x),
@@ -169,9 +176,11 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnRoles:
     # and record every other op that touches the input.
     (qkv_name,) = qkv_proj_of(attn, hidden)
     proj = attn.get_submodule(qkv_name)
-    probe = torch.empty(_TOKENS, hidden, **meta)
-    by_source = {"normed": probe, hidden_p: probe, residual_p: args[1]}
-    by_source[positions_p] = args[2]
+    probe = torch.empty(_TOKENS, hidden, **live)
+    by_source = {"normed": probe, hidden_p: probe, residual_p: torch.empty_like(probe)}
+    by_source[positions_p] = torch.zeros(
+        _TOKENS, device=live["device"], dtype=torch.long
+    )
     call = {k: by_source[src] for k, src in attention_args}
     width = int(proj.output_size_per_partition)
     used: list[str] = []
@@ -179,7 +188,7 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnRoles:
 
     def projection(t: torch.Tensor) -> Any:  # noqa: ANN401
         projected.append(t is probe)
-        out = torch.empty(_TOKENS, width, **meta)
+        out = torch.empty(_TOKENS, width, **live)
         return (out, None) if getattr(proj, "return_bias", True) else out
 
     def core(q: torch.Tensor, *a: Any, **k: Any) -> torch.Tensor:  # noqa: ANN401
@@ -212,7 +221,7 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnRoles:
         try:
             attn(**call)
         except Exception as e:  # noqa: BLE001 - a forward that will not run here
-            raise _fail(layer, f"attention does not run on meta: {e}") from e
+            raise _fail(layer, f"attention does not run on a probe: {e}") from e
     if projected != [True]:
         raise _fail(layer, f"attention does not pass its input to {qkv_name} once")
     if used:
@@ -255,6 +264,16 @@ class NormThenAttention:
         roles = conform(layer, declaration)
         plan, source = plan_mod.resolve(context.subblock_plan)
         cls = type(layer).__qualname__
+        if plan.input_proj == "fused_qkv" and (
+            why := plan_mod.fused_qkv_supports(layer.get_submodule(roles.attention))
+        ):
+            if source == "user":  # A pin that cannot run raises at startup.
+                raise ValueError(
+                    f"TPU_SUBBLOCK_PLAN input_proj=fused_qkv on {cls}: {why}"
+                )
+            return Installed(
+                name, cls, f"conforms; input_proj=unfused (fused_qkv declined: {why})"
+            )
         if plan.input_proj == "unfused":
             return Installed(name, cls, f"conforms; input_proj=unfused ({source})")
         if isinstance(layer.get_submodule(roles.input_norm), AddOnly):

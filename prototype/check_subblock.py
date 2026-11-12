@@ -147,7 +147,8 @@ def _context(plan: str = "") -> blocks.InstallContext:
     )
 
 
-def family(spec: _build.Spec) -> list[str]:
+def family(spec: _build.Spec, declines: bool = False) -> list[str]:
+    """Conforms, installs and compares; ``declines``: fused_qkv must decline."""
     blocks.load_declarations()
     cls = getattr(__import__(spec.module, fromlist=["x"]), spec.layer_class)
     declaration = blocks.DECLARATIONS.get((cls, norm_then_attention))
@@ -174,6 +175,10 @@ def family(spec: _build.Spec) -> list[str]:
         f"fused calls {ran}; max |fused - upstream| {diff:.1e}"
     )
     torch.set_default_dtype(torch.bfloat16)
+    if declines:
+        if "declined" not in item.outcome or ran or diff:
+            return [f"{spec.name}: fused_qkv was expected to decline"]
+        return []
     if ran != 1 or diff > TOLERANCE:
         return [f"{spec.name}: fused calls {ran}, diff {diff:.1e}"]
     return []
@@ -186,7 +191,7 @@ def new_models() -> list[str]:
             f"    {c.family} ({c.repo}), not a #3096 target: declaration 1 call; "
             "per-model code 0"
         )
-        failures += family(_spec(c))
+        failures += family(_spec(c), declines=c.repo == "openai/gpt-oss-20b")
     return failures
 
 

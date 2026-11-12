@@ -28,6 +28,8 @@ override (``TPU_SUBBLOCK_PLAN``) comes first, as for every plan.
 import dataclasses
 from typing import Literal, get_args
 
+from torch import nn
+
 from vllm_torchtpu.layers.core.plan_marker import plan_of
 from vllm_torchtpu.layers.core.resolution import require_no_default
 
@@ -44,6 +46,21 @@ class NormAttnPlan:
 
 
 RULE = NormAttnPlan(input_proj="fused_qkv")
+
+
+def fused_qkv_supports(attention: nn.Module) -> str | None:
+    """Why ``fused_qkv`` cannot serve this attention, or None (its capability).
+
+    The value stands for PR #3096's kernel, which writes its output in the
+    batched ragged-paged-attention layout; attention that needs another
+    attention kernel cannot take it. The attention role answers: capability
+    flows up from the primitive to the plan.
+    """
+    if any(getattr(m, "sinks", None) is not None for m in attention.modules()):
+        return "attention sinks need RPA v3; fused_qkv writes the batched-RPA layout"
+    if getattr(attention, "head_dim", None) == 64:
+        return "head_dim 64 runs on RPA v3; fused_qkv writes the batched-RPA layout"
+    return None
 
 
 def resolve(override: str) -> tuple[NormAttnPlan, str]:
