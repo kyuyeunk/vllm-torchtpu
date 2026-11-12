@@ -1,4 +1,4 @@
-**Scopes group** (`prototype/scopes/`). Backs DATA_CONTRACTS.md section 5.3 (the declared block that carries #1492) and Appendix I.2. Siblings: `prototype/scopes/attention-layer-plan`, `prototype/scopes/fork-migration`.
+**Scopes group** (`prototype/scopes/`). Backs DATA_CONTRACTS.md section 5.3 (the declared block that carries #1492) and Appendix I.2. Sibling: `prototype/scopes/attention-layer-plan`.
 
 # Prototype: the attention-to-MoE overlap as a declared block
 
@@ -14,11 +14,11 @@ environment flag, and writing three children's decisions after they are built.
 
 | Claim | Code |
 |---|---|
-| The model owner declares, with a typed binding function | [`qwen3_5_block`](../src/vllm_torchtpu/models/vllm/qwen3_5/registration.py#L34-L62) in `registration.py` (L34-L62) |
+| The model owner declares, with a typed binding function | [`qwen3_5_block`](../src/vllm_torchtpu/models/vllm/qwen3_5/registration.py#L34-L62) in `qwen3_5/registration.py` (L34-L62); ten more models declare the same way, e.g. [`mixtral/registration.py`](../src/vllm_torchtpu/models/vllm/mixtral/registration.py) |
 | The declaration API and the installer | [`declare_block`](../src/vllm_torchtpu/blocks/__init__.py#L109-L125) in `__init__.py` (L109-L125) |
 |  | [`install`](../src/vllm_torchtpu/blocks/__init__.py#L193-L226) in `__init__.py` (L193-L226) |
-| A mismatch declines at startup: the layer keeps its upstream forward | the `except BlockConformanceError` in [`install`](../src/vllm_torchtpu/blocks/__init__.py#L215-L220) (L215-L220); shown by [`mismatch_declines`](../prototype/check_block.py#L156-L174) in `check_block.py` (L156-L174) |
-| CI fails on the same mismatch | [`conformance`](../prototype/check_block.py#L88-L100) in `check_block.py` (L88-L100), with `PLANT_MISMATCH` (L51-L52) declaring the misordered fixture; `test_mismatch_declines_at_install` in `tests/blocks/` |
+| A mismatch declines at startup: the layer keeps its upstream forward | the `except BlockConformanceError` in [`install`](../src/vllm_torchtpu/blocks/__init__.py#L215-L220) (L215-L220); shown by [`mismatch_declines`](../prototype/check_block.py#L160-L178) in `check_block.py` (L160-L178) |
+| CI fails on the same mismatch | [`conformance`](../prototype/check_block.py#L92-L104) in `check_block.py` (L92-L104), with `PLANT_MISMATCH` (L52-L53) declaring the misordered fixture; `test_mismatch_declines_at_install` in `tests/blocks/` |
 | The pattern | [`attn_then_moe`](../src/vllm_torchtpu/blocks/attn_moe/pattern.py#L54-L67) in `pattern.py` (L54-L67) |
 | The parts a binding function returns, kinds checked when built | [`AttnMoEParts`](../src/vllm_torchtpu/blocks/attn_moe/pattern.py#L136-L197) in `pattern.py` (L136-L197) |
 | How the layer's forward and its attention are called, with no parameter name read | [`Stream`](../src/vllm_torchtpu/blocks/stream.py#L36-L52) in `stream.py` (L36-L52) |
@@ -30,7 +30,9 @@ environment flag, and writing three children's decisions after they are built.
 | #1492's forward, on the declared parts | [`AttentionMoEBlock`](../src/vllm_torchtpu/blocks/attn_moe/forward.py#L37-L96) in `forward.py` (L37-L96) |
 | The runner hook | [`_install_blocks`](../src/vllm_torchtpu/runner/tpu_runner.py#L5786-L5806) in `tpu_runner.py` (L5786-L5806) |
 | The suggester proposes, never applies | [`propose`](../prototype/suggest_blocks.py#L84-L139) in `suggest_blocks.py` (L84-L139) |
-| An outside write raises | [`outside_write`](../prototype/check_block.py#L142-L153) in `check_block.py` (L142-L153) |
+| Every declared layer's forward equals upstream on a CPU (TP 1) | [`check`](../prototype/forward_equivalence.py#L160-L189) and the stand-ins [`_stand_ins`](../prototype/forward_equivalence.py#L93-L144) in `forward_equivalence.py` |
+| Nemotron-H's layer is built on a CPU to be checked | [`_gated_experts_on_cpu`](../prototype/_build.py#L105-L131) in `_build.py` (L105-L131) |
+| An outside write raises | [`outside_write`](../prototype/check_block.py#L146-L157) in `check_block.py` (L146-L157) |
 
 Here the model owner **declares** that its layer conforms to a pattern; the
 framework **checks** the declaration and **owns** what runs under it.
@@ -38,7 +40,7 @@ framework **checks** the declaration and **owns** what runs under it.
 ```mermaid
 flowchart LR
   D["models/vllm/qwen3_5/registration.py<br/>declare_block(...)<br/>(model owner)"] --> C{"conformance<br/>part kinds + graph<br/>vs the pattern"}
-  C -->|error: role edge + line| X["merge / startup fails"]
+  C -->|error: role edge + line| X["merge fails;<br/>startup declines"]
   C -->|parts| R{"plan per bucket<br/>user > model plan > rule > default"}
   R -->|all_reduce on every bucket| U["left as upstream built it"]
   R -->|overlap on some buckets| B["bind child contracts<br/>block forward"]
@@ -46,7 +48,7 @@ flowchart LR
 
 | File | Owner | What it holds |
 |---|---|---|
-| `models/vllm/qwen3_5/registration.py` | model | the declaration |
+| `models/vllm/<model>/registration.py` (eleven layer types, ten models) | model | the declaration |
 | `blocks/__init__.py` | framework | `declare_block`, `install` |
 | `blocks/parts.py` | framework | `BlockParts` (what a binding function returns), kind errors |
 | `blocks/stream.py` | framework | how a layer's forward and its attention are called (`Stream`, `Attend`), one helper per convention |
@@ -130,6 +132,7 @@ On a CPU against vLLM v0.33.0 (`<vllm>`); nothing loads libtpu.
 export PYTHONPATH=src:.:<vllm>
 python -m prototype.check_block
 python -m prototype.suggest_blocks
+python -m prototype.forward_equivalence
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 JAX_PLATFORMS=cpu python -m pytest tests/blocks
 ```
 
@@ -143,6 +146,15 @@ the read-only guard. Output (warnings omitted):
 1 conformance: declared layers and planted fixtures
     ok   declared Qwen3.5-MoE (full attention): conforms
     ok   declared Qwen3.5-MoE (linear attention): conforms
+    ok   declared Qwen3-Next: conforms
+    ok   declared Qwen3-MoE: conforms
+    ok   declared Qwen2-MoE: conforms
+    ok   declared GLM-4 MoE: conforms
+    ok   declared Mixtral: conforms
+    ok   declared MiniMax-M2: conforms
+    ok   declared Llama4 (MoE layer): conforms
+    ok   declared DeepSeek-V3: conforms
+    ok   declared Bailing-MoE: conforms
     ok   Qwen3.5 with layer_scale: declared attn_then_moe, but extra op aten.mul between attn and post_norm at qwen3_next.py:589
     ok   fixture Renamed: conforms
     ok   fixture ReorderedNorms: declared attn_then_moe, but role post_norm runs after the block input at fixtures.py:70, where the pattern does not call it
@@ -290,15 +302,86 @@ Jamba (attention layer) (vllm.model_executor.models.jamba.JambaAttentionDecoderL
 
 Jamba (Mamba layer) (vllm.model_executor.models.jamba.JambaMambaDecoderLayer)
   does not conform: declared attn_then_moe, but extra op aten.empty_like between in_norm and post_norm at jamba.py:174
+
+Nemotron-H (MoE layer) (vllm.model_executor.models.nemotron_h.NemotronHMoEDecoderLayer)
+  no binding: 1 norms called with a residual, 0 attention children, 1 MoE children
 ```
+
+Nemotron-H is built with its experts gated (SiLU) instead of non-gated
+(relu2), since no CPU MoE backend builds non-gated experts; the activation is
+inside the MoE child, an opaque role, so the verdict does not depend on it.
+Its MoE layer is a norm and a MoE mixer with attention in separate layers, a
+different block shape.
+
+Every layer proposed here is also declared in its model's
+`models/vllm/<model>/registration.py` and checked as a declaration by
+`check_block` and the merge gate.
+
+### `prototype.forward_equivalence`
+
+Each declared layer is built on the CPU at TP 1 in float32 with random weights
+and run twice on the same inputs: as upstream built it, and with the block
+forward installed under each plan value. The contract is the residual stream,
+so `hidden + residual` is compared. Attention (it needs a KV cache) and the
+MoE runner (vLLM's CPU MoE kernels are not built in this tree) are replaced by
+the same deterministic stand-ins in both runs; the norms, the residual
+handling, the router call and the overlap's arithmetic are real. At TP 1 the
+reduce-scatter and all-gather are identities, so the overlap's communication
+is not exercised.
+
+```
+=== block forward vs upstream forward, TP 1, CPU (relative max abs difference of hidden + residual; tolerance 1e-05)
+  Qwen3.5-MoE (full attention): equal (all_reduce 0.00e+00, reduce_scatter_all_gather 6.46e-08)
+  Qwen3.5-MoE (linear attention): equal (all_reduce 0.00e+00, reduce_scatter_all_gather 7.50e-08)
+  Qwen3-Next: equal (all_reduce 0.00e+00, reduce_scatter_all_gather 6.46e-08)
+  Qwen3-MoE: equal (all_reduce 0.00e+00, reduce_scatter_all_gather 9.70e-08)
+  Qwen2-MoE: equal (all_reduce 0.00e+00, reduce_scatter_all_gather 9.21e-08)
+  GLM-4 MoE: equal (all_reduce 0.00e+00, reduce_scatter_all_gather 1.01e-07)
+  Mixtral: equal (all_reduce 0.00e+00, reduce_scatter_all_gather 9.06e-08)
+  MiniMax-M2: equal (all_reduce 0.00e+00, reduce_scatter_all_gather 8.73e-08)
+  Llama4 (MoE layer): equal (all_reduce 0.00e+00, reduce_scatter_all_gather 1.03e-07)
+  GPT-OSS: not declared
+  DeepSeek-V3: equal (all_reduce 0.00e+00, reduce_scatter_all_gather 8.85e-08)
+  Bailing-MoE: equal (all_reduce 0.00e+00, reduce_scatter_all_gather 9.86e-08)
+  Kimi-Linear (nvidia): not declared
+  Jamba (attention layer): not declared
+  Jamba (Mamba layer): not declared
+  Nemotron-H (MoE layer): not declared
+```
+
+| Layer type | Declared | Conforms | Forward vs upstream (overlap plan) |
+|---|---|---|---|
+| Qwen3.5-MoE, full attention | yes | yes | 6.5e-08 |
+| Qwen3.5-MoE, linear attention | yes | yes | 7.5e-08 |
+| Qwen3-Next | yes | yes | 6.5e-08 |
+| Qwen3-MoE | yes | yes | 9.7e-08 |
+| Qwen2-MoE | yes | yes | 9.2e-08 |
+| GLM-4 MoE | yes | yes | 1.0e-07 |
+| Mixtral | yes | yes | 9.1e-08 |
+| MiniMax-M2 | yes | yes | 8.7e-08 |
+| Llama 4, MoE layer | yes | yes | 1.0e-07 |
+| DeepSeek-V3 | yes | yes | 8.9e-08 |
+| Bailing-MoE | yes | yes | 9.9e-08 |
+| GPT-OSS | no | no: extra `aten.alias` after the experts | — |
+| Kimi-Linear | no | no: the runner takes `shared_experts_input` | — |
+| Jamba, attention layer | no | no: no `RowParallelLinear` to the hidden size | — |
+| Jamba, Mamba layer | no | no: extra `aten.empty_like` between the norms | — |
+| Nemotron-H, MoE layer | no | no: no attention child | — |
+
+In bfloat16 the same comparison shows the overlap's numerics rather than its
+wiring: its different rounding of `attn + residual` flips a token's top-k
+expert choice for Qwen3.5's and Qwen3-Next's full-attention layers (stream
+difference 1.1e-01), and leaves 2.5e-03 to 5.0e-03 elsewhere. That is the
+mechanism behind #1492's drift on a TPU, so the wiring check runs in float32.
 
 ### `tests/blocks`
 
-The merge gate (every declaration conforms) and #1492's call-order and
-warmup-gate tests, ported to the parts-based forward:
+The merge gate (every declaration conforms, one case per surveyed layer;
+undeclared layers skip) and #1492's call-order and warmup-gate tests, ported
+to the parts-based forward:
 
 ```
-5 passed
+14 passed, 5 skipped
 ```
 
 ## TPU results
@@ -360,11 +443,12 @@ At concurrency 8 the spread between passes is larger than the differences.
 
 ## What this prototype does not show
 
-- **One model on a TPU.** Only Qwen3.5-35B-A3B-FP8 at TP 4 has run, and it
-  is the only declaration; the others `suggest_blocks` proposes are not
-  declared.
-- **Suggestions are built at TP 1.** A decision that depends on the real TP
-  size shows only in the startup check.
+- **One model on a TPU.** Only Qwen3.5-35B-A3B-FP8 at TP 4 has run. The other
+  ten declared models are verified on a CPU only: conformance as declarations
+  and the forward check at TP 1.
+- **Everything on a CPU is at TP 1, with stand-ins.** A decision that depends
+  on the real TP size shows only in the startup check, and the forward check
+  stands in for attention and the MoE runner.
 - **Conformance treats each role as its contract.** That attention ends in
   its output projection and that the runner returns `(tokens, hidden)` come
   from the part kinds, not from the graph.
@@ -374,6 +458,8 @@ At concurrency 8 the spread between passes is larger than the differences.
   construction-time contract scope, and upstream passing `reduce_results`
   through.
 - **Class rebinding** versus LoRA wrapping and compile caches is not audited.
+- **DeepSeek's `llama_4_scaling` is not carried.** The block passes its
+  attention None and refuses a call that passes a scaling.
 - **Production would also** check the stream contract on an exported decoder
-  stack, run the block under every plan value against upstream, and port the
-  rest of #1492's tests.
+  stack, run the block under every plan value against upstream on a TPU at
+  TP > 1 for each declared model, and port the rest of #1492's tests.
