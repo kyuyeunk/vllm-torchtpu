@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The norm_then_attention sub-block: declarations conform, mismatches decline."""
+"""norm_then_attention: declarations conform; one AttentionRunner runs them."""
 
 import pytest
 import torch
@@ -34,8 +34,8 @@ def test_every_declaration_conforms(spec: _build.Spec) -> None:
     assert roles.qkv_proj == "self_attn.qkv_proj"
 
 
-def test_fused_value_matches_upstream() -> None:
-    """The one fused value runs and matches upstream on every family."""
+def test_runner_matches_upstream() -> None:
+    """The runner's unfused composition equals upstream, and its fused value runs."""
     assert all(not check_subblock.family(spec) for spec in check_subblock.FAMILIES)
 
 
@@ -98,3 +98,27 @@ def test_fp8_pin_on_a_chip_without_fp8_matmul_stops_startup() -> None:
         pytest.raises(ValueError, match="chip v6e has none"),
     ):
         impl.install("l", layer, declaration, context)
+
+
+def test_installed_forward_has_source() -> None:
+    """torch.compile's AOT cache needs source for every code object it traces."""
+    for spec in check_subblock.FAMILIES:
+        assert check_subblock._source_less(spec) == []  # noqa: SLF001
+
+
+def test_scopes_nest_on_qwen3_5() -> None:
+    """Qwen3.5 declares both scopes; the block runs its front half in the runner."""
+    layer = _build.build(check_subblock.FAMILIES[2])  # Qwen3.5-MoE, full attention
+    context = blocks.InstallContext(
+        tp=4,
+        dtype="bfloat16",
+        buckets=(16, 8192),
+        override="collectives=reduce_scatter_all_gather",
+        model_plan="",
+    )
+    with set_current_vllm_config(_build.current_config()):
+        report = blocks.install(torch.nn.ModuleDict({"l": layer}), context)
+    outcomes = [item.outcome for item in report]
+    assert len(outcomes) == 2, outcomes
+    assert outcomes[1].startswith("runner inside block"), outcomes
+    assert layer.__dict__["_norm_attn_runner"].input_proj == "fused_qkv"

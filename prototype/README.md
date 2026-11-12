@@ -49,7 +49,7 @@ local scratch build, not on this branch).
 | The one fused value: two rewired roles | [`AddOnly`](../src/vllm_torchtpu/blocks/norm_attn/forward.py#L35-L49), [`FusedNormProjection`](../src/vllm_torchtpu/blocks/norm_attn/forward.py#L52-L70), [`install_fused_qkv`](../src/vllm_torchtpu/blocks/norm_attn/forward.py#L73-L82) |
 | Scopes nest: several patterns per class | [`declarations_for`](../src/vllm_torchtpu/blocks/__init__.py#L84-L86) |
 | One call per model | [GLM-4.5/4.6](../src/vllm_torchtpu/models/vllm/glm4_moe/registration.py#L21), [Mistral](../src/vllm_torchtpu/models/vllm/mistral/registration.py#L21), [Llama](../src/vllm_torchtpu/models/vllm/llama/registration.py#L21), [Qwen3](../src/vllm_torchtpu/models/vllm/qwen3/registration.py#L21), [gpt-oss](../src/vllm_torchtpu/models/vllm/gpt_oss/registration.py#L21-L25), [Qwen3-MoE](../src/vllm_torchtpu/models/vllm/qwen3_moe/registration.py#L21), [Qwen3.5](../src/vllm_torchtpu/models/vllm/qwen3_5/registration.py#L43-L48) |
-| Per model: conforms, fused value matches upstream | [`family`](check_subblock.py#L169-L203), [`new_models`](check_subblock.py#L206-L214) |
+| Per model: conforms, fused value matches upstream | [`family`](check_subblock.py#L171-L203), [`new_models`](check_subblock.py#L206-L214) |
 | The planted non-conforming declaration | [`ScaledAttention`](check_subblock.py#L103-L111), [`planted`](check_subblock.py#L217-L243) |
 | The count against #3096 | [`PR_3096`](check_subblock.py#L248-L271) |
 | Reach over current models, from real configs | [`CANDIDATES`](subblock_reach.py#L62-L192), [`MAIN_CANDIDATES`](subblock_reach.py#L198-L254), [`check`](subblock_reach.py#L332-L358) |

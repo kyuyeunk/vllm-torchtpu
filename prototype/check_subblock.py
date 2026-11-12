@@ -27,6 +27,7 @@ anything is not as expected.
 """
 
 import dataclasses
+import inspect
 import sys
 
 import torch
@@ -42,7 +43,7 @@ from prototype import _build, subblock_reach
 from vllm_torchtpu import blocks
 from vllm_torchtpu.blocks import norm_attn
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
-from vllm_torchtpu.blocks.norm_attn import forward as fwd
+from vllm_torchtpu.blocks.norm_attn import runner as runner_mod
 from vllm_torchtpu.blocks.norm_attn.pattern import norm_then_attention
 
 # Comment in to see CI fail: the planted layer becomes a declared model.
@@ -91,6 +92,7 @@ NEW_MODELS = tuple(
         "openai/gpt-oss-20b",
         "mistralai/Ministral-8B-Instruct-2410",
         "Qwen/Qwen3-32B",
+        "zai-org/GLM-4.5-Air",
     )
 )
 
@@ -109,6 +111,24 @@ class ScaledAttention(LlamaDecoderLayer):
         hidden_states = hidden_states * 2.0
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         return self.mlp(hidden_states), residual
+
+
+class ScaledQueryAttention(LlamaDecoderLayer):
+    """Planted: its attention scales q after RoPE (see ``_scale_query``)."""
+
+
+def _scale_query(attn: nn.Module) -> None:
+    """Gives ``attn`` a forward the runner does not compute: q * 0.5 after RoPE."""
+
+    def forward(positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        qkv, _ = attn.qkv_proj(hidden_states)
+        q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+        q, k = attn.rotary_emb(positions, q, k)
+        q = q * 0.5
+        out, _ = attn.o_proj(attn.attn(q, k, v))
+        return out
+
+    attn.forward = forward
 
 
 def _core(heads: int, kv_heads: int, head_dim: int):  # noqa: ANN202
@@ -167,16 +187,10 @@ def _context(plan: str = "", chip: str = "") -> blocks.InstallContext:
     )
 
 
-def family(spec: _build.Spec, declines: bool = False) -> list[str]:
-    """Conforms, installs and compares; ``declines``: fused_qkv must decline."""
-    blocks.load_declarations()
-    cls = getattr(__import__(spec.module, fromlist=["x"]), spec.layer_class)
-    declaration = blocks.DECLARATIONS.get((cls, norm_then_attention))
-    if declaration is None:
-        return [f"{spec.name}: not declared"]
-    meta = _build.build(spec)
-    with set_current_vllm_config(_build.current_config()):
-        norm_attn.conform(meta, declaration)
+def _install_and_run(
+    spec: _build.Spec, declaration: blocks.BlockDeclaration, plan: str
+) -> tuple[str, int, float]:
+    """Installs the runner on a fresh CPU layer; (outcome, fused runs, max diff)."""
     torch.set_default_dtype(torch.float32)
     layer = _runnable(spec)
     t = 6
@@ -184,24 +198,59 @@ def family(spec: _build.Spec, declines: bool = False) -> list[str]:
     call = {"positions": torch.arange(t), "hidden_states": hidden, "residual": residual}
     with set_current_vllm_config(_build.current_config()), torch.no_grad():
         want = layer(**call)
-        before = fwd.FUSED_CALLS.get(cls.__qualname__, 0)
+        before = runner_mod.FUSED_CALLS.get("l", 0)
         impl = blocks.IMPLEMENTATIONS[norm_then_attention]
-        item = impl.install("l", layer, declaration, _context())
+        item = impl.install("l", layer, declaration, _context(plan))
         got = layer(**call)
-    ran = fwd.FUSED_CALLS.get(cls.__qualname__, 0) - before
+    ran = runner_mod.FUSED_CALLS.get("l", 0) - before
     diff = max((g - w).abs().max().item() for g, w in zip(got, want, strict=True))
-    print(
-        f"    {spec.name:30} declared -> conforms -> {item.outcome}; "
-        f"fused calls {ran}; max |fused - upstream| {diff:.1e}"
-    )
     torch.set_default_dtype(torch.bfloat16)
+    return item.outcome, ran, diff
+
+
+def family(spec: _build.Spec, declines: bool = False) -> list[str]:
+    """Conforms, then runs the runner both ways against upstream.
+
+    A: the runner's unfused composition (pinned) against the model's own
+    forward, identical. B: the rule's value (``fused_qkv`` where the
+    capability allows) through the same runner. ``declines``: fused_qkv must
+    fall back to unfused.
+    """
+    blocks.load_declarations()
+    cls = getattr(__import__(spec.module, fromlist=["x"]), spec.layer_class)
+    declaration = blocks.DECLARATIONS.get((cls, norm_then_attention))
+    if declaration is None:
+        return [f"{spec.name}: not declared"]
+    meta = _build.build(spec)
+    with set_current_vllm_config(_build.current_config()):
+        roles = norm_attn.conform(meta, declaration)
+    _, ran_a, diff_a = _install_and_run(spec, declaration, "input_proj=unfused")
+    outcome, ran, diff = _install_and_run(spec, declaration, "")
+    print(
+        f"    {spec.name:30} declared -> conforms ({_props(roles.config)})\n"
+        f"    {'':30}   A runner unfused vs upstream: max diff {diff_a:.1e}\n"
+        f"    {'':30}   B {outcome}; fused runs {ran}; max diff {diff:.1e}"
+    )
+    failures = []
+    if ran_a or diff_a:
+        failures.append(
+            f"{spec.name}: runner unfused differs from upstream ({diff_a:.1e})"
+        )
     if declines:
-        if "declined" not in item.outcome or ran or diff:
-            return [f"{spec.name}: fused_qkv was expected to decline"]
-        return []
-    if ran != 1 or diff > TOLERANCE:
-        return [f"{spec.name}: fused calls {ran}, diff {diff:.1e}"]
-    return []
+        if "input_proj=unfused" not in outcome or ran or diff:
+            failures.append(f"{spec.name}: fused_qkv was expected to fall back")
+    elif ran != 1 or diff > TOLERANCE:
+        failures.append(f"{spec.name}: fused runs {ran}, diff {diff:.1e}")
+    return failures
+
+
+def _props(c: runner_mod.AttnConfig) -> str:
+    gqa = f"{c.num_heads}q/{c.num_kv_heads}kv x {c.head_dim}"
+    return ", ".join(
+        [gqa]
+        + (["per-head q/k norm"] if c.qk_norm else [])
+        + (["output gate"] if c.output_gate else [])
+    )
 
 
 def new_models() -> list[str]:
@@ -216,10 +265,22 @@ def new_models() -> list[str]:
 
 
 def planted() -> list[str]:
+    failures = []
+    for cls, where in (
+        (ScaledAttention, "the layer"),
+        (ScaledQueryAttention, "attention"),
+    ):
+        failures += _planted(cls, where)
+    return failures
+
+
+def _planted(planted_cls: type, where: str) -> list[str]:
     layer = _build.build(FAMILIES[0])
-    layer.__class__ = ScaledAttention
+    layer.__class__ = planted_cls
+    if planted_cls is ScaledQueryAttention:
+        _scale_query(layer.self_attn)
     declaration = blocks.BlockDeclaration(
-        ScaledAttention,
+        planted_cls,
         norm_then_attention,
         {
             "in_norm": "input_layernorm",
@@ -229,19 +290,75 @@ def planted() -> list[str]:
         },
         lambda _: True,
     )
-    key = (ScaledAttention, norm_then_attention)
+    key = (planted_cls, norm_then_attention)
     blocks.DECLARATIONS[key] = declaration
     try:
         with set_current_vllm_config(_build.current_config()):
             blocks.install(nn.ModuleDict({"l": layer}), _context())
     except BlockConformanceError as e:
-        print(f"    startup error: {e}")
+        print(f"    planted in {where}: startup error: {e}")
         if PLANT_MISMATCH:  # CI: the planted layer counts as a declared model.
-            return ["declared ScaledAttention (planted) does not conform"]
+            return [f"declared {planted_cls.__name__} (planted) does not conform"]
         return []
     finally:
         del blocks.DECLARATIONS[key]
-    return ["the planted declaration did not stop startup"]
+    return [f"the planted {planted_cls.__name__} declaration did not stop startup"]
+
+
+def _source_less(spec: _build.Spec) -> list[str]:
+    """Code objects the installed forward runs whose source cannot be found.
+
+    torch.compile's AOT cache (``torch/_dynamo/package.py``, ``add_code``)
+    calls ``inspect.getsourcelines`` on every code object it traces; one
+    without a source file (``exec``, ``compile``, a generated method) fails
+    the compile on the TPU. This runs the same lookup on a CPU.
+    """
+    blocks.load_declarations()
+    cls = getattr(__import__(spec.module, fromlist=["x"]), spec.layer_class)
+    declaration = blocks.DECLARATIONS[(cls, norm_then_attention)]
+    torch.set_default_dtype(torch.float32)
+    layer = _runnable(spec)
+    t = 6
+    call = {
+        "positions": torch.arange(t),
+        "hidden_states": torch.randn(t, HIDDEN),
+        "residual": torch.randn(t, HIDDEN),
+    }
+    codes: set = set()
+
+    def tracer(frame, event, arg):  # noqa: ANN001, ANN202
+        if event == "call":
+            codes.add(frame.f_code)
+        return None
+
+    with set_current_vllm_config(_build.current_config()), torch.no_grad():
+        impl = blocks.IMPLEMENTATIONS[norm_then_attention]
+        impl.install("l", layer, declaration, _context())
+        sys.settrace(tracer)
+        try:
+            layer(**call)
+            layer(**{**call, "residual": None})  # the first layer
+        finally:
+            sys.settrace(None)
+    torch.set_default_dtype(torch.bfloat16)
+    missing = []
+    for code in codes:
+        if code.co_filename.startswith("<frozen "):
+            continue  # Frozen stdlib (os.getenv); dynamo never traces into it.
+        try:
+            inspect.getsourcelines(code)
+        except (OSError, TypeError):
+            missing.append(f"{code.co_filename}:{code.co_firstlineno} {code.co_name}")
+    return sorted(missing)
+
+
+def source_lookup() -> list[str]:
+    failures = []
+    for spec in (*FAMILIES, *(_spec(c) for c in NEW_MODELS)):
+        missing = _source_less(spec)
+        print(f"    {spec.name:30} {len(missing)} code object(s) without source")
+        failures += [f"{spec.name}: {m}" for m in missing]
+    return failures
 
 
 # Counted from PR #3096's diff (vllm-project/vllm-torchtpu#3096, open), which
@@ -276,7 +393,7 @@ def counts() -> list[str]:
     for what, items in PR_3096.items():
         print(f"    #3096 {what}: {len(items)}")
     print(
-        "    here: 1 plan value (FusedNormProjection), 7 declarations, "
+        "    here: 1 forward (AttentionRunner) with 1 fused branch, 7 declarations, "
         "1 conformance check (norm_attn.conform)"
     )
     return []
@@ -293,7 +410,7 @@ def _run(check, title: str) -> bool:  # noqa: ANN001
 
 def main() -> None:
     ok = True
-    print("1 each family: declared -> conforms -> fused_qkv, against upstream")
+    print("1 each family: declared -> conforms -> AttentionRunner, against upstream")
     failures = []
     for spec in FAMILIES:
         try:
@@ -307,6 +424,10 @@ def main() -> None:
     ok &= _run(new_models, "2 current models #3096 does not target, real configs")
     ok &= _run(planted, "3 a declaration that does not conform stops startup")
     ok &= _run(counts, "4 the same fusion as #3096, by count")
+    ok &= _run(
+        source_lookup,
+        "5 every code object the installed forward runs has source (for torch.compile)",
+    )
     sys.exit(0 if ok else 1)
 
 
