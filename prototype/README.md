@@ -40,7 +40,7 @@ kernel. Its point is the route, not the speed.
 | Install, declining a mismatch | [`NormThenAttention.install`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L213-L237) |
 | Scopes nest: several patterns per class | [`declarations_for`](../src/vllm_torchtpu/blocks/__init__.py#L84-L87) |
 | The three declarations | [Llama](../src/vllm_torchtpu/models/vllm/llama/registration.py#L21-L30), [Qwen3-MoE](../src/vllm_torchtpu/models/vllm/qwen3_moe/registration.py#L21-L30), [Qwen3.5](../src/vllm_torchtpu/models/vllm/qwen3_5/registration.py#L43-L54) |
-| Per family: conforms, fused value matches upstream | [`family`](check_subblock.py#L129-L158) |
+| Per family: conforms, fused value matches upstream | [`family`](check_subblock.py#L131-L158) |
 | The planted mismatch | [`ScaledAttention`](check_subblock.py#L64-L72), [`planted`](check_subblock.py#L161-L188) |
 | The count against #3096 | [`PR_3096`](check_subblock.py#L192-L215) |
 

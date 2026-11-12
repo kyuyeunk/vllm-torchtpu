@@ -32,11 +32,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from vllm.config import set_current_vllm_config
+from vllm.model_executor.layers import rotary_embedding
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.models.llama import LlamaDecoderLayer
 
-from prototype import _build
+from prototype import _build, subblock_reach
 from vllm_torchtpu import blocks
 from vllm_torchtpu.blocks import norm_attn
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
@@ -59,6 +60,25 @@ FAMILIES = (
     next(s for s in _build.SPECS if s.name == "Qwen3-MoE"),
     _build.SPECS[0],  # Qwen3.5-MoE, full attention
 )
+
+
+# Current models #3096 does not target, from their real configs (shrunk):
+# each gets the fusion from one declare_block call in its registration.py.
+NEW_MODELS = tuple(
+    c
+    for c in subblock_reach.CANDIDATES
+    if c.repo
+    in (
+        "openai/gpt-oss-20b",
+        "mistralai/Ministral-8B-Instruct-2410",
+        "Qwen/Qwen3-32B",
+    )
+)
+
+
+def _spec(c: subblock_reach.Candidate) -> _build.Spec:
+    cfg = subblock_reach._config(c)  # noqa: SLF001 - the shrunk real config
+    return _build.Spec(c.repo, lambda: cfg, c.module, c.layer_class, c.extra, c.model)
 
 
 class ScaledAttention(LlamaDecoderLayer):
@@ -103,6 +123,7 @@ def _runnable(spec: _build.Spec) -> nn.Module:
     RoPE, gates and the output projection.
     """
     torch.manual_seed(0)
+    rotary_embedding._ROPE_DICT.clear()  # noqa: SLF001 - drop meta-device ropes
     layer = _build.build(spec, device="cpu")
     for p in layer.parameters():
         nn.init.normal_(p, std=0.05)
@@ -156,6 +177,17 @@ def family(spec: _build.Spec) -> list[str]:
     if ran != 1 or diff > TOLERANCE:
         return [f"{spec.name}: fused calls {ran}, diff {diff:.1e}"]
     return []
+
+
+def new_models() -> list[str]:
+    failures = []
+    for c in NEW_MODELS:
+        print(
+            f"    {c.family} ({c.repo}), not a #3096 target: declaration 1 call; "
+            "per-model code 0"
+        )
+        failures += family(_spec(c))
+    return failures
 
 
 def planted() -> list[str]:
@@ -219,7 +251,7 @@ def counts() -> list[str]:
     for what, items in PR_3096.items():
         print(f"    #3096 {what}: {len(items)}")
     print(
-        "    here: 1 plan value (fused_norm_add_qkv), 3 declarations, "
+        "    here: 1 plan value (fused_norm_add_qkv), 6 declarations, "
         "1 conformance check (norm_attn.conform)"
     )
     return []
@@ -247,8 +279,9 @@ def main() -> None:
         print(f"    FAIL {failure}")
     print("  -> " + ("FAIL" if failures else "PASS"))
     ok &= not failures
-    ok &= _run(planted, "2 a layer that does not conform is declined")
-    ok &= _run(counts, "3 the same fusion as #3096, by count")
+    ok &= _run(new_models, "2 current models #3096 does not target, real configs")
+    ok &= _run(planted, "3 a layer that does not conform is declined")
+    ok &= _run(counts, "4 the same fusion as #3096, by count")
     sys.exit(0 if ok else 1)
 
 
