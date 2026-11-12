@@ -1,0 +1,12 @@
+{
+  // The strict type gate for the framework's blocks/ (all checks on).
+  "typeCheckingMode": "all",
+  "pythonVersion": "3.12",
+  "venvPath": "/home/kyuyeunk_google_com/workspace/vllm-torchtpu",
+  "venv": ".venv",
+  "include": ["src/vllm_torchtpu/blocks"],
+  "extraPaths": ["/mnt/disks/persist/data-contracts-val/vllm-v0.33.0", "src", "."],
+  // Conflicts with ruff's ISC003 (explicit concatenation of literals), as
+  // ruff's own COM812/ISC001 conflict with ruff format; ruff owns the rule.
+  "reportImplicitStringConcatenation": false
+}

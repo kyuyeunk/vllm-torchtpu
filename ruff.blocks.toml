@@ -1,0 +1,19 @@
+# Strict gate for src/vllm_torchtpu/blocks and tests/blocks: every rule, minus the pairs ruff documents as conflicting.
+line-length = 88
+target-version = "py312"
+
+[lint]
+select = ["ALL"]
+ignore = [
+    "COM812",  # conflicts with ruff format
+    "ISC001",  # conflicts with ruff format
+    "D203",    # conflicts with D211
+    "D213",    # conflicts with D212
+]
+
+[lint.pydocstyle]
+convention = "google"
+
+[lint.per-file-ignores]
+# pytest's idiom is the bare assert, and tests/ directories are not packages.
+"tests/**" = ["S101", "INP001"]
