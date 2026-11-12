@@ -55,11 +55,8 @@ def test_every_declaration_conforms(spec: _build.Spec) -> None:
 def test_mismatch_stops_startup(monkeypatch: pytest.MonkeyPatch) -> None:
     """A declared layer that does not conform is a startup error."""
     layer = fixtures.ReorderedNorms(_build.build(_build.SPECS[0]))
-    declaration = blocks.BlockDeclaration(
-        fixtures.ReorderedNorms,
-        pattern_mod.attn_then_moe,
-        fixtures.RENAMED_ROLES,
-        lambda _: True,
+    declaration = blocks.BlockDeclaration.of(
+        fixtures.ReorderedNorms, fixtures.renamed_parts
     )
     monkeypatch.setitem(
         blocks.DECLARATIONS,
@@ -126,11 +123,11 @@ def test_block_builds_attention_with_its_contract(spec: _build.Spec) -> None:
     assert "output_reduced=False" in outcomes[0], outcomes
     assert type(layer) is cls  # No mixin, no __class__ rebinding.
     runner = _block_runner(layer)
-    front = runner.front
-    assert isinstance(front, AttentionRunner)
-    assert front.output_reduced is False
-    assert front.o_proj is attention.o_proj
-    assert front.qkv_proj is attention.qkv_proj
+    attention_part = runner.attention
+    assert isinstance(attention_part, AttentionRunner)
+    assert attention_part.output_reduced is False
+    assert attention_part.o_proj is attention.o_proj
+    assert attention_part.qkv_proj is attention.qkv_proj
     assert attention.o_proj.reduce_results is True  # Not written.
     assert runner.post_norm is layer.get_submodule("post_attention_layernorm")
     assert runner.router is layer.get_submodule("mlp.gate")
@@ -142,12 +139,12 @@ def test_block_builds_attention_with_its_contract(spec: _build.Spec) -> None:
     assert experts.moe_config.skip_final_all_reduce is True
 
 
-def test_model_attention_front_keeps_the_interim_write() -> None:
+def test_model_attention_fallback_keeps_the_interim_write() -> None:
     """Qwen3.5's linear attention declares no sub-block: its o_proj is written."""
     layer = _build.build(QWEN3_5_LINEAR)
     contract_adapter.LEDGER.clear()
     _install(layer, _context())
-    assert isinstance(_block_runner(layer).front, ModelAttention)
+    assert isinstance(_block_runner(layer).attention, ModelAttention)
     assert ("out_proj", "reduce_results") in {
         (e.child, e.field) for e in contract_adapter.LEDGER
     }

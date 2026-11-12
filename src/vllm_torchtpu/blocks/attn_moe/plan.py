@@ -36,11 +36,13 @@ rule picks that cannot run falls back to the default with the reason.
 """
 
 import dataclasses
-from typing import Literal, get_args
+from typing import TYPE_CHECKING, Literal, get_args
 
-from vllm_torchtpu.blocks.attn_moe.pattern import BlockKey
 from vllm_torchtpu.layers.core.plan_marker import plan_of
 from vllm_torchtpu.layers.core.resolution import require_no_default
+
+if TYPE_CHECKING:  # pattern imports the runner, which imports this module
+    from vllm_torchtpu.blocks.attn_moe.pattern import BlockKey
 
 Collectives = Literal["all_reduce", "reduce_scatter_all_gather"]
 Source = Literal["user", "model plan", "rule", "default"]
@@ -91,12 +93,12 @@ DEFAULT = AttnMoEBlockPlan("all_reduce")
 OVERLAP = AttnMoEBlockPlan("reduce_scatter_all_gather")
 
 
-def min_tokens(key: BlockKey) -> int:
+def min_tokens(key: "BlockKey") -> int:
     """Smallest bucket at which the rule picks the overlap."""
     return MIN_PER_CHIP_BYTES * key.tp // (key.hidden * _ELEMENT_SIZE[key.dtype])
 
 
-def declines(plan: AttnMoEBlockPlan, key: BlockKey) -> list[str]:
+def declines(plan: AttnMoEBlockPlan, key: "BlockKey") -> list[str]:
     """Why ``plan`` cannot run for this block; empty when it can."""
     if plan.collectives == "all_reduce":
         return []
@@ -123,7 +125,7 @@ def _parse(text: str, source: str) -> Collectives | None:
 
 
 def resolve_table(
-    key: BlockKey,
+    key: "BlockKey",
     buckets: tuple[int, ...],
     override: str = "",
     model_plan: str = "",

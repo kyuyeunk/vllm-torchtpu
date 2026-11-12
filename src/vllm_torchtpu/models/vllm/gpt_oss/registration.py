@@ -13,13 +13,18 @@
 # limitations under the License.
 """gpt-oss (OpenAI)'s block declarations. Owned by its model owner."""
 
-from vllm.model_executor.models.gpt_oss import TransformerBlock
+from vllm.model_executor.models.gpt_oss import OAIAttention, TransformerBlock
 
 from vllm_torchtpu.blocks import declare_block
-from vllm_torchtpu.blocks.norm_attn.pattern import PRE_NORM_ROLES, norm_then_attention
+from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnParts, pre_norm_parts
+from vllm_torchtpu.blocks.parts import as_kind
 
-declare_block(
-    TransformerBlock,
-    pattern=norm_then_attention,
-    roles=PRE_NORM_ROLES | {"attn": "attn"},
-)
+
+@declare_block(TransformerBlock)
+def gpt_oss_attention(layer: TransformerBlock) -> NormAttnParts:
+    """The pre-norm attention sub-block; gpt-oss names its attention ``attn``.
+
+    gpt-oss builds ``attn`` from a class attribute (``attention_cls``), so
+    the binding names the class it covers.
+    """
+    return pre_norm_parts(layer, as_kind(layer.attn, OAIAttention))

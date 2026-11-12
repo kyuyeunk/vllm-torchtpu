@@ -42,38 +42,36 @@ from vllm_torchtpu.blocks.attn_moe.contract_adapter import (
     bind_child_contracts,
 )
 from vllm_torchtpu.blocks.attn_moe.pattern import (
+    AttnMoEParts,
     AttnMoERoles,
     attn_then_moe,
     block_key,
-    check_roles,
     moe_explicit_router,
-    moe_parts,
     moe_runner_router,
     out_proj_of,
 )
 from vllm_torchtpu.blocks.attn_moe.runner import AttnMoERunner, ModelAttention
 from vllm_torchtpu.blocks.norm_attn import plan as subblock_plan
 from vllm_torchtpu.blocks.norm_attn.pattern import norm_then_attention
+from vllm_torchtpu.blocks.parts import attribute_of
 from vllm_torchtpu.blocks.stream import StreamParams, route
 from vllm_torchtpu.logger import init_logger
 
-_STREAM = {"hidden": ("hidden_states", "x"), "residual": ("residual",)}
-_POSITIONS = ("positions", "position_ids")
 _TOKENS = 8
 _conformed: dict[tuple[object, ...], AttnMoERoles] = {}
 
 
 def _stream_params(layer: nn.Module) -> tuple[str, str, str]:
-    params = inspect.signature(layer.forward).parameters
-    hidden = next((p for p in _STREAM["hidden"] if p in params), "")
-    residual = next((p for p in _STREAM["residual"] if p in params), "")
-    positions = next((p for p in _POSITIONS if p in params), "")
+    params = inspect.signature(type(layer).forward).parameters
+    hidden = next((p for p in ("hidden_states", "x") if p in params), "")
+    residual = "residual" if "residual" in params else ""
+    positions = next((p for p in ("positions", "position_ids") if p in params), "")
     required = [
         p
         for p, v in params.items()
         if v.default is inspect.Parameter.empty
         and v.kind not in (v.VAR_KEYWORD, v.VAR_POSITIONAL)
-        and p not in (hidden, residual, positions)
+        and p not in ("self", hidden, residual, positions)
     ]
     if not hidden or not residual or required:
         raise conf.BlockConformanceError(
@@ -92,39 +90,57 @@ def _norm_stub(role: str):  # noqa: ANN202
     return stub
 
 
+def declared_parts(layer: nn.Module, declaration: BlockDeclaration) -> AttnMoEParts:
+    """The parts the binding function returns for ``layer``.
+
+    Raises:
+        BlockConformanceError: The function returns None or other parts, or a
+            part is the wrong kind (named by its attribute).
+    """
+    parts = declaration.parts(layer)
+    if not isinstance(parts, AttnMoEParts):
+        raise conf.BlockConformanceError(
+            f"{declaration.parts_of.__qualname__} returns {type(parts).__name__} "
+            "for this layer, not AttnMoEParts"
+        )
+    return parts
+
+
 def conform(layer: nn.Module, declaration: BlockDeclaration) -> AttnMoERoles:
     """Checks a declared layer against attn_then_moe; returns its roles.
 
+    The parts' kinds are checked when the binding function builds them; this
+    checks the wiring: the layer's forward and its MoE child's forward.
+
     Raises:
-        BlockConformanceError: The roles are the wrong kinds, or the layer's
+        BlockConformanceError: A part is the wrong kind, or the layer's
             forward or its MoE child's forward computes another graph.
     """
+    parts = declared_parts(layer, declaration)
     binding = declaration.bind(layer)
     # Layers of one class differ in flags their forward branches on
     # (layer_type, layer_scale); those are bool or str attributes.
     flags = tuple(
         sorted((k, v) for k, v in vars(layer).items() if isinstance(v, (bool, str)))
     )
-    cache_key = (type(layer), tuple(sorted(binding.items())), flags)
+    # Layers of one class built at other sizes (another config) differ in
+    # their parameters' shapes, which the roles' config is read from.
+    shapes = tuple((n, tuple(t.shape)) for n, t in layer.named_parameters())
+    cache_key = (type(layer), tuple(sorted(binding.items())), flags, shapes)
     if cache_key in _conformed:
         return _conformed[cache_key]
-    if problems := check_roles(layer, binding):
-        raise conf.BlockConformanceError(
-            f"declared attn_then_moe on {type(layer).__qualname__}, but "
-            + "; ".join(problems)
-        )
     hidden_p, residual_p, positions_p = _stream_params(layer)
-    moe = layer.get_submodule(binding["moe"])
-    runner_name, router_name = moe_parts(moe)
-    runner, router = moe.get_submodule(runner_name), moe.get_submodule(router_name)
+    moe, runner, router = parts.moe, parts.experts, parts.router
+    runner_name = attribute_of(moe, runner, "experts")
+    router_name = attribute_of(moe, router, "router")
     width = int(router.output_size)
     hidden = int(router.input_size)
     meta = {"device": "meta", "dtype": torch.bfloat16}
     x = torch.empty(_TOKENS, hidden, **meta)
-    attn = layer.get_submodule(binding["attn"])
+    attn = parts.attention
     attn_params = list(inspect.signature(attn.forward).parameters)
     attn_input = next(
-        (p for p in _STREAM["hidden"] if p in attn_params), attn_params[0]
+        (p for p in ("hidden_states", "x") if p in attn_params), attn_params[0]
     )
     seen: dict[str, Any] = {}
 
@@ -162,9 +178,9 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> AttnMoERoles:
         return out
 
     stubs = {
-        binding["in_norm"]: recording_in_norm,
+        binding["input_norm"]: recording_in_norm,
         binding["post_norm"]: _norm_stub("post_norm"),
-        binding["attn"]: attn_stub,
+        binding["attention"]: attn_stub,
         binding["moe"]: lambda hidden_states, *a, **k: conf.ops.unary(
             hidden_states, "moe"
         ),
@@ -232,10 +248,10 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> AttnMoERoles:
         if isinstance(v, torch.Tensor):
             attention_args.append((k, sources[id(v)]))
     roles = AttnMoERoles(
-        input_norm=binding["in_norm"],
+        input_norm=binding["input_norm"],
         post_norm=binding["post_norm"],
-        attention=binding["attn"],
-        out_proj=f"{binding['attn']}.{out_proj_of(attn, hidden)}",
+        attention=binding["attention"],
+        out_proj=f"{binding['attention']}.{out_proj_of(attn, hidden)}",
         moe=binding["moe"],
         experts=f"{binding['moe']}.{runner_name}",
         router=f"{binding['moe']}.{router_name}",
@@ -269,31 +285,30 @@ def _summary(table: plan_mod.BlockPlanTable) -> str:
 def build_runner(
     name: str,
     layer: nn.Module,
+    parts: AttnMoEParts,
     roles: AttnMoERoles,
     table: plan_mod.BlockPlanTable,
     tp: int,
-    front: nn.Module | None = None,
+    attention: nn.Module | None = None,
 ) -> AttnMoERunner:
-    """The block's runner, from the layer's parts and the nested front half.
+    """The block's runner: the declared parts, and the attention part.
 
     Args:
-        front: The nested ``AttentionRunner``, built with
-            ``output_reduced=False``; None runs the model's own norm and
+        attention: The attention part, the nested ``AttentionRunner`` built
+            with ``output_reduced=False``; None runs the model's own norm and
             attention (``ModelAttention``).
     """
-    if front is None:
-        front = ModelAttention(
-            input_norm=layer.get_submodule(roles.input_norm),
-            attention=layer.get_submodule(roles.attention),
+    if attention is None:
+        attention = ModelAttention(
+            input_norm=parts.input_norm,
+            attention=parts.attention,
             attention_args=roles.attention_args,
             positions_param=roles.positions_param,
         )
     return AttnMoERunner(
         name,
-        front=front,
-        post_norm=layer.get_submodule(roles.post_norm),
-        router=layer.get_submodule(roles.router),
-        experts=layer.get_submodule(roles.experts),
+        parts,
+        attention=attention,
         table=table,
         tp=tp,
         stream=StreamParams.of(
@@ -305,24 +320,25 @@ def build_runner(
 def apply_block(
     name: str,
     layer: nn.Module,
+    parts: AttnMoEParts,
     roles: AttnMoERoles,
     table: plan_mod.BlockPlanTable,
     tp: int,
-    front: nn.Module | None = None,
+    attention: nn.Module | None = None,
 ) -> AttnMoERunner:
     """Builds the block's runner and makes it the layer's forward.
 
     The MoE child's contracts are written (the interim adapter); attention's
-    is a constructor argument of ``front`` when there is one.
+    is a constructor argument of the attention part when there is one.
     """
     bind_child_contracts(
         name,
-        None if front is not None else layer.get_submodule(roles.out_proj),
-        layer.get_submodule(roles.experts),
+        None if attention is not None else layer.get_submodule(roles.out_proj),
+        parts.experts,
         _MOE_CONTRACTS,
         source=_summary(table),
     )
-    runner = build_runner(name, layer, roles, table, tp, front)
+    runner = build_runner(name, layer, parts, roles, table, tp, attention)
     route(layer, runner)
     return runner
 
@@ -354,19 +370,18 @@ class AttnThenMoE:
         nested: dict[Any, BlockDeclaration],
     ) -> Installed:
         roles = conform(layer, declaration)
-        key = block_key(layer, declaration.bind(layer), context.tp, context.dtype)
+        parts = declared_parts(layer, declaration)
+        key = block_key(parts, context.tp, context.dtype)
         table, fell_back = plan_mod.resolve_table(
             key, context.buckets, context.override, context.model_plan
         )
         inner = nested.get(norm_then_attention)
         if inner is not None and table.uses("reduce_scatter_all_gather"):
             # The block needs attention unreduced: ask the floor value first.
-            sub_roles = norm_attn.conform(layer, inner)
+            norm_attn.conform(layer, inner)
             floor = subblock_plan.NormAttnPlan("unfused", "bf16")
             why = subblock_plan.unreduced_output_supports(
-                floor,
-                layer.get_submodule(sub_roles.attention),
-                fused_unreduced=False,
+                floor, parts.attention, fused_unreduced=False
             )
             if why and any(s in ("user", "model plan") for _, _, s in table.entries):
                 raise ValueError(
@@ -384,11 +399,11 @@ class AttnThenMoE:
                 sub = norm_attn.install_standalone(name, layer, inner, context)
                 outcome += f"; sub-block {sub.outcome}"
             return Installed(name, cls, outcome)
-        front, what = None, ""
+        attention, what = None, ""
         if inner is not None:
-            _, front, chosen = norm_attn.resolve_runner(
+            _, attention, chosen = norm_attn.resolve_runner(
                 name, layer, inner, context, output_reduced=False
             )
             what = f"; nested AttentionRunner {chosen}"
-        apply_block(name, layer, roles, table, context.tp, front)
+        apply_block(name, layer, parts, roles, table, context.tp, attention)
         return Installed(name, cls, f"AttnMoERunner installed; {_summary(table)}{what}")

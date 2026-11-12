@@ -31,12 +31,13 @@ import sys
 
 import transformers
 from huggingface_hub import hf_hub_download
+from torch import nn
 from vllm.config import set_current_vllm_config
 
 from prototype import _build
 from vllm_torchtpu.blocks import BlockDeclaration, norm_attn
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
-from vllm_torchtpu.blocks.norm_attn.pattern import norm_then_attention
+from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnParts
 from vllm_torchtpu.blocks.norm_attn.plan import fused_qkv_supports
 
 # #3096 patches these decoder classes (fused_attn_proj_patch.py).
@@ -329,6 +330,38 @@ def _config(c: Candidate, *, shrink_heads: bool = True):  # noqa: ANN202
     return cls(**data)
 
 
+def _child(layer: nn.Module, *names: str) -> nn.Module:
+    for name in names:
+        if isinstance(child := getattr(layer, name, None), nn.Module):
+            return child
+    raise AttributeError(f"the layer has none of {names}")
+
+
+def guess_parts(layer: nn.Module) -> NormAttnParts:
+    """The parts under vLLM's usual names, for the survey (not a declaration).
+
+    A model owner's binding function reads its own class's attributes; the
+    survey runs over many classes, so it tries the common names and finds
+    attention's parts by kind.
+    """
+    norm = _child(layer, "input_layernorm")
+    attention = _child(layer, "self_attn", "attn")
+    names, _ = norm_attn.attention_parts(attention, int(norm.weight.shape[0]))
+    found = {k: attention.get_submodule(v) for k, v in names.items()}
+    return NormAttnParts(
+        input_norm=norm,
+        qkv_proj=found["qkv_proj"],
+        attn=found["attn"],
+        o_proj=found["o_proj"],
+        rotary=found["rotary"],
+        q_norm=found.get("q_norm"),
+        k_norm=found.get("k_norm"),
+        attention=attention,
+        post_norm=_child(layer, "post_attention_layernorm"),
+        mlp=_child(layer, "mlp", "block_sparse_moe", "feed_forward"),
+    )
+
+
 def check(c: Candidate) -> tuple[str, str]:
     try:
         cfg = _config(c, shrink_heads=False)
@@ -339,15 +372,7 @@ def check(c: Candidate) -> tuple[str, str]:
     except Exception as e:  # noqa: BLE001 - report why it does not build
         first = (str(e).splitlines() or [""])[0][:90]
         return "not buildable", f"{type(e).__name__}: {first}"
-    roles = {
-        "in_norm": "input_layernorm",
-        "post_norm": "post_attention_layernorm",
-        "attn": ("self_attn", "attn"),
-        "mlp": ("mlp", "block_sparse_moe", "feed_forward"),
-    }
-    declaration = BlockDeclaration(
-        type(layer), norm_then_attention, roles, lambda _: True
-    )
+    declaration = BlockDeclaration.of(type(layer), guess_parts)
     try:
         with set_current_vllm_config(_build.current_config()):
             roles = norm_attn.conform(layer, declaration)

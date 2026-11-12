@@ -58,8 +58,8 @@ weights and contract, and the plan is the runner's.
 | The runner: parts in, composition owned, plan resolved once | [`AttentionRunner`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L74-L185) ([`__init__`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L81-L112), [`_select_forward`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L114-L120), [`_unfused`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L132-L145), [`_fused_qkv`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L147-L159), [`attention_from_qkv`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L163-L185)), [`AttnConfig`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L48-L71) |
 | The fused value's reference (stands in for #3096's kernel) | [`reference_fused_qkv`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L188-L206) |
 | Conformance: the layer's wiring | [`conform`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L96-L213) |
-| Conformance: attention's forward is the runner's composition; a variant the runner does not implement is a stated missing property | [`attention_parts`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L223-L270), [`conform_attention`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L273-L346) |
-| A non-conforming declaration stops startup | [`install`](../src/vllm_torchtpu/blocks/__init__.py#L168-L199) |
+| Conformance: attention's forward is the runner's composition; a variant the runner does not implement is a stated missing property | [`attention_parts`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L223-L268), [`conform_attention`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L271-L346) |
+| A non-conforming declaration stops startup | [`install`](../src/vllm_torchtpu/blocks/__init__.py#L170-L199) |
 | The plan and the kernel's capability | [`NormAttnPlan`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L49-L56), [`rule` and fallbacks](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L64-L72), [`fused_qkv_supports`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L75-L157), [`resolve`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L160-L179), [`choose`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L182-L214); the chip fact [`has_fp8_matmul`](../src/vllm_torchtpu/tpu_info.py#L90-L99) |
 | Install: capability consulted (automatic falls back, a pin that cannot run raises), runner built from the layer's parts, the layer routed through it | [`NormThenAttention`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L423-L471), [`build_runner`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L394-L416), [`NormAttnDecoder`](../src/vllm_torchtpu/blocks/norm_attn/__init__.py#L360-L380) |
 | Scopes nest: inside `attn_then_moe`'s block, the block runs its front half through the runner | [`AttentionMoEBlock.forward`](../src/vllm_torchtpu/blocks/attn_moe/forward.py#L82-L94), [`test_scopes_nest_on_qwen3_5`](../tests/blocks/test_norm_attn_integration.py#L238-L255) |
@@ -69,7 +69,7 @@ weights and contract, and the plan is the runner's.
 | Planted non-conforming declarations (the layer; attention) | [`ScaledAttention`](check_subblock.py#L105-L113), [`_scale_query`](check_subblock.py#L120-L131), [`_planted`](check_subblock.py#L277-L305) |
 | Every code object the installed forward runs has source (torch.compile's AOT cache) | [`_source_less`](check_subblock.py#L308-L352) |
 | The count against #3096 | [`counts`](check_subblock.py#L392-L399) |
-| Reach over current models, from real configs | [`CANDIDATES`](subblock_reach.py#L62-L192), [`MAIN_CANDIDATES`](subblock_reach.py#L198-L254), [`check`](subblock_reach.py#L332-L358) |
+| Reach over current models, from real configs | [`CANDIDATES`](subblock_reach.py#L62-L192), [`MAIN_CANDIDATES`](subblock_reach.py#L198-L254), [`check`](subblock_reach.py#L333-L358) |
 | The startup override | `TPU_SUBBLOCK_PLAN` in `envs.py`, passed by the runner's `_install_blocks` |
 
 ## The kernel's capability, as its author would declare it

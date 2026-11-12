@@ -26,25 +26,19 @@ It is the front half of ``attn_then_moe``; the two plans nest by scope.
 
 import dataclasses
 from collections.abc import Callable
+from typing import Protocol
 
 import torch
 from torch import nn
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
-from vllm.model_executor.layers.linear import QKVParallelLinear
+from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 
-from vllm_torchtpu.blocks.norm_attn.runner import AttnConfig
+from vllm_torchtpu.blocks.norm_attn.runner import AttentionParts, AttnConfig
+from vllm_torchtpu.blocks.parts import BlockParts
 
 Norm = Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
 Op = Callable[[torch.Tensor], torch.Tensor]
-
-PRE_NORM_ROLES = {
-    "in_norm": "input_layernorm",
-    "attn": "self_attn",
-    "post_norm": "post_attention_layernorm",
-    "mlp": "mlp",
-}
-"""vLLM's usual child names for the four roles; a model with others binds its own."""
 
 
 def norm_then_attention(
@@ -114,22 +108,113 @@ def qkv_proj_of(attn: nn.Module, hidden: int) -> list[str]:
     ]
 
 
-def check_roles(layer: nn.Module, binding: dict[str, str]) -> list[str]:
-    """Why the bound children are not the kinds their roles need."""
-    problems = []
-    for role in ("in_norm", "post_norm"):
-        if not is_residual_norm(layer.get_submodule(binding[role])):
-            problems.append(
-                f"{role}={binding[role]} is not an RMSNorm called with a residual"
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class NormAttnParts(AttentionParts, BlockParts):
+    """A declared layer's parts for norm_then_attention.
+
+    The runner's parts (``AttentionParts``) plus the layer's other roles:
+    ``attention`` (the module holding the runner's parts, whose forward
+    conformance compares with the runner's composition), and the rest of the
+    layer (``post_norm``, ``mlp``), which stays opaque.
+    """
+
+    attention: nn.Module
+    post_norm: nn.Module
+    mlp: nn.Module
+
+    pattern = staticmethod(norm_then_attention)
+
+    def layer_children(self) -> dict[str, nn.Module]:
+        return {
+            "input_norm": self.input_norm,
+            "attention": self.attention,
+            "post_norm": self.post_norm,
+            "mlp": self.mlp,
+        }
+
+    def problems(self) -> list[tuple[str, str]]:
+        problems = [
+            (name, f"is a {type(norm).__name__}, not an RMSNorm called with a residual")
+            for name, norm in (
+                ("input_norm", self.input_norm),
+                ("post_norm", self.post_norm),
             )
-    attn = layer.get_submodule(binding["attn"])
-    if not any(isinstance(m, AttentionLayerBase) for m in attn.modules()):
-        problems.append(f"attn={binding['attn']} holds no attention layer")
-    if not problems:
-        hidden = int(layer.get_submodule(binding["in_norm"]).weight.shape[0])
-        if len(found := qkv_proj_of(attn, hidden)) != 1:
-            problems.append(
-                f"attn={binding['attn']} has {len(found)} QKVParallelLinear "
-                f"from the hidden size {hidden}, not one"
-            )
-    return problems
+            if not is_residual_norm(norm)
+        ]
+        inside = {id(m) for m in self.attention.modules()}
+        for name, part in (
+            ("qkv_proj", self.qkv_proj),
+            ("attn", self.attn),
+            ("o_proj", self.o_proj),
+            ("rotary", self.rotary),
+            ("q_norm", self.q_norm),
+            ("k_norm", self.k_norm),
+        ):
+            if part is not None and id(part) not in inside:
+                problems.append((name, "is not a module of attention"))
+        kinds = (
+            ("attn", AttentionLayerBase, "an attention layer"),
+            ("qkv_proj", QKVParallelLinear, "a QKVParallelLinear"),
+            ("o_proj", RowParallelLinear, "a RowParallelLinear"),
+        )
+        for name, kind, words in kinds:
+            part = getattr(self, name)
+            if not isinstance(part, kind):
+                problems.append((name, f"is a {type(part).__name__}, not {words}"))
+        weight = self.input_norm.weight
+        if not problems and isinstance(weight, torch.Tensor):
+            hidden = int(weight.shape[0])
+            if self.qkv_proj.input_size != hidden:
+                problems.append(
+                    (
+                        "qkv_proj",
+                        f"reads {self.qkv_proj.input_size}, not hidden {hidden}",
+                    )
+                )
+        if (self.q_norm is None) != (self.k_norm is None):
+            problems.append(("q_norm", "and k_norm come together or not at all"))
+        return problems
+
+
+class PreNormAttention(Protocol):
+    """An attention module with vLLM's usual part names."""
+
+    @property
+    def qkv_proj(self) -> nn.Module: ...
+    @property
+    def attn(self) -> nn.Module: ...
+    @property
+    def o_proj(self) -> nn.Module: ...
+    @property
+    def rotary_emb(self) -> nn.Module: ...
+
+
+class PreNormLayer(Protocol):
+    """A pre-norm decoder layer with vLLM's usual child names (attention aside)."""
+
+    @property
+    def input_layernorm(self) -> nn.Module: ...
+    @property
+    def post_attention_layernorm(self) -> nn.Module: ...
+    @property
+    def mlp(self) -> nn.Module: ...
+
+
+def pre_norm_parts(layer: PreNormLayer, attention: PreNormAttention) -> NormAttnParts:
+    """The parts of a layer and attention that use vLLM's usual names.
+
+    Per-head q/k norms are optional in vLLM's attentions, so they are read if
+    present; every other part is typed attribute access.
+    """
+    return NormAttnParts(
+        input_norm=layer.input_layernorm,
+        qkv_proj=attention.qkv_proj,
+        attn=attention.attn,
+        o_proj=attention.o_proj,
+        rotary=attention.rotary_emb,
+        q_norm=getattr(attention, "q_norm", None),
+        k_norm=getattr(attention, "k_norm", None),
+        attention=attention,  # type: ignore[arg-type]  # a Protocol over an nn.Module
+        post_norm=layer.post_attention_layernorm,
+        mlp=layer.mlp,
+    )

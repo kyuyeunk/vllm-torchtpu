@@ -47,7 +47,10 @@ from torch import nn  # noqa: E402 - after the snapshot above
 
 from vllm_torchtpu.blocks.attn_moe import plan as block_plan  # noqa: E402 - ditto
 from vllm_torchtpu.blocks.attn_moe import runner as block_runner  # noqa: E402 - ditto
-from vllm_torchtpu.blocks.attn_moe.runner import AttnMoERunner  # noqa: E402 - ditto
+from vllm_torchtpu.blocks.attn_moe.runner import (  # noqa: E402 - ditto
+    AttnMoERunner,
+    MoEParts,
+)
 from vllm_torchtpu.blocks.norm_attn import plan as subblock_plan  # noqa: E402 - ditto
 from vllm_torchtpu.blocks.norm_attn.runner import (  # noqa: E402 - ditto
     AttentionRunner,
@@ -62,7 +65,7 @@ NUM_EXPERTS, TOP_K = 4, 2
 ATOL = 1e-5  # float32; the overlap sums the stream in another order.
 # head_dim 128: a configuration fused_qkv's capability accepts, so the
 # unreduced-output condition is the one under test.
-ROLES = Roles(qk_norm=True, gqa=4, head_dim=128)
+SUBBLOCK = Roles(qk_norm=True, gqa=4, head_dim=128)
 STREAM = StreamParams(
     ("positions", "hidden_states", "residual"),
     *("hidden_states", "residual", "positions"),
@@ -126,12 +129,12 @@ def _moe() -> tuple[InputNorm, Linear, Experts]:
 
 
 def _attention(input_proj: str) -> tuple[InputNorm, Attention, AttentionRunner]:
-    norm, attention = setup_parts(ROLES)
+    norm, attention = setup_parts(SUBBLOCK)
     fused = reference_fused_qkv if input_proj == "fused_qkv" else None
-    front = build_runner(
-        norm, attention, ROLES.config(), input_proj, fused, output_reduced=False
+    attention_part = build_runner(
+        norm, attention, SUBBLOCK.config(), input_proj, fused, output_reduced=False
     )
-    return norm, attention, front
+    return norm, attention, attention_part
 
 
 def _table(collectives: str) -> block_plan.BlockPlanTable:
@@ -140,14 +143,12 @@ def _table(collectives: str) -> block_plan.BlockPlanTable:
 
 
 def _block(collectives: str, input_proj: str) -> tuple[AttnMoERunner, tuple]:
-    norm, attention, front = _attention(input_proj)
+    norm, attention, attention_part = _attention(input_proj)
     post_norm, router, experts = _moe()
     block = AttnMoERunner(
         "layer",
-        front=front,
-        post_norm=post_norm,
-        router=router,
-        experts=experts,
+        MoEParts(post_norm=post_norm, router=router, experts=experts),
+        attention=attention_part,
         table=_table(collectives),
         tp=1,
         stream=STREAM,
@@ -161,7 +162,7 @@ def reference_block(
     """Upstream's layer in straight-line torch: attention, norm, route, experts."""
     norm, attention, post_norm, router, experts = parts
     attn, stream = reference_forward(
-        ROLES, norm, attention, hidden, residual, positions
+        SUBBLOCK, norm, attention, hidden, residual, positions
     )
     stream = attn + stream
     h = stream / torch.sqrt(stream.pow(2).mean(-1, keepdim=True) + 1e-6)
@@ -226,17 +227,15 @@ def test_select_forward(collectives_value: str) -> None:
 
 def test_by_bucket(collectives: list[str]) -> None:
     """The table's runs pick the value per token count; eager runs are counted."""
-    norm, attention, front = _attention("unfused")
+    norm, attention, attention_part = _attention("unfused")
     post_norm, router, experts = _moe()
     table = block_plan.BlockPlanTable(
         ((4, block_plan.DEFAULT, "rule"), (TOKENS, block_plan.OVERLAP, "rule"))
     )
     block = AttnMoERunner(
         "bucketed",
-        front=front,
-        post_norm=post_norm,
-        router=router,
-        experts=experts,
+        MoEParts(post_norm=post_norm, router=router, experts=experts),
+        attention=attention_part,
         table=table,
         tp=1,
         stream=STREAM,
@@ -281,11 +280,11 @@ def test_runner_owns_no_parameters() -> None:
 @pytest.mark.parametrize("input_proj", ["unfused", "fused_qkv"])
 def test_unreduced_attention_equals_reduced_at_tp1(input_proj: str) -> None:
     """``output_reduced=False`` skips only the reduction; at TP=1 that is nothing."""
-    norm, attention = setup_parts(ROLES)
+    norm, attention = setup_parts(SUBBLOCK)
     fused = reference_fused_qkv if input_proj == "fused_qkv" else None
-    reduced = build_runner(norm, attention, ROLES.config(), input_proj, fused)
+    reduced = build_runner(norm, attention, SUBBLOCK.config(), input_proj, fused)
     unreduced = build_runner(
-        norm, attention, ROLES.config(), input_proj, fused, output_reduced=False
+        norm, attention, SUBBLOCK.config(), input_proj, fused, output_reduced=False
     )
     hidden, residual, positions = make_inputs(first=False)
     with torch.no_grad():
@@ -296,8 +295,8 @@ def test_unreduced_attention_equals_reduced_at_tp1(input_proj: str) -> None:
 
 def test_unreduced_never_calls_the_projection_forward() -> None:
     """The flag is passed per call; the projection's own reduce is not consulted."""
-    norm, attention = setup_parts(ROLES)
-    runner = build_runner(norm, attention, ROLES.config(), output_reduced=False)
+    norm, attention = setup_parts(SUBBLOCK)
+    runner = build_runner(norm, attention, SUBBLOCK.config(), output_reduced=False)
 
     def refuse(*args: object, **kwargs: object) -> None:
         raise AssertionError("o_proj.forward runs its all-reduce")
@@ -332,7 +331,7 @@ def _o_proj_replicated(attention: Attention) -> Attention:
 def test_unreduced_output_supports(
     edit, input_proj: str, fused_unreduced: bool, why: str | None
 ) -> None:  # noqa: ANN001
-    _, attention = setup_parts(ROLES)
+    _, attention = setup_parts(SUBBLOCK)
     plan = subblock_plan.NormAttnPlan(input_proj, "bf16")  # type: ignore[arg-type]
     got = subblock_plan.unreduced_output_supports(
         plan, edit(attention), fused_unreduced=fused_unreduced
@@ -342,7 +341,7 @@ def test_unreduced_output_supports(
 
 def test_rule_falls_back_when_the_fused_op_cannot_skip_the_reduce() -> None:
     """Chosen automatically: fused_qkv declines quietly, unfused serves the block."""
-    _, attention = setup_parts(ROLES)
+    _, attention = setup_parts(SUBBLOCK)
     plan, pinned, declined = subblock_plan.choose(
         "", attention, output_reduced=False, fused_unreduced=False
     )
@@ -352,7 +351,7 @@ def test_rule_falls_back_when_the_fused_op_cannot_skip_the_reduce() -> None:
 
 def test_pin_that_cannot_skip_the_reduce_raises() -> None:
     """Pinned: the same decline stops startup."""
-    _, attention = setup_parts(ROLES)
+    _, attention = setup_parts(SUBBLOCK)
     with pytest.raises(ValueError, match="always all-reduces"):
         subblock_plan.choose(
             "input_proj=fused_qkv",
@@ -365,7 +364,7 @@ def test_pin_that_cannot_skip_the_reduce_raises() -> None:
 
 def test_reduced_contract_ignores_the_capability() -> None:
     """A layer on its own (reduced output) keeps fused_qkv whatever the op says."""
-    _, attention = setup_parts(ROLES)
+    _, attention = setup_parts(SUBBLOCK)
     plan, _, _ = subblock_plan.choose(
         "", _o_proj_bias(attention), fused_unreduced=False
     )

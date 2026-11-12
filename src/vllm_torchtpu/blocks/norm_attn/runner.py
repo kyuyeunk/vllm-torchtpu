@@ -83,6 +83,32 @@ class AttnConfig:
         return self.num_kv_heads * self.head_dim
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class AttentionParts:
+    """What ``AttentionRunner`` composes: the model's own part objects.
+
+    Execution needs only each part's call contract, so tests build this from
+    synthetic modules. A model's declaration builds ``NormAttnParts``, which
+    extends it with the layer's other roles and checks every kind.
+
+    Attributes:
+        input_norm: The input RMSNorm, called as ``(x, residual)``.
+        qkv_proj: Attention's input projection, returning ``(out, bias)``.
+        attn: The attention core on ``(q, k, v)``.
+        o_proj: The output projection (a ``RowParallelLinear``).
+        rotary: RoPE on ``(positions, q, k)``.
+        q_norm, k_norm: Per-head norms on q and k, both or neither.
+    """
+
+    input_norm: nn.Module
+    qkv_proj: nn.Module
+    attn: nn.Module
+    o_proj: nn.Module
+    rotary: nn.Module
+    q_norm: nn.Module | None = None
+    k_norm: nn.Module | None = None
+
+
 class AttentionRunner(nn.Module):
     """The sub-block's composition; the parts stay the model's.
 
@@ -102,31 +128,17 @@ class AttentionRunner(nn.Module):
     def __init__(
         self,
         layer_name: str,
+        parts: AttentionParts,
         *,
-        input_norm: nn.Module,
-        qkv_proj: nn.Module,
-        attn: nn.Module,
-        o_proj: nn.Module,
-        rotary: nn.Module,
-        q_norm: nn.Module | None = None,
-        k_norm: nn.Module | None = None,
         config: AttnConfig,
         input_proj: str = "unfused",
         fused_op: FusedOp | None = None,
         output_reduced: bool = True,
     ) -> None:
         super().__init__()
-        parts = {
-            "input_norm": input_norm,
-            "qkv_proj": qkv_proj,
-            "attn": attn,
-            "o_proj": o_proj,
-            "rotary": rotary,
-            "q_norm": q_norm,
-            "k_norm": k_norm,
-        }
-        for name, part in parts.items():
-            object.__setattr__(self, name, part)  # a reference, not a child
+        for field in dataclasses.fields(AttentionParts):  # the runner's parts only
+            # A reference, not a child: the model keeps owning its parts.
+            object.__setattr__(self, field.name, getattr(parts, field.name))
         self.layer_name = layer_name
         self.config = config
         self.input_proj = input_proj

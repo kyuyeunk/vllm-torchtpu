@@ -41,13 +41,6 @@ from typing import Any
 
 from torch import nn
 
-# The fields this adapter may write, per child role.
-_FIELDS = {
-    "out_proj": ("reduce_results",),
-    "experts": ("gate",),
-    "moe_config": ("skip_final_all_reduce",),
-}
-
 
 @dataclasses.dataclass(frozen=True)
 class ChildContracts:
@@ -152,6 +145,6 @@ def bind_child_contracts(
             )
         )
     if out_proj is not None:
-        _guard(out_proj, _FIELDS["out_proj"], "attn_then_moe")
-    _guard(experts, _FIELDS["experts"], "attn_then_moe")
-    _guard(moe_config, _FIELDS["moe_config"], "attn_then_moe")
+        _guard(out_proj, ("reduce_results",), "attn_then_moe")
+    _guard(experts, ("gate",), "attn_then_moe")
+    _guard(moe_config, ("skip_final_all_reduce",), "attn_then_moe")

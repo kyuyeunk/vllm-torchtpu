@@ -36,17 +36,19 @@ from vllm_torchtpu.blocks import (
 from vllm_torchtpu.blocks import conformance as conf
 from vllm_torchtpu.blocks.norm_attn import plan as plan_mod
 from vllm_torchtpu.blocks.norm_attn.pattern import (
+    NormAttnParts,
     NormAttnRoles,
-    check_roles,
     norm_then_attention,
     qkv_proj_of,
 )
 from vllm_torchtpu.blocks.norm_attn.runner import (
+    AttentionParts,
     AttentionRunner,
     AttnConfig,
     FusedOp,
     reference_fused_qkv,
 )
+from vllm_torchtpu.blocks.parts import attribute_of
 from vllm_torchtpu.blocks.stream import StreamParams
 from vllm_torchtpu.logger import init_logger
 
@@ -88,6 +90,23 @@ def _norm_stub(role: str):  # noqa: ANN202
     return stub
 
 
+def declared_parts(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnParts:
+    """The parts the binding function returns for ``layer``.
+
+    Raises:
+        BlockConformanceError: The function returns None or other parts, or a
+            part is the wrong kind (named by its attribute).
+    """
+    parts = declaration.parts(layer)
+    if not isinstance(parts, NormAttnParts):
+        raise _fail(
+            layer,
+            f"{declaration.parts_of.__qualname__} returns {type(parts).__name__}, "
+            "not NormAttnParts",
+        )
+    return parts
+
+
 def conform(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnRoles:
     """Checks a declared layer against norm_then_attention; returns its roles.
 
@@ -97,21 +116,26 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnRoles:
     attention's parts opaque, attention's own forward is the runner's
     composition (``conform_attention``), so the runner can replace it.
 
+    The parts' kinds are checked when the binding function builds them; the
+    attention parts it declares must be the ones attention's forward calls.
+
     Raises:
         BlockConformanceError: Naming the role, edge and source line.
     """
+    declared = declared_parts(layer, declaration)
     binding = declaration.bind(layer)
     flags = tuple(
         sorted((k, v) for k, v in vars(layer).items() if isinstance(v, (bool, str)))
     )
-    cache_key = (type(layer), tuple(sorted(binding.items())), flags)
+    # Layers of one class built at other sizes (another config) differ in
+    # their parameters' shapes, which the roles' config is read from.
+    shapes = tuple((n, tuple(t.shape)) for n, t in layer.named_parameters())
+    cache_key = (type(layer), tuple(sorted(binding.items())), flags, shapes)
     if cache_key in _conformed:
         return _conformed[cache_key]
-    if problems := check_roles(layer, binding):
-        raise _fail(layer, "; ".join(problems))
     hidden_p, residual_p, positions_p = _stream_params(layer)
-    hidden = int(layer.get_submodule(binding["in_norm"]).weight.shape[0])
-    attn = layer.get_submodule(binding["attn"])
+    hidden = int(declared.input_norm.weight.shape[0])
+    attn = declared.attention
     attn_params = list(inspect.signature(attn.forward).parameters)
     attn_input = next(
         (p for p in ("hidden_states", "x") if p in attn_params), attn_params[0]
@@ -156,9 +180,9 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnRoles:
         )
 
     stubs = {
-        binding["in_norm"]: recording_in_norm,
+        binding["input_norm"]: recording_in_norm,
         binding["post_norm"]: _norm_stub("post_norm"),
-        binding["attn"]: attn_stub,
+        binding["attention"]: attn_stub,
         binding["mlp"]: lambda hidden_states, *a, **k: conf.ops.unary(
             hidden_states, "mlp"
         ),
@@ -190,11 +214,20 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnRoles:
     parts, config = conform_attention(
         attn, hidden, attn_hidden, attn_positions, f" on {type(layer).__qualname__}"
     )
+    for field, name in parts.items():
+        part = getattr(declared, field)
+        if part is not attn.get_submodule(name):
+            where = attribute_of(attn, part, field) if part is not None else "None"
+            raise _fail(
+                layer,
+                f"it declares {field}={binding['attention']}.{where}, but "
+                f"attention's forward calls {binding['attention']}.{name}",
+            )
 
     roles = NormAttnRoles(
-        input_norm=binding["in_norm"],
-        attention=binding["attn"],
-        qkv_proj=f"{binding['attn']}.{parts['qkv_proj']}",
+        input_norm=binding["input_norm"],
+        attention=binding["attention"],
+        qkv_proj=f"{binding['attention']}.{parts['qkv_proj']}",
         post_norm=binding["post_norm"],
         mlp=binding["mlp"],
         attention_args=attention_args,
@@ -308,13 +341,15 @@ def conform_attention(
     }
     runner = AttentionRunner(
         "conformance",
-        input_norm=nn.Identity(),
-        qkv_proj=mod["qkv_proj"],
-        attn=mod["attn"],
-        o_proj=mod["o_proj"],
-        rotary=mod["rotary"],
-        q_norm=mod.get("q_norm"),
-        k_norm=mod.get("k_norm"),
+        AttentionParts(
+            input_norm=nn.Identity(),
+            qkv_proj=mod["qkv_proj"],
+            attn=mod["attn"],
+            o_proj=mod["o_proj"],
+            rotary=mod["rotary"],
+            q_norm=mod.get("q_norm"),
+            k_norm=mod.get("k_norm"),
+        ),
         config=config,
     )
     meta = {"device": "meta", "dtype": torch.bfloat16}
@@ -388,26 +423,18 @@ def _decoder_class(cls: type) -> type:
 
 def build_runner(
     name: str,
-    layer: nn.Module,
-    roles: NormAttnRoles,
+    parts: AttentionParts,
+    config: AttnConfig,
     input_proj: str,
     fused_op: FusedOp | None = None,
     *,
     output_reduced: bool = True,
 ) -> AttentionRunner:
-    """The runner for one declared layer, holding the layer's own parts."""
-    attention = layer.get_submodule(roles.attention)
-    parts = {k: attention.get_submodule(v) for k, v in roles.parts}
+    """The runner for one declared layer: the declared parts are its arguments."""
     return AttentionRunner(
         name,
-        input_norm=layer.get_submodule(roles.input_norm),
-        qkv_proj=parts["qkv_proj"],
-        attn=parts["attn"],
-        o_proj=parts["o_proj"],
-        rotary=parts["rotary"],
-        q_norm=parts.get("q_norm"),
-        k_norm=parts.get("k_norm"),
-        config=roles.config,
+        parts,
+        config=config,
         input_proj=input_proj,
         fused_op=fused_op if input_proj == "fused_qkv" else None,
         output_reduced=output_reduced,
@@ -465,7 +492,12 @@ def resolve_runner(
     for item in declined:  # The rule's value fell back: quiet.
         logger.debug("%s: %s", name, item)
     runner = build_runner(
-        name, layer, roles, plan.input_proj, fused_op, output_reduced=output_reduced
+        name,
+        declared_parts(layer, declaration),
+        roles.config,
+        plan.input_proj,
+        fused_op,
+        output_reduced=output_reduced,
     )
     source = "user" if pinned else "rule"
     matmul = f" matmul={plan.matmul}" if plan.input_proj == "fused_qkv" else ""

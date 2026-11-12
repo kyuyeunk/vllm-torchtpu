@@ -27,6 +27,8 @@ own forward, so only the wiring differs from upstream:
 import torch
 from torch import nn
 
+from vllm_torchtpu.blocks.attn_moe.pattern import AttnMoEParts
+
 
 class _Children(nn.Module):
     def __init__(self, layer: nn.Module) -> None:
@@ -82,9 +84,13 @@ class DeadBranchAndView(_Children):
         return self.ffn(hidden_states), residual
 
 
-RENAMED_ROLES = {
-    "in_norm": "pre_norm",
-    "attn": "mixer",
-    "post_norm": "mid_norm",
-    "moe": "ffn",
-}
+def renamed_parts(layer: _Children) -> AttnMoEParts:
+    """The fixtures' binding function: the same parts under the new names."""
+    return AttnMoEParts(
+        input_norm=layer.pre_norm,
+        attention=layer.mixer,
+        post_norm=layer.mid_norm,
+        moe=layer.ffn,
+        router=layer.ffn.get_submodule("gate"),
+        experts=layer.ffn.get_submodule("experts"),
+    )

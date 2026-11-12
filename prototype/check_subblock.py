@@ -37,14 +37,19 @@ from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers import rotary_embedding
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import LinearBase
-from vllm.model_executor.models.llama import LlamaDecoderLayer
+from vllm.model_executor.models.llama import LlamaAttention, LlamaDecoderLayer
 
 from prototype import _build, subblock_reach
 from vllm_torchtpu import blocks
 from vllm_torchtpu.blocks import norm_attn
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
 from vllm_torchtpu.blocks.norm_attn import runner as runner_mod
-from vllm_torchtpu.blocks.norm_attn.pattern import norm_then_attention
+from vllm_torchtpu.blocks.norm_attn.pattern import (
+    NormAttnParts,
+    norm_then_attention,
+    pre_norm_parts,
+)
+from vllm_torchtpu.blocks.parts import as_kind
 
 # Comment in to see CI fail: the planted layer becomes a declared model.
 PLANT_MISMATCH = False
@@ -274,22 +279,17 @@ def planted() -> list[str]:
     return failures
 
 
+def _llama_parts(layer: LlamaDecoderLayer) -> NormAttnParts:
+    """The planted layers' binding function (they reuse Llama's children)."""
+    return pre_norm_parts(layer, as_kind(layer.self_attn, LlamaAttention))
+
+
 def _planted(planted_cls: type, where: str) -> list[str]:
     layer = _build.build(FAMILIES[0])
     layer.__class__ = planted_cls
     if planted_cls is ScaledQueryAttention:
         _scale_query(layer.self_attn)
-    declaration = blocks.BlockDeclaration(
-        planted_cls,
-        norm_then_attention,
-        {
-            "in_norm": "input_layernorm",
-            "attn": "self_attn",
-            "post_norm": "post_attention_layernorm",
-            "mlp": "mlp",
-        },
-        lambda _: True,
-    )
+    declaration = blocks.BlockDeclaration.of(planted_cls, _llama_parts)
     key = (planted_cls, norm_then_attention)
     blocks.DECLARATIONS[key] = declaration
     try:

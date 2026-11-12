@@ -17,8 +17,10 @@ Ownership is split at the declaration:
 
 - **The model owner declares.** In the model's own directory
   (``models/<family>/<model>/registration.py``, the only place a model's
-  identity appears) ``declare_block`` states that a decoder class conforms to a
-  pattern and binds its children to the pattern's roles.
+  identity appears) a binding function decorated with ``declare_block``
+  takes a decoder layer and returns the pattern's parts dataclass, built by
+  typed attribute access, or None where the layer does not conform. The
+  return type names the pattern; the type checker checks the attributes.
 - **The framework runs what is declared.** The pattern, the conformance
   check, the block plan, the child-contract adapter and the block forward
   live here, in a shared package. A declaration that does not conform fails
@@ -42,15 +44,21 @@ import dataclasses
 import importlib
 import pathlib
 import pkgutil
+import typing
 from collections.abc import Callable
 from typing import Any, Protocol
 
 from torch import nn
 
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
+from vllm_torchtpu.blocks.parts import BlockParts, PartsKindError, attribute_of
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+Binding = Callable[[Any], BlockParts | None]
+"""A model owner's binding function: layer -> the pattern's parts, or None."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -59,27 +67,63 @@ class BlockDeclaration:
 
     Attributes:
         layer_class: The decoder layer class, matched exactly.
-        pattern: The pattern's reference forward, e.g. ``attn_then_moe``.
-        roles: Role name -> child attribute; a tuple lists alternatives, of
-            which the first present on the layer is bound.
-        when: Which instances of the class the declaration covers.
+        pattern: The pattern's reference forward, read off the binding
+            function's parts type.
+        parts_of: The binding function.
     """
 
     layer_class: type
     pattern: Callable[..., Any]
-    roles: dict[str, str | tuple[str, ...]]
-    when: Callable[[nn.Module], bool]
+    parts_of: Binding
+
+    @classmethod
+    def of(cls, layer_class: type, parts_of: Binding) -> "BlockDeclaration":
+        """The declaration ``parts_of`` makes; its return type names the pattern."""
+        returns = typing.get_type_hints(parts_of).get("return")
+        kinds = [
+            t
+            for t in typing.get_args(returns) or (returns,)
+            if isinstance(t, type) and issubclass(t, BlockParts)
+        ]
+        if len(kinds) != 1:
+            raise TypeError(
+                f"{parts_of.__qualname__} must return one BlockParts dataclass "
+                f"(or None), not {returns}"
+            )
+        return cls(layer_class, kinds[0].pattern, parts_of)
+
+    def parts(self, layer: nn.Module) -> BlockParts | None:
+        """The layer's parts, or None where the declaration does not cover it.
+
+        Raises:
+            BlockConformanceError: A part is not the kind its field needs,
+                named by its attribute on the layer.
+        """
+        try:
+            return self.parts_of(layer)
+        except PartsKindError as e:
+            raise BlockConformanceError(e.describe(layer)) from e
+
+    def when(self, layer: nn.Module) -> bool:
+        """Whether the declaration covers this instance."""
+        return self.parts(layer) is not None
 
     def bind(self, layer: nn.Module) -> dict[str, str]:
-        """The child bound to each role on this instance."""
-        bound = {}
-        for role, names in self.roles.items():
-            options = (names,) if isinstance(names, str) else names
-            present = [n for n in options if getattr(layer, n, None) is not None]
-            if not present:
-                raise AttributeError(f"{role}: the layer has none of {options}")
-            bound[role] = present[0]
-        return bound
+        """Each layer-level field's attribute name, recovered by identity.
+
+        Raises:
+            BlockConformanceError: The layer is not covered, or a part is not
+                one of its children.
+        """
+        parts = self.parts(layer)
+        if parts is None:
+            raise BlockConformanceError(
+                f"{self.parts_of.__qualname__} returns None for this layer"
+            )
+        return {
+            field: attribute_of(layer, module, field)
+            for field, module in parts.layer_children().items()
+        }
 
 
 DECLARATIONS: dict[tuple[type, Callable[..., Any]], BlockDeclaration] = {}
@@ -90,20 +134,28 @@ def declarations_for(layer_class: type) -> list[BlockDeclaration]:
     return [d for (cls, _), d in DECLARATIONS.items() if cls is layer_class]
 
 
-def declare_block(
-    layer_class: type,
-    *,
-    pattern: Callable[..., Any],
-    roles: dict[str, str | tuple[str, ...]],
-    when: Callable[[nn.Module], bool] = lambda layer: True,
-) -> None:
-    """Declares that ``layer_class`` conforms to ``pattern`` (model owner's API)."""
-    key = (layer_class, pattern)
-    if key in DECLARATIONS:
-        raise ValueError(
-            f"{layer_class.__qualname__} is already declared for {pattern.__name__}"
-        )
-    DECLARATIONS[key] = BlockDeclaration(layer_class, pattern, roles, when)
+def declare_block[L: nn.Module, P: BlockParts](
+    layer_class: type[L],
+) -> Callable[[Callable[[L], P | None]], Callable[[L], P | None]]:
+    """Declares a binding function for ``layer_class`` (the model owner's API).
+
+    The function takes the layer, typed as ``layer_class``, so its attribute
+    reads are type-checked against the model's class, and returns the
+    pattern's parts dataclass, or None where the layer does not conform.
+    """
+
+    def register(parts_of: Callable[[L], P | None]) -> Callable[[L], P | None]:
+        declaration = BlockDeclaration.of(layer_class, parts_of)
+        key = (layer_class, declaration.pattern)
+        if key in DECLARATIONS:
+            raise ValueError(
+                f"{layer_class.__qualname__} is already declared for "
+                f"{declaration.pattern.__name__}"
+            )
+        DECLARATIONS[key] = declaration
+        return parts_of
+
+    return register
 
 
 def load_declarations() -> None:
@@ -188,7 +240,10 @@ def install(model: nn.Module, context: InstallContext) -> list[Installed]:
     report = []
     for name, module in list(model.named_modules()):
         cls = type(module)
-        declared = [d for d in declarations_for(cls) if d.when(module)]
+        try:
+            declared = [d for d in declarations_for(cls) if d.when(module)]
+        except BlockConformanceError as e:
+            raise BlockConformanceError(f"{name} ({cls.__qualname__}): {e}") from e
         inner = {p for d in declared for p in IMPLEMENTATIONS[d.pattern].nests}
         nested = {d.pattern: d for d in declared if d.pattern in inner}
         for declaration in declared:

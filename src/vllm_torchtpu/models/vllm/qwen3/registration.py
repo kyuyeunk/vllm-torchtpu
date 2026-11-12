@@ -16,6 +16,10 @@
 from vllm.model_executor.models.qwen3 import Qwen3DecoderLayer
 
 from vllm_torchtpu.blocks import declare_block
-from vllm_torchtpu.blocks.norm_attn.pattern import PRE_NORM_ROLES, norm_then_attention
+from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnParts, pre_norm_parts
 
-declare_block(Qwen3DecoderLayer, pattern=norm_then_attention, roles=PRE_NORM_ROLES)
+
+@declare_block(Qwen3DecoderLayer)
+def qwen3_attention(layer: Qwen3DecoderLayer) -> NormAttnParts:
+    """The pre-norm attention sub-block (norm_then_attention)."""
+    return pre_norm_parts(layer, layer.self_attn)

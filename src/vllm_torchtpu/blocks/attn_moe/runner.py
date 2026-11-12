@@ -16,7 +16,7 @@
 Shaped like vLLM's ``MoERunner`` (``layers/fused_moe/runner/moe_runner.py``)
 and like ``AttentionRunner``, one scope up:
 
-- ``__init__`` receives parts already built: the front half (the nested
+- ``__init__`` receives parts already built: the attention part (the nested
   ``AttentionRunner``, or the model's own input norm and attention), the post
   norm, the router, the experts, and the per-bucket plan table. It keeps
   references; the parts stay registered where the model put them.
@@ -25,7 +25,7 @@ and like ``AttentionRunner``, one scope up:
   all-reduce).
 - ``_select_forward`` picks the implementation once.
 
-The front half's contract is stated when the block builds it: the block
+The attention part's contract is stated when the block builds it: the block
 reduces attention's output itself, so its ``AttentionRunner`` is constructed
 with ``output_reduced=False``. Nothing writes ``o_proj.reduce_results``.
 
@@ -34,6 +34,7 @@ returns the pre-attention residual and folds attention into the output, so
 the two returned tensors differ from upstream's while their sum does not.
 """
 
+import dataclasses
 from collections.abc import Callable
 from typing import Any
 
@@ -49,18 +50,12 @@ from vllm_torchtpu.blocks.attn_moe.plan import OVERLAP, BlockPlanTable
 from vllm_torchtpu.blocks.stream import StreamParams
 from vllm_torchtpu.compilation import shape_variants
 
-Front = Callable[
-    [torch.Tensor, torch.Tensor | None, torch.Tensor | None],
-    tuple[torch.Tensor, torch.Tensor],
-]
-"""``front(hidden, residual, positions) -> (attention partial sum, residual)``."""
-
 CALLS: dict[str, dict[str, int]] = {}
 """Eager runs per layer and plan value, for evidence that a value ran."""
 
 
 class ModelAttention(nn.Module):
-    """The front half for a layer with no nested sub-block: the model's own parts.
+    """The attention part for a layer with no nested sub-block: the model's own parts.
 
     Calls the model's input norm, then its attention module with the
     arguments conformance recorded. The model's attention calls its output
@@ -102,23 +97,43 @@ class ModelAttention(nn.Module):
         ), stream
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class MoEParts:
+    """What ``AttnMoERunner`` calls after attention: the model's own objects.
+
+    Execution needs only each part's call contract, so tests build this from
+    synthetic modules. A model's declaration builds ``AttnMoEParts``, which
+    extends it with the layer's other roles and checks every kind.
+
+    Attributes:
+        post_norm: The norm between attention and the MoE.
+        router: The router, returning logits (``(out, bias)`` unless built
+            with ``return_bias=False``).
+        experts: The MoE runner, taking ``(hidden_states, router_logits)``.
+    """
+
+    post_norm: nn.Module
+    router: nn.Module
+    experts: nn.Module
+
+
 class AttnMoERunner(nn.Module):
     """The block's composition; the parts stay the model's.
 
     Args:
         layer_name: The decoder layer's module path.
-        front: The nested ``AttentionRunner`` (built with
+        parts: The post norm, the router and the experts.
+        attention: The attention part: input norm -> attention -> out
+            projection, returning the unreduced attention output and the
+            residual stream. The nested ``AttentionRunner`` (built with
             ``output_reduced=False``) or a ``ModelAttention``.
-        post_norm: The norm between attention and the MoE.
-        router: The MoE router (a ``GateLinear``).
-        experts: The MoE runner, taking ``router_logits``.
         table: The plan per compiled bucket.
         tp: The tensor-parallel world size.
         stream: Where the stream sits in the layer's forward, so the runner
             can stand in for it.
     """
 
-    front: nn.Module
+    attention: nn.Module
     post_norm: nn.Module
     router: nn.Module
     experts: nn.Module
@@ -126,23 +141,21 @@ class AttnMoERunner(nn.Module):
     def __init__(
         self,
         layer_name: str,
+        parts: MoEParts,
         *,
-        front: nn.Module,
-        post_norm: nn.Module,
-        router: nn.Module,
-        experts: nn.Module,
+        attention: nn.Module,
         table: BlockPlanTable,
         tp: int,
         stream: StreamParams,
     ) -> None:
         super().__init__()
-        parts = {
-            "front": front,
-            "post_norm": post_norm,
-            "router": router,
-            "experts": experts,
+        refs = {
+            "attention": attention,
+            "post_norm": parts.post_norm,
+            "router": parts.router,
+            "experts": parts.experts,
         }
-        for name, part in parts.items():
+        for name, part in refs.items():
             object.__setattr__(self, name, part)  # a reference, not a child
         self.layer_name = layer_name
         self.table = table
@@ -190,7 +203,7 @@ class AttnMoERunner(nn.Module):
         """Upstream's collectives: all-reduce attention, all-reduce the MoE."""
         self._count("all_reduce")
         stream: torch.Tensor
-        attn, stream = self.front(hidden, residual, positions)
+        attn, stream = self.attention(hidden, residual, positions)
         h, stream = self.post_norm(tensor_model_parallel_all_reduce(attn), stream)
         out = self.experts(hidden_states=h, router_logits=self._logits(h))
         return tensor_model_parallel_all_reduce(out), stream
@@ -205,7 +218,7 @@ class AttnMoERunner(nn.Module):
         """PR #1492: norm and route a token shard; fold attention into the MoE sum."""
         self._count("reduce_scatter_all_gather")
         stream: torch.Tensor
-        attn, stream = self.front(hidden, residual, positions)
+        attn, stream = self.attention(hidden, residual, positions)
         x_loc = tensor_model_parallel_reduce_scatter(attn + stream / self.tp, 0)
         h_loc = self.post_norm(x_loc)
         logits = tensor_model_parallel_all_gather(self._logits(h_loc), 0)

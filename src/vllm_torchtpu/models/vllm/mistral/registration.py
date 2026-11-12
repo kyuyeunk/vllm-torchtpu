@@ -16,6 +16,10 @@
 from vllm.model_executor.models.mistral import MistralDecoderLayer
 
 from vllm_torchtpu.blocks import declare_block
-from vllm_torchtpu.blocks.norm_attn.pattern import PRE_NORM_ROLES, norm_then_attention
+from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnParts, pre_norm_parts
 
-declare_block(MistralDecoderLayer, pattern=norm_then_attention, roles=PRE_NORM_ROLES)
+
+@declare_block(MistralDecoderLayer)
+def mistral_attention(layer: MistralDecoderLayer) -> NormAttnParts:
+    """The pre-norm attention sub-block (norm_then_attention)."""
+    return pre_norm_parts(layer, layer.self_attn)

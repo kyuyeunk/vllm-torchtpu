@@ -17,7 +17,7 @@ A suggestion tool: it never applies anything. For one meta-built decoder
 layer per surveyed model (prototype/_build.py), it looks for children of the
 role kinds (two RMSNorm-family norms, an attention child, a MoE child), tries
 the binding, and runs the same conformance check the install runs. A layer
-that conforms gets the ``declare_block`` call its model owner could add to
+that conforms gets the binding function its model owner could add to
 ``models/<family>/<model>/registration.py``; one that does not gets the
 reason.
 """
@@ -29,50 +29,78 @@ import sys
 from torch import nn
 from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+from vllm.model_executor.layers.fused_moe.runner.moe_runner_interface import (
+    MoERunnerInterface,
+)
 
 from prototype import _build
 from vllm_torchtpu.blocks import BlockDeclaration
 from vllm_torchtpu.blocks.attn_moe import conform
-from vllm_torchtpu.blocks.attn_moe.pattern import _is_norm, attn_then_moe, moe_parts
+from vllm_torchtpu.blocks.attn_moe.pattern import AttnMoEParts
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
+from vllm_torchtpu.blocks.norm_attn.pattern import is_residual_norm
 
 
-def _moe_child(child: nn.Module) -> bool:
-    try:
-        moe_parts(child)
-    except StopIteration:
-        return False
-    return True
+def _moe_parts(child: nn.Module) -> tuple[str, str] | None:
+    """The router's and the MoE runner's names in ``child``, if it has one each."""
+    routers = [n for n, c in child.named_children() if isinstance(c, GateLinear)]
+    runners = [
+        n for n, c in child.named_children() if isinstance(c, MoERunnerInterface)
+    ]
+    return (routers[0], runners[0]) if len(routers) == len(runners) == 1 else None
 
 
-def propose(layer: nn.Module) -> BlockDeclaration | str:
-    """A conforming declaration for ``layer``, or why there is none."""
+def _binding(names: dict[str, str]):  # noqa: ANN202 - a binding function
+    def guessed(layer: nn.Module) -> AttnMoEParts:
+        moe = layer.get_submodule(names["moe"])
+        return AttnMoEParts(
+            input_norm=layer.get_submodule(names["input_norm"]),
+            attention=layer.get_submodule(names["attention"]),
+            post_norm=layer.get_submodule(names["post_norm"]),
+            moe=moe,
+            router=moe.get_submodule(names["router"]),
+            experts=moe.get_submodule(names["experts"]),
+        )
+
+    return guessed
+
+
+def propose(layer: nn.Module) -> tuple[BlockDeclaration, dict[str, str]] | str:
+    """A conforming declaration for ``layer`` and its names, or why there is none."""
     children = dict(layer.named_children())
-    norms = [n for n, c in children.items() if _is_norm(c)]
+    norms = [n for n, c in children.items() if is_residual_norm(c)]
     attns = [
         n
         for n, c in children.items()
         if any(isinstance(m, AttentionLayerBase) for m in c.modules())
     ]
-    moes = [n for n, c in children.items() if _moe_child(c)]
+    moes = [n for n, c in children.items() if _moe_parts(c) is not None]
     if len(norms) != 2 or len(attns) != 1 or len(moes) != 1:
         return (
             f"no binding: {len(norms)} norms called with a residual, "
             f"{len(attns)} attention children, {len(moes)} MoE children"
         )
     error = ""
-    for in_norm, post_norm in itertools.permutations(norms):
-        roles = {"in_norm": in_norm, "attn": attns[0], "post_norm": post_norm}
-        declaration = BlockDeclaration(
-            type(layer), attn_then_moe, roles | {"moe": moes[0]}, lambda _: True
-        )
+    found = _moe_parts(children[moes[0]])
+    assert found is not None
+    for input_norm, post_norm in itertools.permutations(norms):
+        names = {
+            "input_norm": input_norm,
+            "attention": attns[0],
+            "post_norm": post_norm,
+            "moe": moes[0],
+            "router": found[0],
+            "experts": found[1],
+        }
+        declaration = BlockDeclaration.of(type(layer), _binding(names))
         try:
             with set_current_vllm_config(_build.current_config()):
                 conform(layer, declaration)
         except BlockConformanceError as e:
             error = error or str(e)
             continue
-        return declaration
+        return declaration, names
     return f"does not conform: {error}"
 
 
@@ -93,9 +121,15 @@ def main() -> None:
             verdicts[spec.name] = "declines"
             continue
         verdicts[spec.name] = "conforms"
-        roles = ", ".join(f'"{k}": "{v}"' for k, v in found.roles.items())
-        print(f"  declare_block({spec.layer_class}, pattern=attn_then_moe,")
-        print(f"                roles={{{roles}}})")
+        _, n = found
+        print(f"  @declare_block({spec.layer_class})")
+        print(f"  def block(layer: {spec.layer_class}) -> AttnMoEParts:")
+        print("      return AttnMoEParts(")
+        for field in ("input_norm", "attention", "post_norm", "moe"):
+            print(f"          {field}=layer.{n[field]},")
+        print(f"          router=layer.{n['moe']}.{n['router']},")
+        print(f"          experts=layer.{n['moe']}.{n['experts']},")
+        print("      )")
     if "--json" in sys.argv:
         print(json.dumps(verdicts))
 

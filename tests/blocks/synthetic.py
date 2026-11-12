@@ -27,7 +27,11 @@ from torch import nn
 from vllm.model_executor.layers import layernorm
 
 from vllm_torchtpu.blocks.norm_attn import runner as runner_mod
-from vllm_torchtpu.blocks.norm_attn.runner import AttentionRunner, AttnConfig
+from vllm_torchtpu.blocks.norm_attn.runner import (
+    AttentionParts,
+    AttentionRunner,
+    AttnConfig,
+)
 
 HIDDEN = 64
 TOKENS = 7
@@ -244,8 +248,7 @@ def build_runner(
     *,
     output_reduced: bool = True,
 ) -> AttentionRunner:
-    return AttentionRunner(
-        "layer",
+    parts = AttentionParts(
         input_norm=norm,
         qkv_proj=attention.qkv_proj,
         attn=attention.attn,
@@ -253,6 +256,10 @@ def build_runner(
         rotary=attention.rotary_emb,
         q_norm=attention.q_norm,
         k_norm=attention.k_norm,
+    )
+    return AttentionRunner(
+        "layer",
+        parts,
         config=config,
         input_proj=input_proj,
         fused_op=fused_op,

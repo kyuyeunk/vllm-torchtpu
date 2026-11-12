@@ -21,8 +21,6 @@ are ``test_attention_runner.py``'s job (model-free, every role
 configuration); here one smoke check runs Llama against upstream.
 """
 
-from typing import Any
-
 import pytest
 import torch
 from torch import nn
@@ -119,17 +117,7 @@ def test_nonconforming_layer_names_edge_and_line(planted: type, edge: str) -> No
     layer.__class__ = planted
     if planted is check_subblock.ScaledQueryAttention:
         check_subblock._scale_query(layer.get_submodule("self_attn"))  # noqa: SLF001 - the planted forward
-    declaration = blocks.BlockDeclaration(
-        planted,
-        norm_then_attention,
-        {
-            "in_norm": "input_layernorm",
-            "attn": "self_attn",
-            "post_norm": "post_attention_layernorm",
-            "mlp": "mlp",
-        },
-        lambda _: True,
-    )
+    declaration = blocks.BlockDeclaration.of(planted, check_subblock._llama_parts)  # noqa: SLF001 - the planted layers' binding
     with (
         set_current_vllm_config(_build.current_config()),
         pytest.raises(
@@ -147,24 +135,27 @@ def _lone_q_norm(attention: nn.Module) -> None:
     attention.q_norm = nn.Identity()
 
 
-@pytest.mark.parametrize(
-    ("edit", "missing"),
-    [(_without_rotary, "rotary_emb"), (_lone_q_norm, "q_norm without its pair")],
-    ids=["no_rotary", "q_norm_alone"],
-)
-def test_missing_role_property_is_named(
-    edit: Any,  # noqa: ANN401 - a test case's edit
-    missing: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(norm_attn, "_conformed", {})  # Conform this layer afresh.
+def test_binding_reads_a_missing_part_and_fails() -> None:
+    """Attention without rotary_emb: the binding function's own read fails.
+
+    For a real class the type checker reports this read before anything runs
+    (the attribute is not on the class); here it is deleted at run time.
+    """
     layer, declaration = _declared(check_subblock.FAMILIES[0])
-    edit(layer.get_submodule("self_attn"))
-    with (
-        set_current_vllm_config(_build.current_config()),
-        pytest.raises(BlockConformanceError, match=f"runner implements: {missing}"),
+    _without_rotary(layer.get_submodule("self_attn"))
+    with pytest.raises(AttributeError, match="rotary_emb"):
+        declaration.parts(layer)
+
+
+def test_part_of_the_wrong_kind_is_named_by_attribute() -> None:
+    """A lone q_norm: the parts' kind check names the attribute."""
+    layer, declaration = _declared(check_subblock.FAMILIES[0])
+    _lone_q_norm(layer.get_submodule("self_attn"))
+    with pytest.raises(
+        BlockConformanceError,
+        match=r"q_norm=self_attn\.q_norm and k_norm come together",
     ):
-        norm_attn.conform(layer, declaration)
+        declaration.parts(layer)
 
 
 # The runner holds the model's own parts, and the decoder routes through it.
@@ -238,7 +229,7 @@ def test_decoder_routes_through_the_runner(
 
 
 def test_scopes_nest_on_qwen3_5() -> None:
-    """Qwen3.5 declares both scopes; the block builds the runner as its front half."""
+    """Qwen3.5 declares both scopes; the block builds the attention runner itself."""
     layer = _build.build(check_subblock.FAMILIES[2])  # Qwen3.5-MoE, full attention
     context = blocks.InstallContext(
         tp=4,
@@ -254,7 +245,7 @@ def test_scopes_nest_on_qwen3_5() -> None:
     assert "nested AttentionRunner" in outcomes[0], outcomes
     block = routed_runner(layer)
     assert isinstance(block, AttnMoERunner)
-    runner = block.front
+    runner = block.attention
     assert isinstance(runner, AttentionRunner)
     assert runner.qkv_proj is layer.get_submodule("self_attn.qkv_proj")
     assert runner.input_proj == "fused_qkv"

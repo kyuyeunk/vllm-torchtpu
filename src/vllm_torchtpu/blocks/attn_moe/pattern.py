@@ -14,13 +14,14 @@
 """The attn_then_moe pattern: a reference forward and what each role must be.
 
 Framework-owned. A model owner declares that a decoder layer conforms to this
-pattern and binds its children to the four roles (``declare_block``). The
-conformance check then holds the layer to two things:
+pattern with a binding function returning ``AttnMoEParts`` (``declare_block``).
+The conformance check then holds the layer to two things:
 
-- **Kinds.** Each bound child is what its role says (``check_roles``): two
-  RMSNorm-family norms called with a residual; an attention child holding an
-  attention layer and ending in a ``RowParallelLinear`` to the hidden size; a
-  MoE child owning a MoE runner and a ``GateLinear`` router.
+- **Kinds.** Each part is what its field says (``AttnMoEParts.problems``, run
+  when the parts are built): two RMSNorm-family norms called with a residual;
+  an attention child holding an attention layer and ending in a
+  ``RowParallelLinear`` to the hidden size; a MoE child owning the MoE runner
+  and the ``GateLinear`` router.
 - **Wiring.** With each role made opaque, the layer's forward computes the
   same graph as ``attn_then_moe`` below, and the MoE child's forward the same
   graph as ``moe_explicit_router`` or ``moe_runner_router``.
@@ -28,7 +29,7 @@ conformance check then holds the layer to two things:
 
 import dataclasses
 from collections.abc import Callable
-from typing import Literal
+from typing import Literal, Protocol
 
 import torch
 from torch import nn
@@ -40,9 +41,11 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner_interface import (
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 from vllm.model_executor.layers.linear import RowParallelLinear
 
+from vllm_torchtpu.blocks.attn_moe.runner import MoEParts
+from vllm_torchtpu.blocks.parts import BlockParts
+
 Norm = Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
 Op = Callable[[torch.Tensor], torch.Tensor]
-ROLES = ("in_norm", "attn", "post_norm", "moe")
 
 
 def attn_then_moe(
@@ -118,38 +121,6 @@ class AttnMoERoles:
     positions_param: str
 
 
-def _is_norm(module: nn.Module) -> bool:
-    return isinstance(module, (RMSNorm, GemmaRMSNorm)) and (
-        "residual" in module.forward_native.__code__.co_varnames
-    )
-
-
-def check_roles(layer: nn.Module, binding: dict[str, str]) -> list[str]:
-    """Why the bound children are not the kinds their roles need."""
-    problems = []
-    for role in ("in_norm", "post_norm"):
-        if not _is_norm(layer.get_submodule(binding[role])):
-            problems.append(
-                f"{role}={binding[role]} is not an RMSNorm called with a residual"
-            )
-    attn = layer.get_submodule(binding["attn"])
-    if not any(isinstance(m, AttentionLayerBase) for m in attn.modules()):
-        problems.append(f"attn={binding['attn']} holds no attention layer")
-    moe = layer.get_submodule(binding["moe"])
-    runners = [c for c in moe.children() if isinstance(c, MoERunnerInterface)]
-    routers = [c for c in moe.children() if isinstance(c, GateLinear)]
-    if len(runners) != 1 or len(routers) != 1:
-        problems.append(
-            f"moe={binding['moe']} owns {len(runners)} MoE runners and "
-            f"{len(routers)} GateLinear routers, not one each"
-        )
-    elif out_proj_of(attn, int(routers[0].input_size)) is None:
-        problems.append(
-            f"attn={binding['attn']} has no RowParallelLinear to the hidden size"
-        )
-    return problems
-
-
 def out_proj_of(attn: nn.Module, hidden: int) -> str | None:
     """The last RowParallelLinear to ``hidden`` in attention's subtree."""
     found = None
@@ -159,27 +130,15 @@ def out_proj_of(attn: nn.Module, hidden: int) -> str | None:
     return found
 
 
-def moe_parts(moe: nn.Module) -> tuple[str, str]:
-    """The MoE child's runner and router names (after ``check_roles``)."""
-    runner = next(
-        n for n, c in moe.named_children() if isinstance(c, MoERunnerInterface)
-    )
-    router = next(n for n, c in moe.named_children() if isinstance(c, GateLinear))
-    return runner, router
-
-
-def block_key(
-    layer: nn.Module, binding: dict[str, str], tp: int, dtype: str
-) -> BlockKey:
-    """The plan's key, read from the bound children."""
-    moe = layer.get_submodule(binding["moe"])
-    runner_name, router_name = moe_parts(moe)
-    runner, router = moe.get_submodule(runner_name), moe.get_submodule(router_name)
+def block_key(parts: "AttnMoEParts", tp: int, dtype: str) -> BlockKey:
+    """The plan's key, read from the declared parts."""
+    runner, router = parts.experts, parts.router
     cfg = runner.moe_config
     sp = bool(getattr(cfg, "is_sequence_parallel", False))
-    attn = layer.get_submodule(binding["attn"])
     kind = next(
-        type(m).__name__ for m in attn.modules() if isinstance(m, AttentionLayerBase)
+        type(m).__name__
+        for m in parts.attention.modules()
+        if isinstance(m, AttentionLayerBase)
     )
     return BlockKey(
         kind="attn_then_moe",
@@ -201,4 +160,100 @@ def block_key(
             if sp
             else "late_all_reduce"
         ),
+    )
+
+
+def _is_residual_norm(module: nn.Module) -> bool:
+    return isinstance(module, (RMSNorm, GemmaRMSNorm)) and (
+        "residual" in module.forward_native.__code__.co_varnames
+    )
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class AttnMoEParts(MoEParts, BlockParts):
+    """A declared layer's parts for attn_then_moe.
+
+    The runner's parts (``MoEParts``: post norm, router, experts) plus the
+    layer's other roles: the input norm, the attention child (the front half,
+    run whole or through the nested ``AttentionRunner``) and the MoE child
+    that owns the router and the experts.
+    """
+
+    input_norm: nn.Module
+    attention: nn.Module
+    moe: nn.Module
+
+    pattern = staticmethod(attn_then_moe)
+
+    def layer_children(self) -> dict[str, nn.Module]:
+        return {
+            "input_norm": self.input_norm,
+            "attention": self.attention,
+            "post_norm": self.post_norm,
+            "moe": self.moe,
+        }
+
+    def problems(self) -> list[tuple[str, str]]:
+        problems = [
+            (name, f"is a {type(norm).__name__}, not an RMSNorm called with a residual")
+            for name, norm in (
+                ("input_norm", self.input_norm),
+                ("post_norm", self.post_norm),
+            )
+            if not _is_residual_norm(norm)
+        ]
+        if not any(isinstance(m, AttentionLayerBase) for m in self.attention.modules()):
+            problems.append(("attention", "holds no attention layer"))
+        kinds = (
+            ("router", GateLinear, "a GateLinear"),
+            ("experts", MoERunnerInterface, "a MoE runner"),
+        )
+        children = list(self.moe.children())
+        for name, kind, words in kinds:
+            part = getattr(self, name)
+            if not isinstance(part, kind):
+                problems.append((name, f"is a {type(part).__name__}, not {words}"))
+            if not any(c is part for c in children):
+                problems.append((name, "is not a child of moe"))
+        router = self.router
+        if (
+            not problems
+            and isinstance(router, GateLinear)
+            and out_proj_of(self.attention, int(router.input_size)) is None
+        ):
+            problems.append(
+                ("attention", "has no RowParallelLinear to the hidden size")
+            )
+        return problems
+
+
+class RoutedMoE(Protocol):
+    """A MoE child with vLLM's usual part names."""
+
+    @property
+    def gate(self) -> nn.Module: ...
+    @property
+    def experts(self) -> nn.Module: ...
+
+
+class PreNormMoELayer(Protocol):
+    """A pre-norm decoder layer with vLLM's usual child names (attention aside)."""
+
+    @property
+    def input_layernorm(self) -> nn.Module: ...
+    @property
+    def post_attention_layernorm(self) -> nn.Module: ...
+
+
+def pre_norm_moe_parts(
+    layer: PreNormMoELayer, attention: nn.Module, moe: RoutedMoE
+) -> AttnMoEParts:
+    """The parts of a layer, its attention and its MoE, under vLLM's usual names."""
+    return AttnMoEParts(
+        input_norm=layer.input_layernorm,
+        attention=attention,
+        post_norm=layer.post_attention_layernorm,
+        moe=moe,  # type: ignore[arg-type]  # a Protocol over an nn.Module
+        router=moe.gate,
+        experts=moe.experts,
     )
