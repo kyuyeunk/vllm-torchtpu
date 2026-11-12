@@ -33,6 +33,8 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear
 
+from vllm_torchtpu.blocks.norm_attn.runner import AttnConfig
+
 Norm = Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
 Op = Callable[[torch.Tensor], torch.Tensor]
 
@@ -70,7 +72,11 @@ class NormAttnRoles:
         qkv_proj: Dotted path of attention's input projection.
         attention_args: Attention's keyword arguments and their sources.
         hidden_param, residual_param, positions_param: The forward's stream
-            parameters ("" when there is no positions parameter).
+            parameters.
+        parts: The attention role's parts the runner holds: part -> child
+            name inside attention (``qkv_proj``, ``attn``, ``o_proj``,
+            ``rotary``, and ``q_norm`` / ``k_norm`` when present).
+        config: The role properties the runner's composition reads.
     """
 
     input_norm: str
@@ -82,6 +88,8 @@ class NormAttnRoles:
     hidden_param: str
     residual_param: str
     positions_param: str
+    parts: tuple[tuple[str, str], ...]
+    config: AttnConfig
 
 
 def is_residual_norm(module: nn.Module) -> bool:

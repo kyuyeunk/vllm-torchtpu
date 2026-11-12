@@ -14,8 +14,10 @@
 """The pre-norm attention sub-block: one fusion for every model that declares it.
 
 ``pattern`` is the reference forward and the role kinds; ``conform`` checks a
-declared layer against it; ``plan`` picks whether the input norm joins
-attention's projection; ``forward`` runs the fused value through the roles.
+declared layer against it, twice: the layer's wiring against the pattern, and
+attention's own forward against ``AttentionRunner``'s composition; ``plan``
+picks the value; ``runner`` is the one forward every declared layer then runs,
+shaped like vLLM's ``MoERunner``.
 """
 
 import contextlib
@@ -24,7 +26,6 @@ from typing import Any
 
 import torch
 from torch import nn
-from vllm.model_executor.layers.linear import LinearBase
 
 from vllm_torchtpu.blocks import (
     BlockDeclaration,
@@ -33,17 +34,19 @@ from vllm_torchtpu.blocks import (
     block_implementation,
 )
 from vllm_torchtpu.blocks import conformance as conf
+from vllm_torchtpu.blocks.attn_moe.forward import _arg
 from vllm_torchtpu.blocks.norm_attn import plan as plan_mod
-from vllm_torchtpu.blocks.norm_attn.forward import (
-    AddOnly,
-    FusedNormProjection,
-    install_fused_qkv,
-)
 from vllm_torchtpu.blocks.norm_attn.pattern import (
     NormAttnRoles,
     check_roles,
     norm_then_attention,
     qkv_proj_of,
+)
+from vllm_torchtpu.blocks.norm_attn.runner import (
+    AttentionRunner,
+    AttnConfig,
+    FusedOp,
+    reference_fused_qkv,
 )
 from vllm_torchtpu.logger import init_logger
 
@@ -58,8 +61,21 @@ def _fail(layer: nn.Module, why: str) -> conf.BlockConformanceError:
     )
 
 
+def original_class(layer: nn.Module) -> type:
+    """The model's own class, under any framework mixin an installer placed."""
+    from vllm_torchtpu.blocks.attn_moe.forward import (  # noqa: PLC0415
+        AttentionMoEBlock,
+    )
+
+    mixins = (AttentionMoEBlock, NormAttnDecoder)
+    for cls in type(layer).__mro__:
+        if cls not in mixins and not any(m in cls.__bases__ for m in mixins):
+            return cls
+    raise TypeError(type(layer))
+
+
 def _stream_params(layer: nn.Module) -> tuple[str, str, str]:
-    params = inspect.signature(layer.forward).parameters
+    params = inspect.signature(original_class(layer).forward).parameters
     hidden = next((p for p in ("hidden_states", "x") if p in params), "")
     residual = "residual" if "residual" in params else ""
     positions = next((p for p in ("positions", "position_ids") if p in params), "")
@@ -81,9 +97,10 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnRoles:
     """Checks a declared layer against norm_then_attention; returns its roles.
 
     Three checks, all on the meta device: the roles are the right kinds; with
-    the roles opaque, the layer's forward computes the pattern's graph (so the
-    normed tokens reach nothing but attention); and attention's input reaches
-    nothing but its QKV projection, so the fused value can normalize there.
+    the roles opaque, the layer's forward computes the pattern's graph (the
+    normed tokens and the positions reach nothing but attention); and, with
+    attention's parts opaque, attention's own forward is the runner's
+    composition (``conform_attention``), so the runner can replace it.
 
     Raises:
         BlockConformanceError: Naming the role, edge and source line.
@@ -106,13 +123,6 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnRoles:
     )
     meta = {"device": "meta", "dtype": torch.bfloat16}
     x = torch.empty(_TOKENS, hidden, **meta)
-    # The attention probe below runs attention's own children (RoPE, q/k
-    # norms), so its tensors live where attention's weights do.
-    param = next(attn.parameters(), None)
-    live = {
-        "device": param.device if param is not None else "meta",
-        "dtype": torch.bfloat16,
-    }
     args = (
         x,
         torch.empty_like(x),
@@ -132,10 +142,12 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnRoles:
         seen["normed"] = out = in_norm_stub(*a, **k)
         return out
 
+    forward = original_class(layer).forward.__get__(layer)
+
     def layer_fn(h: torch.Tensor, r: torch.Tensor, p: torch.Tensor) -> Any:  # noqa: ANN401
         seen["inputs"] = {hidden_p: h, residual_p: r, positions_p: p}
         call = {hidden_p: h, residual_p: r} | ({positions_p: p} if positions_p else {})
-        return layer(**call)
+        return forward(**call)
 
     def pattern_fn(h: torch.Tensor, r: torch.Tensor, p: torch.Tensor) -> Any:  # noqa: ANN401
         del p
@@ -171,76 +183,167 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnRoles:
         for k, v in seen["attn"].items()
         if isinstance(v, torch.Tensor)
     )
+    reads = dict(attention_args)
+    if sorted(reads.values()) != sorted(["normed", positions_p]) or not positions_p:
+        raise _fail(
+            layer, f"attention reads {reads}, not the normed tokens and the positions"
+        )
+    attn_hidden = next(k for k, src in attention_args if src == "normed")
+    attn_positions = next(k for k, src in attention_args if src == positions_p)
 
-    # Attention's input reaches nothing but its QKV projection: run attention
-    # on the meta device with the projection and the attention core opaque,
-    # and record every other op that touches the input.
-    (qkv_name,) = qkv_proj_of(attn, hidden)
-    proj = attn.get_submodule(qkv_name)
-    probe = torch.empty(_TOKENS, hidden, **live)
-    by_source = {"normed": probe, hidden_p: probe, residual_p: torch.empty_like(probe)}
-    by_source[positions_p] = torch.zeros(
-        _TOKENS, device=live["device"], dtype=torch.long
+    # Attention's own forward against the runner's composition.
+    parts, config = conform_attention(
+        attn, hidden, attn_hidden, attn_positions, f" on {type(layer).__qualname__}"
     )
-    call = {k: by_source[src] for k, src in attention_args}
-    width = int(proj.output_size_per_partition)
-    used: list[str] = []
-    projected: list[bool] = []
-
-    def projection(t: torch.Tensor) -> Any:  # noqa: ANN401
-        projected.append(t is probe)
-        out = torch.empty(_TOKENS, width, **live)
-        return (out, None) if getattr(proj, "return_bias", True) else out
-
-    def core(q: torch.Tensor, *a: Any, **k: Any) -> torch.Tensor:  # noqa: ANN401
-        return torch.empty_like(q)
-
-    class _Uses(torch.overrides.TorchFunctionMode):
-        def __torch_function__(self, func, types, a=(), k=None):  # noqa: ANN001, ANN204
-            k = k or {}
-            if any(x is probe for x in (*a, *k.values())):
-                used.append(getattr(func, "__name__", str(func)))
-            return func(*a, **k)
-
-    cores = [m for m in attn.modules() if isinstance(m, conf_core_types())]
-    linears = [m for m in attn.modules() if isinstance(m, LinearBase) and m is not proj]
-
-    def linear_stub(m: nn.Module):  # noqa: ANN202
-        def stub(x: torch.Tensor, *a: Any, **k: Any) -> Any:  # noqa: ANN401
-            out = x.new_empty((*x.shape[:-1], int(m.output_size_per_partition)))
-            return (out, None) if getattr(m, "return_bias", True) else out
-
-        return stub
-
-    with contextlib.ExitStack() as stack:
-        stack.enter_context(conf.opaque(proj, projection))
-        for m in cores:
-            stack.enter_context(conf.opaque(m, core))
-        for m in linears:
-            stack.enter_context(conf.opaque(m, linear_stub(m)))
-        stack.enter_context(_Uses())
-        try:
-            attn(**call)
-        except Exception as e:  # noqa: BLE001 - a forward that will not run here
-            raise _fail(layer, f"attention does not run on a probe: {e}") from e
-    if projected != [True]:
-        raise _fail(layer, f"attention does not pass its input to {qkv_name} once")
-    if used:
-        raise _fail(layer, f"attention also reads its input in {sorted(set(used))}")
 
     roles = NormAttnRoles(
         input_norm=binding["in_norm"],
         attention=binding["attn"],
-        qkv_proj=f"{binding['attn']}.{qkv_name}",
+        qkv_proj=f"{binding['attn']}.{parts['qkv_proj']}",
         post_norm=binding["post_norm"],
         mlp=binding["mlp"],
         attention_args=attention_args,
         hidden_param=hidden_p,
         residual_param=residual_p,
         positions_param=positions_p,
+        parts=tuple(sorted(parts.items())),
+        config=config,
     )
     _conformed[cache_key] = roles
     return roles
+
+
+def _missing(where: str, what: str) -> conf.BlockConformanceError:
+    return conf.BlockConformanceError(
+        f"declared {_PATTERN}{where}, but attention lacks a role property the "
+        f"runner implements: {what}"
+    )
+
+
+def attention_parts(
+    attn: nn.Module, hidden: int, where: str = ""
+) -> tuple[dict[str, str], AttnConfig]:
+    """The attention role's parts (child names) and the properties the runner reads.
+
+    The parts are vLLM's shared building blocks, found by kind: the QKV
+    projection from the hidden size, ``o_proj``, ``rotary_emb``, the attention
+    core and, together or not at all, per-head ``q_norm`` and ``k_norm``.
+
+    Raises:
+        BlockConformanceError: A part or property the runner needs is missing,
+            or present in a form it does not implement.
+    """
+    (qkv_name,) = qkv_proj_of(attn, hidden)
+    cores = [n for n, m in attn.named_modules() if isinstance(m, conf_core_types())]
+    if len(cores) != 1:
+        raise _missing(where, f"one attention core, found {len(cores)}")
+    parts = {"qkv_proj": qkv_name, "attn": cores[0]}
+    for part, name in (("o_proj", "o_proj"), ("rotary", "rotary_emb")):
+        if getattr(attn, name, None) is None:
+            raise _missing(where, f"{name}")
+        parts[part] = name
+    norms = [n for n in ("q_norm", "k_norm") if getattr(attn, n, None) is not None]
+    if len(norms) == 1:
+        raise _missing(where, f"{norms[0]} without its pair")
+    # The projection holds this rank's head counts (qkv_proj_of found it by
+    # kind); attention's sizes would be a second copy of them. Its query
+    # heads include an output gate's copies.
+    qkv = attn.get_submodule(qkv_name)
+    output_gate = bool(getattr(attn, "attn_output_gate", False))
+    head_dim = qkv.head_size
+    for n in norms:
+        width = int(getattr(attn, n).weight.numel())
+        if width != head_dim:
+            raise _missing(
+                where,
+                f"{n} over {width} values; the runner implements a per-head "
+                f"norm over head_dim {head_dim}",
+            )
+        parts[n] = n
+    config = AttnConfig(
+        num_heads=qkv.num_heads // 2 if output_gate else qkv.num_heads,
+        num_kv_heads=qkv.num_kv_heads,
+        head_dim=head_dim,
+        qk_norm=bool(norms),
+        output_gate=output_gate,
+    )
+    return parts, config
+
+
+def conform_attention(
+    attn: nn.Module,
+    hidden: int,
+    hidden_param: str,
+    positions_param: str,
+    where: str = "",
+) -> tuple[dict[str, str], AttnConfig]:
+    """Checks that attention's forward is the runner's composition of its parts.
+
+    With every part opaque, attention's own forward must export to the same
+    graph as ``AttentionRunner.attention_from_qkv`` after the projection: the
+    same split, q/k norms, RoPE, gate and output projection, and nothing else.
+
+    Raises:
+        BlockConformanceError: Naming the role, edge and source line.
+    """
+    parts, config = attention_parts(attn, hidden, where)
+    mod = {k: attn.get_submodule(v) for k, v in parts.items()}
+
+    def projection(m: nn.Module, role: str):  # noqa: ANN202
+        width = int(m.output_size_per_partition)
+
+        def stub(x: torch.Tensor, *a: Any, **k: Any) -> Any:  # noqa: ANN401
+            out = conf.ops.project(x, width, role)
+            return (out, None) if getattr(m, "return_bias", True) else out
+
+        return stub
+
+    stubs = {
+        "qkv_proj": projection(mod["qkv_proj"], "qkv_proj"),
+        "o_proj": projection(mod["o_proj"], "o_proj"),
+        "rotary": lambda positions, q, k, *a, **kw: conf.ops.pair(q, k, "rope"),
+        "attn": lambda q, k, v, *a, **kw: conf.ops.binary(
+            conf.ops.binary(q, k, "attn"), v, "attn_v"
+        ),
+    }
+    stubs |= {
+        n: (lambda role: lambda x: conf.ops.unary(x, role))(n)
+        for n in ("q_norm", "k_norm")
+        if n in mod
+    }
+    runner = AttentionRunner(
+        "conformance",
+        input_norm=nn.Identity(),
+        qkv_proj=mod["qkv_proj"],
+        attn=mod["attn"],
+        o_proj=mod["o_proj"],
+        rotary=mod["rotary"],
+        q_norm=mod.get("q_norm"),
+        k_norm=mod.get("k_norm"),
+        config=config,
+    )
+    meta = {"device": "meta", "dtype": torch.bfloat16}
+    args = (
+        torch.empty(_TOKENS, hidden, **meta),
+        torch.empty(_TOKENS, device="meta", dtype=torch.long),
+    )
+    names = ("hidden", "positions")
+
+    def model_fn(x: torch.Tensor, p: torch.Tensor) -> Any:  # noqa: ANN401
+        return attn(**{hidden_param: x, positions_param: p})
+
+    def runner_fn(x: torch.Tensor, p: torch.Tensor) -> Any:  # noqa: ANN401
+        qkv, _ = runner.qkv_proj(x)
+        return runner.attention_from_qkv(qkv, p)
+
+    with contextlib.ExitStack() as stack:
+        for part, stub in stubs.items():
+            stack.enter_context(conf.opaque(mod[part], stub))
+        got = conf.canonicalize(conf.export(model_fn, args, attn), names)
+        want = conf.canonicalize(conf.export(runner_fn, args, None), names)
+    if error := conf.compare(_PATTERN, got, want, f" (attention{where})"):
+        raise conf.BlockConformanceError(error)
+    return parts, config
 
 
 logger = init_logger(__name__)
@@ -254,6 +357,69 @@ def conf_core_types() -> tuple[type, ...]:
     return (AttentionLayerBase,)
 
 
+class NormAttnDecoder(nn.Module):
+    """Mixin placed before a declared decoder layer's class.
+
+    Runs the sub-block through its ``AttentionRunner``, then the rest of the
+    layer (the second norm and the MLP, opaque), which conformance has shown
+    is all the layer computes. The installer sets ``_norm_attn_roles``,
+    ``_norm_attn_order`` and ``_norm_attn_runner``.
+    """
+
+    _norm_attn_roles: NormAttnRoles
+    _norm_attn_order: tuple[str, ...]
+    _norm_attn_runner: AttentionRunner
+
+    def forward(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:  # noqa: ANN401
+        r, order = self._norm_attn_roles, self._norm_attn_order
+        hidden = _arg(args, kwargs, order, r.hidden_param)
+        residual = _arg(args, kwargs, order, r.residual_param)
+        positions = _arg(args, kwargs, order, r.positions_param)
+        x, residual = self._norm_attn_runner(hidden, residual, positions)
+        x, residual = self.get_submodule(r.post_norm)(x, residual)
+        return self.get_submodule(r.mlp)(x), residual
+
+
+_decoder_classes: dict[type, type] = {}
+
+
+def _decoder_class(cls: type) -> type:
+    if cls not in _decoder_classes:
+        decoder = type(cls.__name__, (NormAttnDecoder, cls), {})
+        decoder.__qualname__ = cls.__qualname__
+        _decoder_classes[cls] = decoder
+    return _decoder_classes[cls]
+
+
+def build_runner(
+    name: str,
+    layer: nn.Module,
+    roles: NormAttnRoles,
+    input_proj: str,
+    fused_op: FusedOp | None = None,
+) -> AttentionRunner:
+    """The runner for one declared layer, holding the layer's own parts."""
+    attention = layer.get_submodule(roles.attention)
+    parts = {k: attention.get_submodule(v) for k, v in roles.parts}
+    return AttentionRunner(
+        name,
+        input_norm=layer.get_submodule(roles.input_norm),
+        qkv_proj=parts["qkv_proj"],
+        attn=parts["attn"],
+        o_proj=parts["o_proj"],
+        rotary=parts["rotary"],
+        q_norm=parts.get("q_norm"),
+        k_norm=parts.get("k_norm"),
+        config=roles.config,
+        input_proj=input_proj,
+        fused_op=fused_op if input_proj == "fused_qkv" else None,
+    )
+
+
+FUSED_OP: FusedOp = reference_fused_qkv
+"""The fused value's implementation: the plain-torch reference, or a kernel."""
+
+
 @block_implementation(norm_then_attention)
 class NormThenAttention:
     """Conforms, resolves and installs one declared norm_then_attention layer."""
@@ -265,10 +431,12 @@ class NormThenAttention:
         declaration: BlockDeclaration,
         context: InstallContext,
     ) -> Installed:
+        cls = type(layer)
+        if isinstance(layer, NormAttnDecoder) or hasattr(layer, "_norm_attn_runner"):
+            return Installed(name, cls.__qualname__, "already installed")
         roles = conform(layer, declaration)
         attention = layer.get_submodule(roles.attention)
         first, pinned = plan_mod.resolve(context.subblock_plan, attention)
-        cls = type(layer).__qualname__
         declined: list[str] = []
         for plan in plan_mod.candidates(first):
             if any(getattr(plan, f) != getattr(first, f) for f in pinned):
@@ -283,16 +451,32 @@ class NormThenAttention:
             declined.append(f"{plan.input_proj}/{plan.matmul} declined: {why}")
         else:  # Every value the pins allow is declined: stop at startup.
             pins = ",".join(f"{f}={getattr(first, f)}" for f in sorted(pinned))
-            raise ValueError(f"TPU_SUBBLOCK_PLAN {pins} on {cls}: {declined[0]}")
+            raise ValueError(
+                f"TPU_SUBBLOCK_PLAN {pins} on {cls.__qualname__}: {declined[0]}"
+            )
+        for item in declined:  # The rule's value fell back: quiet.
+            logger.debug("%s: %s", name, item)
+        runner = build_runner(name, layer, roles, plan.input_proj, FUSED_OP)
         source = "user" if pinned else "rule"
-        note = f" ({'; '.join(declined)})" if declined else f" ({source})"
-        if plan.input_proj == "unfused":
-            return Installed(name, cls, f"conforms; input_proj=unfused{note}")
-        if isinstance(layer.get_submodule(roles.input_norm), AddOnly):
-            return Installed(name, cls, "already installed")
-        install_fused_qkv(layer, roles.input_norm, roles.qkv_proj)
-        assert isinstance(layer.get_submodule(roles.qkv_proj), FusedNormProjection)
-        logger.debug("%s: matmul=%s", name, plan.matmul)
-        return Installed(
-            name, cls, f"installed; input_proj=fused_qkv matmul={plan.matmul}{note}"
+        matmul = f" matmul={plan.matmul}" if plan.input_proj == "fused_qkv" else ""
+        what = f"input_proj={plan.input_proj}{matmul} ({source})"
+        from vllm_torchtpu.blocks.attn_moe.forward import (  # noqa: PLC0415
+            AttentionMoEBlock,
         )
+
+        if isinstance(layer, AttentionMoEBlock):
+            # Scopes nest: attn_then_moe's block already owns the layer's
+            # forward and runs its front half through this runner.
+            object.__setattr__(layer, "_norm_attn_runner", runner)
+            return Installed(
+                name, original_class(layer).__qualname__, f"runner inside block; {what}"
+            )
+        object.__setattr__(layer, "_norm_attn_roles", roles)
+        object.__setattr__(
+            layer,
+            "_norm_attn_order",
+            tuple(inspect.signature(layer.forward).parameters),
+        )
+        object.__setattr__(layer, "_norm_attn_runner", runner)
+        layer.__class__ = _decoder_class(cls)
+        return Installed(name, cls.__qualname__, f"runner installed; {what}")

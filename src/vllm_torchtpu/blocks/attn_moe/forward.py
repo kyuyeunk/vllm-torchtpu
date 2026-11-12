@@ -80,14 +80,18 @@ class AttentionMoEBlock(nn.Module):
         router = self.get_submodule(roles.router)
         experts = self.get_submodule(roles.experts)
 
-        if residual is None:
-            residual = hidden
-            normed = input_norm(hidden)
+        runner = self.__dict__.get("_norm_attn_runner")
+        if runner is not None:  # The nested sub-block's plan (norm_then_attention).
+            attn, residual = runner(hidden, residual, stream[roles.positions_param])
         else:
-            normed, residual = input_norm(hidden, residual)
-        stream["normed"] = normed
-        # Partial sum over TP: the output projection does not reduce.
-        attn = attention(**{k: stream[src] for k, src in roles.attention_args})
+            if residual is None:
+                residual = hidden
+                normed = input_norm(hidden)
+            else:
+                normed, residual = input_norm(hidden, residual)
+            stream["normed"] = normed
+            # Partial sum over TP: the output projection does not reduce.
+            attn = attention(**{k: stream[src] for k, src in roles.attention_args})
 
         # Only the backbone warmup gives each bucket its own trace; a compile
         # outside it (the profile run, the MTP drafter) keeps the all-reduce
