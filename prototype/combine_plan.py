@@ -53,12 +53,10 @@ CALLS = [(16, 8), (512, 8), (2048, 4)]
 BF16 = jnp.dtype(jnp.bfloat16)
 
 
-def describe(tokens: int, topk: int) -> tuple[moe_plan.MoeOpIn, moe_plan.GmmOutSpec]:
+def describe(tokens: int, topk: int) -> tuple[moe_plan.MoeOpIn, moe_plan.GmmOut]:
     """The planner's descriptions of one call."""
     op = moe_plan.MoeOpIn(num_tokens=tokens, topk=topk, local_num_experts=64)
-    out = moe_plan.GmmOutSpec(
-        rows=op.routes, hidden=4096, dtype=BF16, weights_dtype=BF16
-    )
+    out = moe_plan.GmmOut(hidden=4096, dtype=BF16, weights_dtype=BF16)
     return op, out
 
 
@@ -87,7 +85,7 @@ class Raises:
 def outcome(
     process: moe_plan.MoeProcess,
     op: moe_plan.MoeOpIn,
-    out: moe_plan.GmmOutSpec,
+    out: moe_plan.GmmOut,
     chip: pltpu.TpuInfo | None,
 ) -> Runs | Raises:
     """What one call runs under `process`, or why it raises."""

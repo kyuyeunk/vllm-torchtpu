@@ -575,8 +575,7 @@ def moe_combine(
         moe_plan.MoeOpIn(
             num_tokens=num_tokens, topk=topk, local_num_experts=group_sizes.shape[0]
         ),
-        moe_plan.GmmOutSpec(
-            rows=gmm2_res.shape[0],
+        moe_plan.GmmOut(
             hidden=gmm2_res.shape[1],
             dtype=gmm2_res.dtype,
             weights_dtype=topk_weights_flat.dtype,

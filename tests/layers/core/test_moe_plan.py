@@ -32,11 +32,9 @@ _OWNER = MoeProcess(
 
 def _call(
     tokens: int, topk: int, weights: jnp.dtype = _BF16
-) -> tuple[moe_plan.MoeOpIn, moe_plan.GmmOutSpec]:
+) -> tuple[moe_plan.MoeOpIn, moe_plan.GmmOut]:
     op = moe_plan.MoeOpIn(num_tokens=tokens, topk=topk, local_num_experts=64)
-    out = moe_plan.GmmOutSpec(
-        rows=op.routes, hidden=4096, dtype=_BF16, weights_dtype=weights
-    )
+    out = moe_plan.GmmOut(hidden=4096, dtype=_BF16, weights_dtype=weights)
     return op, out
 
 

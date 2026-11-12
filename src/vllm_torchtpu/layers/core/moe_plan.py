@@ -133,32 +133,33 @@ class MoeOpIn:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
-class GmmOutSpec:
+class GmmOut:
     """The second GMM's output and routing weights, which the combine reads.
 
+    The output has one row per route, so its row count is `MoeOpIn.routes`
+    and is not restated here.
+
     Attributes:
-        rows: Routed rows of the GMM output.
         hidden: Width of the GMM output.
         dtype: GMM output dtype.
         weights_dtype: Top-k weights dtype.
     """
 
-    rows: int
     hidden: int
     dtype: jnp.dtype
     weights_dtype: jnp.dtype
 
 
-def combine_args(op: MoeOpIn, out: GmmOutSpec) -> tuple[jax.ShapeDtypeStruct, ...]:
+def combine_args(op: MoeOpIn, out: GmmOut) -> tuple[jax.ShapeDtypeStruct, ...]:
     """The arrays the layer passes a combine, as shapes and dtypes."""
     sds = jax.ShapeDtypeStruct
     return (
-        sds((out.rows, out.hidden), out.dtype),  # gmm2_res
+        sds((op.routes, out.hidden), out.dtype),  # gmm2_res
         sds((op.local_num_experts,), jnp.int32),  # group_sizes
         sds((op.routes,), jnp.int32),  # argsort_revert_indices
         sds((op.routes,), out.weights_dtype),  # topk_weights_flat
         sds((op.routes,), jnp.bool_),  # valid_mask_flat
-        sds((out.rows,), jnp.int32),  # token_indices_sorted
+        sds((op.routes,), jnp.int32),  # token_indices_sorted
     )
 
 
@@ -285,7 +286,7 @@ DEFAULT = Combine.TENSORCORE
 
 
 def combine_capable(
-    process: MoeProcess, op: MoeOpIn, out: GmmOutSpec, chip: pltpu.TpuInfo | None
+    process: MoeProcess, op: MoeOpIn, out: GmmOut, chip: pltpu.TpuInfo | None
 ) -> dict[Combine, str | None]:
     """Why each variant cannot run this call; None for those that can."""
     args = combine_args(op, out)
@@ -320,7 +321,7 @@ class OverrideCannotRunError(ValueError):
 
 
 def pick_combine(
-    process: MoeProcess, op: MoeOpIn, out: GmmOutSpec, chip: pltpu.TpuInfo | None
+    process: MoeProcess, op: MoeOpIn, out: GmmOut, chip: pltpu.TpuInfo | None
 ) -> tuple[MoeCombinePlan, Pick]:
     """Picks the combine for one call, and says why.
 
@@ -350,7 +351,7 @@ def pick_combine(
 
 
 def plan_combine(
-    process: MoeProcess, op: MoeOpIn, out: GmmOutSpec, chip: pltpu.TpuInfo | None
+    process: MoeProcess, op: MoeOpIn, out: GmmOut, chip: pltpu.TpuInfo | None
 ) -> MoeCombinePlan:
     """The combine `pick_combine` picks for one call."""
     return pick_combine(process, op, out, chip)[0]
