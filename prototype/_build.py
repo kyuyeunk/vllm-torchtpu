@@ -99,6 +99,36 @@ class Spec:
     layer_class: type[nn.Module]
     make: Callable[[Built], nn.Module]
     use_mla: bool = False
+    stub: Callable[[], contextlib.AbstractContextManager[None]] = contextlib.nullcontext
+
+
+@contextlib.contextmanager
+def _gated_experts_on_cpu() -> Iterator[None]:
+    """Builds Nemotron-H's experts gated (SiLU) instead of non-gated (relu2).
+
+    No CPU MoE backend runs non-gated experts, so FusedMoE refuses to build
+    them here. The expert activation lives inside the MoE child, which the
+    conformance check treats as one opaque role; the norm, the mixer and their
+    wiring come from the same constructor either way. Construction only;
+    nothing runs.
+    """
+    real = nemotron_h.FusedMoEFactory
+
+    def gated(
+        *,
+        ckpt_names: tuple[str, str, str | None],
+        activation: str,
+        **kwargs: Any,  # noqa: ANN401
+    ) -> Any:  # noqa: ANN401
+        del activation
+        gate, down, _ = ckpt_names
+        return real(**kwargs, activation="silu", ckpt_names=(gate, down, "w3"))
+
+    nemotron_h.FusedMoEFactory = gated  # pyright: ignore[reportAttributeAccessIssue]
+    try:
+        yield
+    finally:
+        nemotron_h.FusedMoEFactory = real
 
 
 def _hf_args(b: Built) -> tuple[Any, Any]:
@@ -360,6 +390,7 @@ SPECS: tuple[Spec, ...] = (
             parallel_config=b.vllm_config.parallel_config,
             prefix=b.prefix,
         ),
+        stub=_gated_experts_on_cpu,
     ),
 )
 
@@ -421,6 +452,6 @@ def build(
     """Builds the spec's decoder layer through its own constructor."""
     _world()
     hf = spec.config()
-    with _config_for(hf, spec.use_mla) as config, torch.device(device):
+    with _config_for(hf, spec.use_mla) as config, torch.device(device), spec.stub():
         _LAST[:] = [config]
         return spec.make(Built(config, hf, prefix))
