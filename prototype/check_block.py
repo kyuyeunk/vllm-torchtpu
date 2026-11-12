@@ -148,9 +148,10 @@ def outside_write() -> list[str]:
     return ["out_proj.reduce_results = True was accepted after binding"]
 
 
-def mismatch_declines() -> list[str]:
+def mismatch_raises() -> list[str]:
     layer = fixtures.ReorderedNorms(_build.build(_build.SPECS[0]))
-    blocks.DECLARATIONS[(fixtures.ReorderedNorms, attn_then_moe)] = BlockDeclaration(
+    key = (fixtures.ReorderedNorms, attn_then_moe)
+    blocks.DECLARATIONS[key] = BlockDeclaration(
         fixtures.ReorderedNorms, attn_then_moe, fixtures.RENAMED_ROLES, lambda _: True
     )
     context = blocks.InstallContext(
@@ -160,13 +161,15 @@ def mismatch_declines() -> list[str]:
         override="",
         model_plan="",
     )
-    with set_current_vllm_config(_build.current_config()):
-        (item,) = blocks.install(nn.ModuleDict({"layer": layer}), context)
-    del blocks.DECLARATIONS[(fixtures.ReorderedNorms, attn_then_moe)]
-    print(f"    {item.layer_class}: {item.outcome}")
-    if not item.outcome.startswith("declined: ") or hasattr(layer, "_block_roles"):
-        return ["the mismatched layer was not declined"]
-    return []
+    try:
+        with set_current_vllm_config(_build.current_config()):
+            blocks.install(nn.ModuleDict({"layer": layer}), context)
+    except BlockConformanceError as e:
+        print(f"    raised: {e}")
+        return []
+    finally:
+        del blocks.DECLARATIONS[key]
+    return ["the mismatched declaration did not stop startup"]
 
 
 def _run(check: Callable[[], list[str]], title: str) -> bool:
@@ -182,7 +185,7 @@ def main() -> None:
     ok = _run(conformance, "1 conformance: declared layers and planted fixtures")
     ok &= _run(plan_table, "2 plan per bucket (al = all_reduce, re = overlap)")
     ok &= _run(outside_write, "3 outside write raises after binding")
-    ok &= _run(mismatch_declines, "4 a mismatch declines at install")
+    ok &= _run(mismatch_raises, "4 a declaration that does not conform stops startup")
     sys.exit(0 if ok else 1)
 
 

@@ -26,6 +26,7 @@ from vllm.model_executor.models.qwen3_5 import Qwen3_5RMSNorm
 
 from prototype import _build, fixtures
 from vllm_torchtpu import blocks
+from vllm_torchtpu.blocks import conformance
 from vllm_torchtpu.blocks.attn_moe import conform, forward
 from vllm_torchtpu.blocks.attn_moe import pattern as pattern_mod
 from vllm_torchtpu.blocks.attn_moe import plan as plan_mod
@@ -43,8 +44,8 @@ def test_every_declaration_conforms(spec: _build.Spec) -> None:
     assert roles.out_proj.endswith(("o_proj", "out_proj"))
 
 
-def test_mismatch_declines_at_install(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A declared layer that does not conform keeps its upstream forward."""
+def test_mismatch_stops_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A declared layer that does not conform is a startup error."""
     layer = fixtures.ReorderedNorms(_build.build(_build.SPECS[0]))
     declaration = blocks.BlockDeclaration(
         fixtures.ReorderedNorms,
@@ -64,11 +65,12 @@ def test_mismatch_declines_at_install(monkeypatch: pytest.MonkeyPatch) -> None:
         override="",
         model_plan="",
     )
-    with set_current_vllm_config(_build.current_config()):
-        (item,) = blocks.install(nn.ModuleDict({"layer": layer}), context)
-    assert item.outcome.startswith("declined: ")
+    with (
+        set_current_vllm_config(_build.current_config()),
+        pytest.raises(conformance.BlockConformanceError, match="post_norm"),
+    ):
+        blocks.install(nn.ModuleDict({"layer": layer}), context)
     assert type(layer) is fixtures.ReorderedNorms
-    assert not hasattr(layer, "_block_roles")
 
 
 class _CpuRMSNorm(Qwen3_5RMSNorm):

@@ -162,16 +162,16 @@ def block_implementation(
 def install(model: nn.Module, context: InstallContext) -> list[Installed]:
     """Checks and installs every declared block in ``model``.
 
-    A layer that does not conform to its declared pattern is declined: it
-    keeps its upstream forward and its children keep their contracts, so
-    serving loses only the block's optimization. CI fails on the same
-    mismatch (``prototype.check_block`` and the conformance test).
+    A declaration is the model owner's explicit claim, so a layer that does
+    not conform to its declared pattern stops startup, naming the edge and
+    line. A plan value whose capability does not cover a conforming layer is
+    a plan choice (the default runs), logged once per class; the closing
+    summary lists, per declared class, what runs and why.
     """
     from vllm_torchtpu.blocks import attn_moe, norm_attn  # noqa: F401 - register
 
     load_declarations()
     report = []
-    declined: set[tuple[type[Any], str]] = set()
     for name, module in list(model.named_modules()):
         cls = type(module)
         for declaration in declarations_for(cls):
@@ -181,13 +181,16 @@ def install(model: nn.Module, context: InstallContext) -> list[Installed]:
             try:
                 report.append(impl.install(name, module, declaration, context))
             except BlockConformanceError as e:
-                if (cls, declaration.pattern.__name__) not in declined:
-                    declined.add((cls, declaration.pattern.__name__))
-                    logger.warning("block declined for %s: %s", cls.__qualname__, e)
-                report.append(Installed(name, cls.__qualname__, f"declined: {e}"))
+                raise BlockConformanceError(
+                    f"{name} ({cls.__qualname__}) is declared "
+                    f"{declaration.pattern.__name__}: {e}"
+                ) from e
     counts: dict[str, int] = {}
     for item in report:
         counts[item.outcome] = counts.get(item.outcome, 0) + 1
     for outcome, count in sorted(counts.items()):
         logger.info("block install: %d layer(s): %s", count, outcome)
+    summary = sorted({(i.layer_class, i.outcome) for i in report})
+    for layer_class, outcome in summary:
+        logger.info("block summary: %s: %s", layer_class, outcome)
     return report

@@ -14,7 +14,6 @@
 """The norm_then_attention sub-block: declarations conform, mismatches decline."""
 
 import pytest
-from torch import nn
 from vllm.config import set_current_vllm_config
 
 from prototype import _build, check_subblock
@@ -39,28 +38,12 @@ def test_fused_value_matches_upstream() -> None:
     assert all(not check_subblock.family(spec) for spec in check_subblock.FAMILIES)
 
 
-def test_mismatch_declines_at_install() -> None:
+def test_mismatch_stops_startup() -> None:
+    """A declared layer that does not conform is a startup error."""
     assert not check_subblock.planted()
-    layer = _build.build(check_subblock.FAMILIES[0])
-    layer.__class__ = check_subblock.ScaledAttention
-    key = (check_subblock.ScaledAttention, norm_then_attention)
-    blocks.DECLARATIONS[key] = blocks.BlockDeclaration(
-        check_subblock.ScaledAttention,
-        norm_then_attention,
-        {
-            "in_norm": "input_layernorm",
-            "attn": "self_attn",
-            "post_norm": "post_attention_layernorm",
-            "mlp": "mlp",
-        },
-        lambda _: True,
-    )
-    try:
-        with set_current_vllm_config(_build.current_config()):
-            (item,) = blocks.install(
-                nn.ModuleDict({"l": layer}), check_subblock._context()
-            )  # noqa: SLF001
-    finally:
-        del blocks.DECLARATIONS[key]
-    assert item.outcome.startswith("declined: ")
-    assert type(layer) is check_subblock.ScaledAttention
+
+
+def test_capability_mismatch_runs_unfused_and_says_so() -> None:
+    """gpt-oss conforms, but fused_qkv cannot serve sinks: unfused, logged."""
+    (c,) = [m for m in check_subblock.NEW_MODELS if m.repo == "openai/gpt-oss-20b"]
+    assert not check_subblock.family(check_subblock._spec(c), declines=True)  # noqa: SLF001

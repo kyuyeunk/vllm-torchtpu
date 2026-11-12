@@ -213,15 +213,15 @@ def planted() -> list[str]:
     blocks.DECLARATIONS[key] = declaration
     try:
         with set_current_vllm_config(_build.current_config()):
-            (item,) = blocks.install(nn.ModuleDict({"l": layer}), _context())
+            blocks.install(nn.ModuleDict({"l": layer}), _context())
+    except BlockConformanceError as e:
+        print(f"    startup error: {e}")
+        if PLANT_MISMATCH:  # CI: the planted layer counts as a declared model.
+            return ["declared ScaledAttention (planted) does not conform"]
+        return []
     finally:
         del blocks.DECLARATIONS[key]
-    print(f"    {item.layer_class}: {item.outcome}")
-    if PLANT_MISMATCH:
-        return [f"declared {item.layer_class} (planted) does not conform"]
-    if not item.outcome.startswith("declined: "):
-        return ["the planted layer was not declined"]
-    return []
+    return ["the planted declaration did not stop startup"]
 
 
 # Counted from PR #3096's diff (vllm-project/vllm-torchtpu#3096, open), which
@@ -285,7 +285,7 @@ def main() -> None:
     print("  -> " + ("FAIL" if failures else "PASS"))
     ok &= not failures
     ok &= _run(new_models, "2 current models #3096 does not target, real configs")
-    ok &= _run(planted, "3 a layer that does not conform is declined")
+    ok &= _run(planted, "3 a declaration that does not conform stops startup")
     ok &= _run(counts, "4 the same fusion as #3096, by count")
     sys.exit(0 if ok else 1)
 
