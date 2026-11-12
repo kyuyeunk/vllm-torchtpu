@@ -24,7 +24,7 @@ from torch import nn
 from vllm.config import set_current_vllm_config
 from vllm.model_executor.models.qwen3_5 import Qwen3_5RMSNorm
 
-from prototype import _build
+from prototype import _build, fixtures
 from vllm_torchtpu import blocks
 from vllm_torchtpu.blocks.attn_moe import conform, forward
 from vllm_torchtpu.blocks.attn_moe import pattern as pattern_mod
@@ -45,6 +45,24 @@ def test_every_declaration_conforms(spec: _build.Spec) -> None:
     with set_current_vllm_config(_build.current_config()):
         parts = conform(layer, declaration)
     assert any(m is parts.out_proj for m in parts.attention.modules())
+
+
+def test_mismatch_declines_at_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A declared layer that does not conform keeps its upstream forward."""
+    layer = fixtures.ReorderedNorms(_build.build(_build.SPECS[0]))
+    declaration = blocks.BlockDeclaration.of(
+        fixtures.ReorderedNorms, fixtures.renamed_parts
+    )
+    monkeypatch.setitem(blocks.DECLARATIONS, fixtures.ReorderedNorms, declaration)
+    context = blocks.InstallContext(
+        tp=4,
+        dtype=torch.bfloat16,
+        buckets=(16, 8192),
+    )
+    with set_current_vllm_config(_build.current_config()):
+        (item,) = blocks.install(nn.ModuleDict({"layer": layer}), context)
+    assert item.layer_class == fixtures.ReorderedNorms.__qualname__
+    assert type(layer) is fixtures.ReorderedNorms
 
 
 class _CpuRMSNorm(Qwen3_5RMSNorm):
