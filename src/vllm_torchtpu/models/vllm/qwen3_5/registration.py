@@ -25,7 +25,7 @@ from vllm.model_executor.models.qwen3_next import Qwen3NextSparseMoeBlock
 
 from vllm_torchtpu.blocks import declare_block
 from vllm_torchtpu.blocks.attn_moe.pattern import attn_then_moe
-from vllm_torchtpu.blocks.norm_attn.pattern import norm_then_attention
+from vllm_torchtpu.blocks.norm_attn.pattern import PRE_NORM_ROLES, norm_then_attention
 
 declare_block(
     Qwen3_5DecoderLayer,
@@ -43,11 +43,6 @@ declare_block(
 declare_block(
     Qwen3_5DecoderLayer,
     pattern=norm_then_attention,
-    roles={
-        "in_norm": "input_layernorm",
-        "attn": "self_attn",
-        "post_norm": "post_attention_layernorm",
-        "mlp": "mlp",
-    },
+    roles=PRE_NORM_ROLES,
     when=lambda layer: layer.layer_type == "full_attention",
 )

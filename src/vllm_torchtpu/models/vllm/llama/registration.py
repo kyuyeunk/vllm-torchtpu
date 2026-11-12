@@ -11,20 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Llama's block declarations. Owned by the Llama model owner."""
+"""Llama's block declarations. Owned by its model owner."""
 
 from vllm.model_executor.models.llama import LlamaDecoderLayer
 
 from vllm_torchtpu.blocks import declare_block
-from vllm_torchtpu.blocks.norm_attn.pattern import norm_then_attention
+from vllm_torchtpu.blocks.norm_attn.pattern import PRE_NORM_ROLES, norm_then_attention
 
-declare_block(
-    LlamaDecoderLayer,
-    pattern=norm_then_attention,
-    roles={
-        "in_norm": "input_layernorm",
-        "attn": "self_attn",
-        "post_norm": "post_attention_layernorm",
-        "mlp": "mlp",
-    },
-)
+declare_block(LlamaDecoderLayer, pattern=norm_then_attention, roles=PRE_NORM_ROLES)

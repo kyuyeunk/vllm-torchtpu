@@ -36,6 +36,14 @@ from vllm.model_executor.layers.linear import QKVParallelLinear
 Norm = Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
 Op = Callable[[torch.Tensor], torch.Tensor]
 
+PRE_NORM_ROLES = {
+    "in_norm": "input_layernorm",
+    "attn": "self_attn",
+    "post_norm": "post_attention_layernorm",
+    "mlp": "mlp",
+}
+"""vLLM's usual child names for the four roles; a model with others binds its own."""
+
 
 def norm_then_attention(
     hidden: torch.Tensor,

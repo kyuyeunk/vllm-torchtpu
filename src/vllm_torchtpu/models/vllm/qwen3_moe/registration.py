@@ -11,20 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Qwen3-MoE's block declarations. Owned by the Qwen3-MoE model owner."""
+"""Qwen3-MoE's block declarations. Owned by its model owner."""
 
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer
 
 from vllm_torchtpu.blocks import declare_block
-from vllm_torchtpu.blocks.norm_attn.pattern import norm_then_attention
+from vllm_torchtpu.blocks.norm_attn.pattern import PRE_NORM_ROLES, norm_then_attention
 
-declare_block(
-    Qwen3MoeDecoderLayer,
-    pattern=norm_then_attention,
-    roles={
-        "in_norm": "input_layernorm",
-        "attn": "self_attn",
-        "post_norm": "post_attention_layernorm",
-        "mlp": "mlp",
-    },
-)
+declare_block(Qwen3MoeDecoderLayer, pattern=norm_then_attention, roles=PRE_NORM_ROLES)

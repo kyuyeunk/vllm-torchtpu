@@ -14,8 +14,9 @@
 """The sub-block's forward and its one fused value, written against roles.
 
 ``fused_norm_add_qkv`` is the plan value ``fused_qkv``: one function adds the
-residual, normalizes and projects, reading the norm's scale and the
-projection's weight from the bound roles. It never names a model. Attention
+residual, normalizes and projects, reading the norm's scale from the bound
+norm and projecting through the bound projection's own matmul (so its weight
+layout and quantization stay its own). It never names a model. Attention
 then runs its own forward on the projected tokens (q/k norms, RoPE, gates and
 the output projection are its own), handed them in place of its projection.
 """
@@ -25,7 +26,6 @@ from collections.abc import Iterator
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnRoles, norm_scale
@@ -45,9 +45,10 @@ def fused_norm_add_qkv(
     variance = added.pow(2).mean(dim=-1, keepdim=True)
     normed = added * torch.rsqrt(variance + norm.variance_epsilon)
     normed = (normed * norm_scale(norm)).to(hidden.dtype)
-    return F.linear(normed, proj.weight, getattr(proj, "bias", None)), added.to(
-        hidden.dtype
-    )
+    qkv = proj(normed)
+    # A vLLM linear returns (output, bias) unless built with return_bias=False.
+    qkv = qkv[0] if getattr(proj, "return_bias", True) else qkv
+    return qkv, added.to(hidden.dtype)
 
 
 @contextlib.contextmanager
