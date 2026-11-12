@@ -1,6 +1,6 @@
-# Prototype: the attention-to-MoE overlap as a declared block
+**Scopes group** (`prototype/scopes/`). Backs DATA_CONTRACTS.md section 5.3 (the declared block that carries #1492) and Appendix I.2. Siblings: `prototype/scopes/attention-layer-plan`, `prototype/scopes/fork-migration`.
 
-Backs DATA_CONTRACTS.md section 5.3 (the declared block that carries #1492) and Appendix I.2.
+# Prototype: the attention-to-MoE overlap as a declared block
 
 PR #1492 overlaps the collectives that join attention and MoE under tensor
 parallelism: reduce-scatter `attn_partial + residual / tp`, run the norm and
