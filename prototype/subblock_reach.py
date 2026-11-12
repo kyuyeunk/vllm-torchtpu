@@ -39,7 +39,7 @@ from prototype import _build
 from vllm_torchtpu.blocks import BlockDeclaration
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
 from vllm_torchtpu.blocks.norm_attn import install as norm_attn
-from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnParts
+from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnBinding
 from vllm_torchtpu.blocks.norm_attn.plan import facts_of, fused_qkv_supports
 from vllm_torchtpu.blocks.stream import (
     Stream,
@@ -346,15 +346,15 @@ def _child(layer: nn.Module, *names: str) -> nn.Module:
     raise AttributeError(f"the layer has none of {names}")
 
 
-def guess_parts(layer: nn.Module) -> NormAttnParts:
-    """The parts under vLLM's usual names, for the survey (not a declaration).
+def guess_binding(layer: nn.Module) -> NormAttnBinding:
+    """The binding under vLLM's usual names, for the survey (not a declaration).
 
     A model owner's binding function reads its own class's attributes; the
     survey runs over many classes, so it tries the common names.
     """
     attention = _child(layer, "self_attn", "attn")
     norms = [getattr(attention, n, None) for n in ("q_norm", "k_norm")]
-    return NormAttnParts(
+    return NormAttnBinding(
         input_norm=_child(layer, "input_layernorm"),
         qkv_proj=_child(attention, "qkv_proj"),
         attn=_child(attention, "attn"),
@@ -391,14 +391,14 @@ def check(c: Candidate) -> tuple[str, str]:
     except Exception as e:  # noqa: BLE001 - report why it does not build
         first = (str(e).splitlines() or [""])[0][:90]
         return "not buildable", f"{type(e).__name__}: {first}"
-    declaration = BlockDeclaration.of(type(layer), guess_parts)
+    declaration = BlockDeclaration.of(type(layer), guess_binding)
     try:
         with set_current_vllm_config(_build.current_config()):
             config = norm_attn.conform(layer, declaration).config
     except (BlockConformanceError, AttributeError) as e:
         return "declines", str(e).split(", but ", 1)[-1][:110]
     # Capability on the model's real head sizes, which the layer was built with.
-    why = fused_qkv_supports(facts_of(guess_parts(layer), config))
+    why = fused_qkv_supports(facts_of(guess_binding(layer), config))
     return "conforms", f"fused_qkv: {'declines: ' + why if why else 'can serve it'}"
 
 

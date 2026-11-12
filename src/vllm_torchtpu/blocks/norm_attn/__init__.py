@@ -13,8 +13,8 @@
 # limitations under the License.
 """The pre-norm attention sub-block: one fusion for every model that declares it.
 
-``pattern`` is the reference forward and the parts' kinds; ``plan`` picks the
+``pattern`` is the reference forward and the binding' kinds; ``plan`` picks the
 value and holds the kernels' capabilities; ``runner`` is the one forward
 every declared layer runs, shaped like vLLM's ``MoERunner``; ``install``
-conforms a declared layer and builds the runner from its declared parts.
+conforms a declared layer and builds the runner from its declared binding.
 """

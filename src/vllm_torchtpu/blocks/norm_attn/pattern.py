@@ -34,8 +34,9 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 
-from vllm_torchtpu.blocks.norm_attn.runner import AttentionParts
-from vllm_torchtpu.blocks.parts import BlockParts, as_kind
+from vllm_torchtpu.blocks import calls
+from vllm_torchtpu.blocks.binding import BlockBinding, as_kind
+from vllm_torchtpu.blocks.norm_attn.runner import AttentionBinding
 from vllm_torchtpu.blocks.stream import Attend, Stream, attend_with_positions
 
 Norm = Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
@@ -58,7 +59,7 @@ def norm_then_attention(  # noqa: PLR0913 - the pattern takes one callable per r
     return mlp(x), residual
 
 
-def is_residual_norm(module: nn.Module) -> bool:
+def is_residual_norm(module: object) -> bool:
     """VLLM's RMSNorm family, whose contract takes ``(x, residual)``."""
     return isinstance(module, (RMSNorm, GemmaRMSNorm))
 
@@ -70,11 +71,11 @@ def norm_scale(norm: nn.Module) -> torch.Tensor:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class NormAttnParts(AttentionParts, BlockParts):
-    """A declared layer's parts for norm_then_attention.
+class NormAttnBinding(AttentionBinding, BlockBinding):
+    """A declared layer's binding for norm_then_attention.
 
-    The runner's parts (``AttentionParts``) plus the layer's other roles:
-    ``attention`` (the module holding the runner's parts, whose forward
+    The runner's binding (``AttentionBinding``) plus the layer's other roles:
+    ``attention`` (the module holding the runner's binding, whose forward
     conformance compares with the runner's composition), the rest of the
     layer (``post_norm``, ``mlp``), which stays opaque, ``output_gate``:
     whether the projection also emits a per-head gate (stated, not guessed;
@@ -84,8 +85,8 @@ class NormAttnParts(AttentionParts, BlockParts):
     """
 
     attention: nn.Module
-    post_norm: nn.Module
-    mlp: nn.Module
+    post_norm: calls.ResidualNorm
+    mlp: calls.Mlp
     output_gate: bool
     stream: Stream
     attend: Attend
@@ -93,7 +94,7 @@ class NormAttnParts(AttentionParts, BlockParts):
     pattern: ClassVar[Callable[..., object]] = norm_then_attention
 
     @override
-    def layer_children(self) -> dict[str, nn.Module]:
+    def layer_children(self) -> dict[str, object]:
         return {
             "input_norm": self.input_norm,
             "attention": self.attention,
@@ -122,7 +123,7 @@ class NormAttnParts(AttentionParts, BlockParts):
         ):
             if part is not None and id(part) not in inside:
                 problems.append((name, part, "is not a module of attention"))
-        kinds: tuple[tuple[str, nn.Module, type, str], ...] = (
+        kinds: tuple[tuple[str, object, type, str], ...] = (
             ("attn", self.attn, AttentionLayerBase, "an attention layer"),
             ("qkv_proj", self.qkv_proj, QKVParallelLinear, "a QKVParallelLinear"),
             ("o_proj", self.o_proj, RowParallelLinear, "a RowParallelLinear"),
@@ -132,7 +133,8 @@ class NormAttnParts(AttentionParts, BlockParts):
                 problems.append(
                     (name, part, f"is a {type(part).__name__}, not {words}")
                 )
-        weight = self.input_norm.weight
+        norm = self.input_norm
+        weight = norm.weight if isinstance(norm, (RMSNorm, GemmaRMSNorm)) else None
         qkv = self.qkv_proj
         if not problems and isinstance(weight, torch.Tensor):
             hidden = int(weight.shape[0])
@@ -165,7 +167,7 @@ class PreNormAttention(Protocol):
         ...
 
     @property
-    def o_proj(self) -> nn.Module:
+    def o_proj(self) -> RowParallelLinear:
         """The part's ``o_proj``."""
         ...
 
@@ -194,20 +196,20 @@ class PreNormLayer(Protocol):
         ...
 
 
-def pre_norm_parts(
+def pre_norm_binding(
     layer: PreNormLayer,
     attention: PreNormAttention,
     *,
     qk_norm: tuple[nn.Module, nn.Module] | None,
     output_gate: bool,
     stream: Stream,
-) -> NormAttnParts:
-    """The parts of a layer and attention that use vLLM's usual names.
+) -> NormAttnBinding:
+    """The binding of a layer and attention that use vLLM's usual names.
 
     Per-head q/k norms are optional in vLLM's attentions, so the binding
     function states them (``qk_norm``); every part is typed attribute access.
     """
-    return NormAttnParts(
+    return NormAttnBinding(
         input_norm=layer.input_layernorm,
         qkv_proj=attention.qkv_proj,
         attn=attention.attn,

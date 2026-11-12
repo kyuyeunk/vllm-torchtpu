@@ -99,23 +99,24 @@ class _Seen:
     normed: Tensor | None = None
     positions: Tensor | None = None
     call: tuple[object, ...] = ()
+    reads_normed: bool = True
 
 
 @dataclasses.dataclass(frozen=True)
-class LayerParts:
-    """The layer-level parts the check makes opaque, and how to call them."""
+class LayerBinding:
+    """The layer-level binding the check makes opaque, and how to call them."""
 
-    input_norm: nn.Module
+    input_norm: object
     attention: nn.Module
-    post_norm: nn.Module
-    rest: nn.Module
+    post_norm: object
+    rest: object
     stream: Stream
     attend: Attend
 
 
 def check_layer(  # noqa: C901 - the opaque stubs are closures over one trace
     layer: nn.Module,
-    parts: LayerParts,
+    binding: LayerBinding,
     hidden: int,
     pattern: Callable[[Tensor, Tensor], object],
     pattern_name: str,
@@ -124,7 +125,7 @@ def check_layer(  # noqa: C901 - the opaque stubs are closures over one trace
 
     Args:
         layer: The declared layer.
-        parts: Its declared layer-level parts.
+        binding: Its declared layer-level binding.
         hidden: The residual stream's width.
         pattern: ``pattern(hidden, residual)`` over the opaque labels
             ``in_norm``, ``attn``, ``post_norm`` and the rest's label.
@@ -151,15 +152,13 @@ def check_layer(  # noqa: C901 - the opaque stubs are closures over one trace
         return normed, summed
 
     def attention_stub(*a: object, **k: object) -> Tensor:
-        seen.call = bound_arguments(parts.attention, a, k)
-        normed = next((t for t in seen.call if t is seen.normed), None)
-        if not isinstance(normed, Tensor):
-            msg = (
-                f"declared {pattern_name} on {type(layer).__qualname__}, but "
-                "attention does not read the normed tokens"
-            )
-            raise conf.BlockConformanceError(msg)
-        return conf.unary(normed, "attn")
+        seen.call = bound_arguments(binding.attention, a, k)
+        tensors = [t for t in seen.call if isinstance(t, Tensor)]
+        normed = next((t for t in tensors if t is seen.normed), None)
+        seen.reads_normed = normed is not None
+        # Keep tracing on whatever attention read, so the graph comparison
+        # can name the edge first; the call itself is checked after it.
+        return conf.unary(normed if normed is not None else tensors[0], "attn")
 
     def rest_stub(x: Tensor, *a: object, **k: object) -> Tensor:
         del a, k
@@ -167,7 +166,7 @@ def check_layer(  # noqa: C901 - the opaque stubs are closures over one trace
 
     def layer_fn(h: Tensor, r: Tensor, p: Tensor) -> object:
         seen.positions = p
-        return parts.stream.call(h, r, p)
+        return binding.stream.call(h, r, p)
 
     def pattern_fn(h: Tensor, r: Tensor, p: Tensor) -> object:
         del p
@@ -180,26 +179,30 @@ def check_layer(  # noqa: C901 - the opaque stubs are closures over one trace
         torch.empty(TOKENS, device="meta", dtype=torch.long),
     )
     names = ("hidden", "residual", "positions")
-    stubs: tuple[tuple[nn.Module, Callable[..., object]], ...] = (
-        (parts.input_norm, recording_in_norm),
-        (parts.post_norm, norm_stub("post_norm")),
-        (parts.attention, attention_stub),
-        (parts.rest, rest_stub),
+    stubs: tuple[tuple[object, Callable[..., object]], ...] = (
+        (binding.input_norm, recording_in_norm),
+        (binding.post_norm, norm_stub("post_norm")),
+        (binding.attention, attention_stub),
+        (binding.rest, rest_stub),
     )
     with contextlib.ExitStack() as stack:
         for module, stub in stubs:
             stack.enter_context(conf.opaque(module, stub))
         got = conf.canonicalize(conf.export(layer_fn, args, layer), names)
         layer_call = classify(seen.call, seen.normed, seen.positions)
+        reads_normed = seen.reads_normed
         # The declared adapter, on fresh tensors, must make the same call.
         normed, positions = torch.empty_like(x), torch.empty_like(args[2])
         seen.normed = normed
-        _ = parts.attend(normed, positions)
+        _ = binding.attend(normed, positions)
         attend_call = classify(seen.call, normed, positions)
     want = conf.canonicalize(conf.export(pattern_fn, args, None), names)
     if error := conf.compare(pattern_name, got, want):
         raise conf.BlockConformanceError(error)
     where = f"declared {pattern_name} on {type(layer).__qualname__}, but"
+    if not reads_normed:
+        msg = f"{where} attention does not read the normed tokens"
+        raise conf.BlockConformanceError(msg)
     if Arg.OTHER in layer_call:
         msg = f"{where} attention reads more than the normed tokens and the positions"
         raise conf.BlockConformanceError(msg)

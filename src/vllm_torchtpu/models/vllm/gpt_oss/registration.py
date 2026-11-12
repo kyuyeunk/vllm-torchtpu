@@ -16,19 +16,19 @@
 from vllm.model_executor.models.gpt_oss import OAIAttention, TransformerBlock
 
 from vllm_torchtpu.blocks import declare_block
-from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnParts, pre_norm_parts
-from vllm_torchtpu.blocks.parts import as_kind
+from vllm_torchtpu.blocks.binding import as_kind
+from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnBinding, pre_norm_binding
 from vllm_torchtpu.blocks.stream import hidden_positions_residual
 
 
 @declare_block(TransformerBlock)
-def gpt_oss_attention(layer: TransformerBlock) -> NormAttnParts:
+def gpt_oss_attention(layer: TransformerBlock) -> NormAttnBinding:
     """The pre-norm attention sub-block; gpt-oss names its attention ``attn``.
 
     gpt-oss builds ``attn`` from a class attribute (``attention_cls``), so
     the binding names the class it covers.
     """
-    return pre_norm_parts(
+    return pre_norm_binding(
         layer,
         as_kind(layer.attn, OAIAttention),
         qk_norm=None,

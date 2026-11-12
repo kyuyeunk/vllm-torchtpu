@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The call contracts of the parts the runners call, as Protocols.
+"""The call contracts of the binding the runners call, as Protocols.
 
-``nn.Module.__call__`` returns ``Any``, so a runner that called its parts as
+``nn.Module.__call__`` returns ``Any``, so a runner that called its binding as
 plain modules would let ``Any`` spread through its forward. Each runner
 instead annotates its references with these Protocols: the one typed
 boundary between vLLM's untyped modules and the framework's composition.
@@ -24,6 +24,7 @@ this states.
 from typing import Protocol, overload
 
 import torch
+from torch import nn
 
 Tensor = torch.Tensor
 
@@ -56,7 +57,7 @@ class Linear(Protocol):
 class QuantMethod(Protocol):
     """A linear's quant method: the GEMM alone, no reduction over ranks."""
 
-    def apply(self, layer: object, x: Tensor, bias: Tensor | None = None) -> Tensor:
+    def apply(self, layer: nn.Module, x: Tensor, bias: Tensor | None = None) -> Tensor:
         """The GEMM alone, without a reduction over ranks."""
         ...
 

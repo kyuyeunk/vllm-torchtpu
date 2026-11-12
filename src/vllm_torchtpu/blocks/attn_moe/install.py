@@ -22,7 +22,7 @@ from torch import nn
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
-from vllm_torchtpu.blocks import BlockDeclaration, Pattern
+from vllm_torchtpu.blocks import BlockDeclaration, Pattern, calls
 from vllm_torchtpu.blocks import conformance as conf
 from vllm_torchtpu.blocks.attn_moe import plan as plan_mod
 from vllm_torchtpu.blocks.attn_moe.contract_adapter import (
@@ -30,19 +30,28 @@ from vllm_torchtpu.blocks.attn_moe.contract_adapter import (
     bind_child_contracts,
 )
 from vllm_torchtpu.blocks.attn_moe.pattern import (
-    AttnMoEParts,
+    AttnMoEBinding,
     attn_then_moe,
     block_key,
     moe_explicit_router,
     moe_runner_router,
 )
-from vllm_torchtpu.blocks.attn_moe.runner import AttnMoERunner, ModelAttention
+from vllm_torchtpu.blocks.attn_moe.runner import (
+    AttnMoERunner,
+    ModelAttention,
+    ModelAttentionBinding,
+)
+from vllm_torchtpu.blocks.binding import as_kind
 from vllm_torchtpu.blocks.context import InstallContext, Installed
-from vllm_torchtpu.blocks.layer_check import TOKENS, LayerParts, check_layer, norm_stub
+from vllm_torchtpu.blocks.layer_check import (
+    TOKENS,
+    LayerBinding,
+    check_layer,
+    norm_stub,
+)
 from vllm_torchtpu.blocks.norm_attn import install as norm_attn
 from vllm_torchtpu.blocks.norm_attn import plan as subblock_plan
 from vllm_torchtpu.blocks.norm_attn.pattern import norm_then_attention
-from vllm_torchtpu.blocks.parts import as_kind
 from vllm_torchtpu.blocks.stream import route
 
 # vllm_torchtpu.logger's proxy resolves to vLLM's logger of this name.
@@ -52,27 +61,27 @@ Tensor = torch.Tensor
 _conformed: set[tuple[object, ...]] = set()
 
 
-def declared_parts(layer: nn.Module, declaration: BlockDeclaration) -> AttnMoEParts:
-    """The parts the binding function returns for ``layer``.
+def declared_binding(layer: nn.Module, declaration: BlockDeclaration) -> AttnMoEBinding:
+    """The binding the binding function returns for ``layer``.
 
     Raises:
-        BlockConformanceError: The function returns None or other parts, or a
+        BlockConformanceError: The function returns None or other binding, or a
             part is the wrong kind (named by its attribute).
     """
-    parts = declaration.parts(layer)
-    if not isinstance(parts, AttnMoEParts):
+    binding = declaration.binding(layer)
+    if not isinstance(binding, AttnMoEBinding):
         msg = (
-            f"{declaration.parts_of.__qualname__} returns {type(parts).__name__} "
-            "for this layer, not AttnMoEParts"
+            f"{declaration.binding_of.__qualname__} returns {type(binding).__name__} "
+            "for this layer, not AttnMoEBinding"
         )
         raise conf.BlockConformanceError(msg)
-    return parts
+    return binding
 
 
-def conform(layer: nn.Module, declaration: BlockDeclaration) -> AttnMoEParts:
-    """Checks a declared layer against attn_then_moe; returns its parts.
+def conform(layer: nn.Module, declaration: BlockDeclaration) -> AttnMoEBinding:
+    """Checks a declared layer against attn_then_moe; returns its binding.
 
-    The parts' kinds are checked when the binding function builds them; this
+    The binding' kinds are checked when the binding function builds them; this
     checks the wiring: the layer's forward (``check_layer``) and the MoE
     child's forward, which the block replaces by calling the router and the
     experts itself.
@@ -81,27 +90,27 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> AttnMoEParts:
         BlockConformanceError: A part is the wrong kind, or the layer's
             forward or its MoE child's forward computes another graph.
     """
-    parts = declared_parts(layer, declaration)
+    binding = declared_binding(layer, declaration)
     state: dict[str, object] = vars(layer)
     flags = tuple(
         sorted((k, v) for k, v in state.items() if isinstance(v, (bool, str)))
     )
     shapes = tuple(tuple(t.shape) for t in layer.parameters())
-    cache_key = (type(layer), declaration.parts_of, flags, shapes)
+    cache_key = (type(layer), declaration.binding_of, flags, shapes)
     if cache_key in _conformed:
-        return parts
-    router = as_kind(parts.router, GateLinear)
-    runner = as_kind(parts.experts, MoERunner)
+        return binding
+    router = as_kind(binding.router, GateLinear)
+    runner = as_kind(binding.experts, MoERunner)
     width, hidden = router.output_size, router.input_size
     _ = check_layer(
         layer,
-        LayerParts(
-            input_norm=parts.input_norm,
-            attention=parts.attention,
-            post_norm=parts.post_norm,
-            rest=parts.moe,
-            stream=parts.stream,
-            attend=parts.attend,
+        LayerBinding(
+            input_norm=binding.input_norm,
+            attention=binding.attention,
+            post_norm=binding.post_norm,
+            rest=binding.moe,
+            stream=binding.stream,
+            attend=binding.attend,
         ),
         hidden,
         lambda h, r: attn_then_moe(
@@ -114,12 +123,12 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> AttnMoEParts:
         ),
         "attn_then_moe",
     )
-    _check_moe(layer, parts.moe, router, runner, width, hidden)
+    _check_moe(layer, binding.moe, router, runner, width, hidden)
     _conformed.add(cache_key)
-    return parts
+    return binding
 
 
-def _check_moe(  # noqa: PLR0913 - the layer, its parts, plan, TP size and attention part
+def _check_moe(  # noqa: PLR0913 - the layer, its binding, plan, TP size and attention part
     layer: nn.Module,
     moe: nn.Module,
     router: GateLinear,
@@ -187,16 +196,16 @@ def _summary(table: plan_mod.BlockPlanTable) -> str:
 
 def build_runner(
     name: str,
-    parts: AttnMoEParts,
+    binding: AttnMoEBinding,
     table: plan_mod.BlockPlanTable,
     tp: int,
-    attention: nn.Module | None = None,
+    attention: calls.AttentionPart | None = None,
 ) -> AttnMoERunner:
-    """The block's runner: the declared parts, and the attention part.
+    """The block's runner: the declared binding, and the attention part.
 
     Args:
         name: The layer's module path.
-        parts: The declared parts.
+        binding: The declared binding.
         table: The plan per bucket.
         tp: The tensor-parallel world size.
         attention: The attention part, the nested ``AttentionRunner`` built
@@ -204,19 +213,21 @@ def build_runner(
             attention (``ModelAttention``).
     """
     if attention is None:
-        attention = ModelAttention(input_norm=parts.input_norm, attend=parts.attend)
+        attention = ModelAttention(
+            ModelAttentionBinding(input_norm=binding.input_norm, attend=binding.attend)
+        )
     return AttnMoERunner(
-        name, parts, attention=attention, table=table, tp=tp, stream=parts.stream
+        name, binding, attention=attention, table=table, tp=tp, stream=binding.stream
     )
 
 
-def apply_block(  # noqa: PLR0913 - the layer, its parts, plan, TP size and attention part
+def apply_block(  # noqa: PLR0913 - the layer, its binding, plan, TP size and attention part
     name: str,
     layer: nn.Module,
-    parts: AttnMoEParts,
+    binding: AttnMoEBinding,
     table: plan_mod.BlockPlanTable,
     tp: int,
-    attention: nn.Module | None = None,
+    attention: calls.AttentionPart | None = None,
 ) -> AttnMoERunner:
     """Builds the block's runner and makes it the layer's forward.
 
@@ -225,12 +236,12 @@ def apply_block(  # noqa: PLR0913 - the layer, its parts, plan, TP size and atte
     """
     bind_child_contracts(
         name,
-        None if attention is not None else parts.out_proj,
-        parts.experts,
+        None if attention is not None else binding.out_proj,
+        binding.experts,
         _MOE_CONTRACTS,
         source=_summary(table),
     )
-    runner = build_runner(name, parts, table, tp, attention)
+    runner = build_runner(name, binding, table, tp, attention)
     route(layer, runner)
     return runner
 
@@ -264,8 +275,8 @@ class AttnThenMoE:
         nested: dict[Pattern, BlockDeclaration] | None = None,
     ) -> Installed:
         """Conforms the layer, resolves its table, installs the runner if needed."""
-        parts = conform(layer, declaration)
-        key = block_key(parts, context.tp, context.dtype)
+        binding = conform(layer, declaration)
+        key = block_key(binding, context.tp, context.dtype)
         table, fell_back = plan_mod.resolve_table(
             key, context.buckets, context.block_pin, context.block_model_pin
         )
@@ -273,10 +284,10 @@ class AttnThenMoE:
         if inner is not None and table.uses(plan_mod.OVERLAP):
             # The block needs attention unreduced: ask the floor value first.
             config = norm_attn.conform(layer, inner).config
-            inner_parts = norm_attn.declared_parts(layer, inner)
+            inner_binding = norm_attn.declared_binding(layer, inner)
             why = subblock_plan.unreduced_output_supports(
                 subblock_plan.UNFUSED,
-                subblock_plan.facts_of(inner_parts, config),
+                subblock_plan.facts_of(inner_binding, config),
                 fused_unreduced=False,
             )
             if why and table.pinned():
@@ -302,5 +313,5 @@ class AttnThenMoE:
                 name, layer, inner, context, output_reduced=False
             )
             what = f"; nested AttentionRunner {chosen}"
-        _ = apply_block(name, layer, parts, table, context.tp, attention)
+        _ = apply_block(name, layer, binding, table, context.tp, attention)
         return Installed(name, cls, f"AttnMoERunner installed; {_summary(table)}{what}")

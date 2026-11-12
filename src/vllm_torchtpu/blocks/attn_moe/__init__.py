@@ -13,9 +13,9 @@
 # limitations under the License.
 """The attention-then-MoE block: PR #1492's collective overlap, framework-owned.
 
-``pattern`` is the reference forward and the parts' kinds; ``plan`` resolves
+``pattern`` is the reference forward and the binding' kinds; ``plan`` resolves
 which collectives join the two halves per bucket; ``runner`` is the one
 forward every installed block runs; ``install`` conforms a declared layer
-and builds the runner from its declared parts; ``contract_adapter`` writes
+and builds the runner from its declared binding; ``contract_adapter`` writes
 the MoE child's contracts, which the model built without them.
 """

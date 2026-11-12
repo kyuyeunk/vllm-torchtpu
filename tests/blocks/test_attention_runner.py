@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Execution tests: AttentionRunner on synthetic parts, no model.
+"""Execution tests: AttentionRunner on synthetic binding, no model.
 
-The runner is built from tiny parts (``synthetic.py``), each with the
+The runner is built from tiny binding (``synthetic.py``), each with the
 contract of the vLLM building block it stands for: an RMSNorm taking ``(x, residual)``,
 linears returning ``(out, bias)``, a NeoX rotary on ``(positions, q, k)``,
 a causal GQA core on ``(q, k, v)``. Every role configuration the runner
@@ -24,7 +24,7 @@ and the fused value against the unfused one. The plan's choice and
 and KV cache settings.
 
 Model registration (that a model's layers conform, and that the runner
-holds their parts) is ``test_norm_attn_integration.py``'s job. This file
+holds their binding) is ``test_norm_attn_integration.py``'s job. This file
 imports nothing from ``vllm.model_executor.models``;
 ``test_imports_no_model`` checks that.
 """
@@ -47,6 +47,7 @@ from synthetic import (  # noqa: E402 - ditto
     reference_forward,
     setup_parts,
 )
+from torch import nn  # noqa: E402 - after the snapshot above
 
 from vllm_torchtpu.blocks.norm_attn import plan as plan_mod  # noqa: E402 - ditto
 from vllm_torchtpu.blocks.norm_attn import runner as runner_mod  # noqa: E402 - ditto
@@ -58,7 +59,7 @@ from vllm_torchtpu.blocks.norm_attn.runner import (  # noqa: E402 - ditto
 
 _LOADED = frozenset(sys.modules) - _PRELOADED  # What this file's imports loaded.
 
-# The fused reference calls the same parts with the platform's rounding
+# The fused reference calls the same binding with the platform's rounding
 # points (the residual sum rounded to the stream's dtype, as the fused
 # add-norm does), so it equals unfused bit for bit, here in bf16. A kernel
 # would be held to bf16 tolerance instead (atol 1e-2, rtol 1.6e-2).
@@ -67,7 +68,7 @@ FUSED_ATOL = FUSED_RTOL = 0.0
 
 @pytest.fixture(autouse=True, scope="module")
 def _one_thread() -> object:
-    """Runs on one thread: the parts are tiny, and a many-core pool costs more."""
+    """Runs on one thread: the binding are tiny, and a many-core pool costs more."""
     threads = torch.get_num_threads()
     torch.set_num_threads(1)
     yield
@@ -145,12 +146,12 @@ def test_fused_op_that_declines_runs_unfused() -> None:
     torch.testing.assert_close(got, want, atol=0.0, rtol=0.0)
 
 
-def test_runner_owns_no_parameters() -> None:
-    """The parts are references: the runner adds nothing to a state_dict."""
+def test_runner_is_composition_only() -> None:
+    """The runner is not a module and holds the model's own part objects."""
     roles = Roles(qk_norm=True)
     norm, attention = setup_parts(roles)
     runner = build_runner(norm, attention, roles.config())
-    assert list(runner.parameters()) == []
+    assert not isinstance(runner, nn.Module)
     assert runner.qkv_proj is attention.qkv_proj
     assert runner.q_norm is attention.q_norm
 
@@ -255,7 +256,7 @@ def test_fused_value_without_an_op_raises() -> None:
 # descriptions.
 
 
-def _case(  # noqa: PLR0913 - the parts and options a runner or reference takes
+def _case(  # noqa: PLR0913 - the binding and options a runner or reference takes
     name: str,
     facts: plan_mod.AttentionFacts,
     reason: str | None = None,
@@ -339,12 +340,22 @@ def test_fused_qkv_supports(
 
 _MODELS = "vllm.model_executor.models"
 # vLLM's model package infrastructure, no model class: the registry (model
-# names to lazily imported modules), the interfaces, and config.py's config
-# fix-ups. vllm_torchtpu.layers loads them through vllm.entrypoints.
+# names to lazily imported modules), the interfaces, config.py's config
+# fix-ups, and the shared helpers (utils, vision) that vLLM's Fp8LinearMethod
+# import chain loads, which the capability check matches by type.
 _MODEL_INFRASTRUCTURE = frozenset(
     {_MODELS}
-    | {f"{_MODELS}.{m}" for m in ("registry", "interfaces", "interfaces_base")}
-    | {f"{_MODELS}.config"}
+    | {
+        f"{_MODELS}.{m}"
+        for m in (
+            "registry",
+            "interfaces",
+            "interfaces_base",
+            "config",
+            "utils",
+            "vision",
+        )
+    }
 )
 
 
@@ -370,5 +381,5 @@ def test_imports_no_model() -> None:
     """
     this, runner = pathlib.Path(__file__), pathlib.Path(runner_mod.__file__)
     assert not {n for n in _imports(this) if n.startswith(_MODELS)}
-    assert not {n for n in _imports(runner) if n.startswith("vllm")}
+    assert not {n for n in _imports(runner) if n.split(".")[0] == "vllm"}
     assert not {m for m in _LOADED if m.startswith(_MODELS)} - _MODEL_INFRASTRUCTURE

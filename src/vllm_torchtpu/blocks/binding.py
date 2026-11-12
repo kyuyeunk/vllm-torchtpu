@@ -11,20 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""What a model's binding function returns: a pattern's parts, typed.
+"""What a model's binding function returns: a pattern's binding, typed.
 
 A model owner declares a block by writing a function from its decoder layer
-to the pattern's parts dataclass (``declare_block``). The dataclass is the
+to the pattern's binding dataclass (``declare_block``). The dataclass is the
 declaration's whole content:
 
-- **Which pattern.** Each parts class names its pattern (``pattern``), so the
+- **Which pattern.** Each binding class names its pattern (``pattern``), so the
   binding function's return type says which pattern the layer conforms to.
 - **Which children.** Each field is a module of the layer, reached by
   attribute access the type checker sees, so a misspelled attribute is a type
   error, not a string that fails at startup.
 - **What kind each is.** ``problems`` checks every field's kind when the
   dataclass is built; a field of the wrong kind raises there.
-- **What the runner takes.** Each parts class extends the dataclass its
+- **What the runner takes.** Each binding class extends the dataclass its
   runner's ``__init__`` takes, so the declaration produces the runner's
   constructor arguments.
 
@@ -41,8 +41,8 @@ from torch import nn
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
 
 
-class BlockParts:
-    """Base of every pattern's parts dataclass.
+class BlockBinding:
+    """Base of every pattern's binding dataclass.
 
     Subclasses are frozen keyword-only dataclasses that set ``pattern`` and
     implement ``layer_children`` and ``problems``.
@@ -50,8 +50,8 @@ class BlockParts:
 
     pattern: ClassVar[Callable[..., object]]
 
-    def layer_children(self) -> dict[str, nn.Module]:
-        """The parts that are direct children of the decoder layer, by field."""
+    def layer_children(self) -> dict[str, object]:
+        """The binding that are direct children of the decoder layer, by field."""
         raise NotImplementedError
 
     def problems(self) -> list[tuple[str, object, str]]:
@@ -61,17 +61,17 @@ class BlockParts:
     def __post_init__(self) -> None:
         """Checks every part's kind as the dataclass is built."""
         if problems := self.problems():
-            raise PartsKindError(self, problems)
+            raise BindingKindError(self, problems)
 
 
-class PartsKindError(BlockConformanceError):
-    """A part of the wrong kind, raised as the parts dataclass is built."""
+class BindingKindError(BlockConformanceError):
+    """A part of the wrong kind, raised as the binding dataclass is built."""
 
     def __init__(
-        self, parts: BlockParts, problems: list[tuple[str, object, str]]
+        self, binding: BlockBinding, problems: list[tuple[str, object, str]]
     ) -> None:
-        """Keeps references to the parts; creates no parameter."""
-        self.parts: BlockParts = parts
+        """Keeps references to the binding; creates no parameter."""
+        self.binding: BlockBinding = binding
         self.problems: list[tuple[str, object, str]] = problems
         super().__init__(self.describe(None))
 
@@ -84,7 +84,7 @@ class PartsKindError(BlockConformanceError):
                 found = [n for n, m in named_modules(layer) if m is part and n]
                 where = f"{field}={found[0]}" if found else field
             words.append(f"{where} {why}")
-        return f"declared {self.parts.pattern.__name__}, but " + "; ".join(words)
+        return f"declared {self.binding.pattern.__name__}, but " + "; ".join(words)
 
 
 def named_modules(root: nn.Module) -> list[tuple[str, nn.Module]]:
@@ -96,7 +96,7 @@ def named_modules(root: nn.Module) -> list[tuple[str, nn.Module]]:
     return found
 
 
-def attribute_of(parent: nn.Module, part: nn.Module, field: str) -> str:
+def attribute_of(parent: nn.Module, part: object, field: str) -> str:
     """The dotted attribute path of ``part`` under ``parent``, found by identity.
 
     Raises:

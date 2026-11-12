@@ -43,7 +43,7 @@ from torch import nn
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import RowParallelLinear
 
-from vllm_torchtpu.blocks.parts import as_kind
+from vllm_torchtpu.blocks.binding import as_kind
 
 
 @dataclasses.dataclass(frozen=True)
@@ -111,7 +111,7 @@ def _render(value: object) -> str:
 def bind_child_contracts(
     layer_name: str,
     out_proj: RowParallelLinear | None,
-    experts: nn.Module,
+    experts: object,
     contracts: ChildContracts,
     source: str,
 ) -> None:

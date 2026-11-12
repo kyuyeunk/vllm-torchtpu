@@ -21,22 +21,26 @@ are ``test_attention_runner.py``'s job (model-free, every role
 configuration); here one smoke check runs Llama against upstream.
 """
 
+import dataclasses
+
 import pytest
 import torch
 from jax.experimental.pallas import tpu as pltpu
 from torch import nn
 from vllm.config.vllm import set_current_vllm_config
+from vllm.model_executor.models.llama import LlamaDecoderLayer
 
 from prototype import _build, check_subblock
 from vllm_torchtpu import blocks
 from vllm_torchtpu.blocks import installer
 from vllm_torchtpu.blocks.attn_moe.plan import Collectives
 from vllm_torchtpu.blocks.attn_moe.runner import AttnMoERunner
+from vllm_torchtpu.blocks.binding import as_kind
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
 from vllm_torchtpu.blocks.context import InstallContext
 from vllm_torchtpu.blocks.norm_attn import install as norm_attn
 from vllm_torchtpu.blocks.norm_attn import plan as subblock_plan
-from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnParts, norm_then_attention
+from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnBinding, norm_then_attention
 from vllm_torchtpu.blocks.norm_attn.runner import AttentionRunner, InputProj
 from vllm_torchtpu.blocks.stream import routed_runner
 
@@ -60,10 +64,12 @@ def _routed(layer: nn.Module) -> norm_attn.NormAttnLayer:
     return routed
 
 
-def _parts_of(layer: nn.Module, declaration: blocks.BlockDeclaration) -> NormAttnParts:
-    parts = declaration.parts(layer)
-    assert isinstance(parts, NormAttnParts)
-    return parts
+def _binding_of(
+    layer: nn.Module, declaration: blocks.BlockDeclaration
+) -> NormAttnBinding:
+    binding = declaration.binding(layer)
+    assert isinstance(binding, NormAttnBinding)
+    return binding
 
 
 def _weight(module: nn.Module) -> torch.Tensor:
@@ -102,9 +108,9 @@ def test_declaration_conforms(spec: _build.Spec) -> None:
     assert declaration.when(layer)
     with set_current_vllm_config(_build.current_config()):
         config = norm_attn.conform(layer, declaration).config
-    parts = _parts_of(layer, declaration)
-    assert config.head_dim == parts.attention.head_dim
-    assert config.qk_norm == (parts.q_norm is not None)
+    binding = _binding_of(layer, declaration)
+    assert config.head_dim == binding.attention.head_dim
+    assert config.qk_norm == (binding.q_norm is not None)
 
 
 @pytest.mark.parametrize(
@@ -121,7 +127,7 @@ def test_nonconforming_layer_names_edge_and_line(planted: type, edge: str) -> No
     layer.__class__ = planted
     if planted is check_subblock.ScaledQueryAttention:
         check_subblock._scale_query(layer.get_submodule("self_attn"))  # noqa: SLF001 - the planted forward
-    declaration = blocks.BlockDeclaration.of(planted, check_subblock._llama_parts)  # noqa: SLF001 - the planted layers' binding
+    declaration = blocks.BlockDeclaration.of(planted, check_subblock._llama_binding)  # noqa: SLF001 - the planted layers' binding
     with (
         set_current_vllm_config(_build.current_config()),
         pytest.raises(
@@ -148,44 +154,54 @@ def test_binding_reads_a_missing_part_and_fails() -> None:
     layer, declaration = _declared(check_subblock.FAMILIES[0])
     _without_rotary(layer.get_submodule("self_attn"))
     with pytest.raises(AttributeError, match="rotary_emb"):
-        declaration.parts(layer)
+        declaration.binding(layer)
 
 
 def test_part_of_the_wrong_kind_is_named_by_attribute() -> None:
-    """A lone q_norm: the parts' kind check names the attribute."""
-    layer, declaration = _declared(check_subblock.FAMILIES[0])
+    """A binding with a lone q_norm: the kind check names the attribute."""
+    layer, _ = _declared(check_subblock.FAMILIES[0])
     _lone_q_norm(layer.get_submodule("self_attn"))
+
+    def lone(llama: LlamaDecoderLayer) -> NormAttnBinding:
+        binding = check_subblock._llama_binding(llama)  # noqa: SLF001 - Llama's binding
+        attention = llama.get_submodule("self_attn")
+        q_norm = attention.get_submodule("q_norm")
+        return dataclasses.replace(binding, q_norm=q_norm, k_norm=None)
+
+    declaration = blocks.BlockDeclaration.of(LlamaDecoderLayer, lone)
     with pytest.raises(
         BlockConformanceError,
         match=r"q_norm=self_attn\.q_norm and k_norm come together",
     ):
-        declaration.parts(layer)
+        declaration.binding(layer)
 
 
-# The runner holds the model's own parts, and the decoder routes through it.
+# The runner holds the model's own binding, and the decoder routes through it.
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=lambda s: s.name)
 def test_runner_holds_the_models_parts(spec: _build.Spec) -> None:
-    """Runner holds the models parts."""
+    """Runner holds the models binding."""
     layer, declaration = _declared(spec)
     state = dict(layer.state_dict(keep_vars=True))
+    names = [n for n, _ in layer.named_parameters()]
     _install(layer, declaration)
     runner = _routed(layer).runner
-    parts = _parts_of(layer, declaration)
-    attention = parts.attention
-    assert runner.input_norm is parts.input_norm
+    binding = _binding_of(layer, declaration)
+    attention = binding.attention
+    assert runner.input_norm is binding.input_norm
     assert runner.qkv_proj is attention.qkv_proj
     assert runner.o_proj is attention.o_proj
     assert runner.rotary is attention.rotary_emb
-    assert runner.attn is parts.attn
-    assert runner.q_norm is parts.q_norm
-    assert runner.k_norm is parts.k_norm
+    assert runner.attn is binding.attn
+    assert runner.q_norm is binding.q_norm
+    assert runner.k_norm is binding.k_norm
     # No copies, no new parameters: the model's state_dict is the same tensors.
     after = layer.state_dict(keep_vars=True)
     assert after.keys() == state.keys()
     assert all(after[k] is v for k, v in state.items())
-    assert list(runner.parameters()) == []
+    assert not isinstance(runner, nn.Module)
+    assert [n for n, _ in layer.named_parameters()] == names
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=lambda s: s.name)
@@ -197,10 +213,10 @@ def test_decoder_routes_through_the_runner(
     cls = type(layer)
     _install(layer, declaration)
     assert type(layer) is cls  # No mixin: the runner is the instance's forward.
-    parts = _parts_of(layer, declaration)
+    binding = _binding_of(layer, declaration)
     calls: list[tuple[torch.Tensor, ...]] = []
     meta = {"device": "meta", "dtype": torch.bfloat16}
-    hidden_size = int(_weight(parts.input_norm).shape[0])
+    hidden_size = int(_weight(as_kind(binding.input_norm, nn.Module)).shape[0])
     attn_out, summed, normed = (torch.empty(4, hidden_size, **meta) for _ in range(3))
 
     def runner(h: torch.Tensor, r: torch.Tensor, p: torch.Tensor) -> tuple:
@@ -212,9 +228,10 @@ def test_decoder_routes_through_the_runner(
         assert r is summed
         return normed, r
 
-    monkeypatch.setattr(_routed(layer).runner, "forward", runner)
-    monkeypatch.setattr(parts.post_norm, "forward", post_norm)
-    monkeypatch.setattr(parts.mlp, "forward", torch.neg)
+    # The runner is a plain object; its plan value is the call it makes.
+    monkeypatch.setattr(_routed(layer).runner, "_forward_entry", runner)
+    monkeypatch.setattr(binding.post_norm, "forward", post_norm)
+    monkeypatch.setattr(binding.mlp, "forward", torch.neg)
     hidden, residual = (
         torch.empty(4, hidden_size, **meta),
         torch.empty(4, hidden_size, **meta),

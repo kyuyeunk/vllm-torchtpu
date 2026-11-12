@@ -20,11 +20,11 @@ from torch import nn
 from vllm_torchtpu.blocks import Pattern, declarations_for, load_declarations
 from vllm_torchtpu.blocks.attn_moe.install import AttnThenMoE
 from vllm_torchtpu.blocks.attn_moe.pattern import attn_then_moe
+from vllm_torchtpu.blocks.binding import named_modules
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
 from vllm_torchtpu.blocks.context import BlockImplementation, InstallContext, Installed
 from vllm_torchtpu.blocks.norm_attn.install import NormThenAttention
 from vllm_torchtpu.blocks.norm_attn.pattern import norm_then_attention
-from vllm_torchtpu.blocks.parts import named_modules
 
 # vllm_torchtpu.logger's proxy resolves to vLLM's logger of this name.
 logger = logging.getLogger("vllm." + __name__)

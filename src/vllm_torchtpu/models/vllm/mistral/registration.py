@@ -13,19 +13,24 @@
 # limitations under the License.
 """Mistral's block declarations. Owned by its model owner."""
 
-from vllm.model_executor.models.mistral import MistralDecoderLayer
+from vllm.model_executor.models.mistral import MistralAttention, MistralDecoderLayer
 
 from vllm_torchtpu.blocks import declare_block
-from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnParts, pre_norm_parts
+from vllm_torchtpu.blocks.binding import as_kind
+from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnBinding, pre_norm_binding
 from vllm_torchtpu.blocks.stream import positions_first
 
 
 @declare_block(MistralDecoderLayer)
-def mistral_attention(layer: MistralDecoderLayer) -> NormAttnParts:
-    """The pre-norm attention sub-block (norm_then_attention)."""
-    return pre_norm_parts(
+def mistral_attention(layer: MistralDecoderLayer) -> NormAttnBinding:
+    """The pre-norm attention sub-block (norm_then_attention).
+
+    Mistral builds ``self_attn`` from Llama's class parameter
+    (``attn_layer_type=MistralAttention``), so the binding names the class.
+    """
+    return pre_norm_binding(
         layer,
-        layer.self_attn,
+        as_kind(layer.self_attn, MistralAttention),
         qk_norm=None,
         output_gate=False,
         stream=positions_first(layer),

@@ -18,7 +18,7 @@ Ownership is split at the declaration:
 - **The model owner declares.** In the model's own directory
   (``models/<family>/<model>/registration.py``, the only place a model's
   identity appears) a binding function decorated with ``declare_block``
-  takes a decoder layer and returns the pattern's parts dataclass, built by
+  takes a decoder layer and returns the pattern's binding dataclass, built by
   typed attribute access, or None where the layer does not conform. The
   return type names the pattern; the type checker checks the attributes.
 - **The framework runs what is declared.** The pattern, the conformance
@@ -52,14 +52,14 @@ from typing import cast
 
 from torch import nn
 
+from vllm_torchtpu.blocks.binding import BindingKindError, BlockBinding, attribute_of
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
-from vllm_torchtpu.blocks.parts import BlockParts, PartsKindError, attribute_of
 
 Pattern = Callable[..., object]
 """A pattern's reference forward, e.g. ``attn_then_moe``; it names the pattern."""
 
-Binding = Callable[[nn.Module], BlockParts | None]
-"""A model owner's binding function: layer -> the pattern's parts, or None."""
+Binding = Callable[[nn.Module], BlockBinding | None]
+"""A model owner's binding function: layer -> the pattern's binding, or None."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -69,50 +69,50 @@ class BlockDeclaration:
     Attributes:
         layer_class: The decoder layer class, matched exactly.
         pattern: The pattern's reference forward, read off the binding
-            function's parts type.
-        parts_of: The binding function.
+            function's binding type.
+        binding_of: The binding function.
     """
 
     layer_class: type
     pattern: Pattern
-    parts_of: Binding
+    binding_of: Binding
 
     @classmethod
     def of[L: nn.Module](
-        cls, layer_class: type[L], parts_of: Callable[[L], BlockParts | None]
+        cls, layer_class: type[L], binding_of: Callable[[L], BlockBinding | None]
     ) -> "BlockDeclaration":
-        """The declaration ``parts_of`` makes; its return type names the pattern."""
-        signature = inspect.signature(parts_of, eval_str=True)
+        """The declaration ``binding_of`` makes; its return type names the pattern."""
+        signature = inspect.signature(binding_of, eval_str=True)
         returns = cast("object", signature.return_annotation)  # inspect types it Any
         kinds = [
             t
             for t in typing.get_args(returns) or (returns,)
-            if isinstance(t, type) and issubclass(t, BlockParts)
+            if isinstance(t, type) and issubclass(t, BlockBinding)
         ]
         if len(kinds) != 1:
             msg = (
-                f"{parts_of.__qualname__} must return one BlockParts dataclass "
+                f"{binding_of.__qualname__} must return one BlockBinding dataclass "
                 f"(or None), not {returns}"
             )
             raise TypeError(msg)
         # Called only on instances of ``layer_class``.
-        return cls(layer_class, kinds[0].pattern, cast("Binding", parts_of))
+        return cls(layer_class, kinds[0].pattern, cast("Binding", binding_of))
 
-    def parts(self, layer: nn.Module) -> BlockParts | None:
-        """The layer's parts, or None where the declaration does not cover it.
+    def binding(self, layer: nn.Module) -> BlockBinding | None:
+        """The layer's binding, or None where the declaration does not cover it.
 
         Raises:
             BlockConformanceError: A part is not the kind its field needs,
                 named by its attribute on the layer.
         """
         try:
-            return self.parts_of(layer)
-        except PartsKindError as e:
+            return self.binding_of(layer)
+        except BindingKindError as e:
             raise BlockConformanceError(e.describe(layer)) from e
 
     def when(self, layer: nn.Module) -> bool:
         """Whether the declaration covers this instance."""
-        return self.parts(layer) is not None
+        return self.binding(layer) is not None
 
     def bind(self, layer: nn.Module) -> dict[str, str]:
         """Each layer-level field's attribute name, recovered by identity.
@@ -121,13 +121,13 @@ class BlockDeclaration:
             BlockConformanceError: The layer is not covered, or a part is not
                 one of its children.
         """
-        parts = self.parts(layer)
-        if parts is None:
-            msg = f"{self.parts_of.__qualname__} returns None for this layer"
+        binding = self.binding(layer)
+        if binding is None:
+            msg = f"{self.binding_of.__qualname__} returns None for this layer"
             raise BlockConformanceError(msg)
         return {
             field: attribute_of(layer, module, field)
-            for field, module in parts.layer_children().items()
+            for field, module in binding.layer_children().items()
         }
 
 
@@ -139,18 +139,18 @@ def declarations_for(layer_class: type) -> list[BlockDeclaration]:
     return [d for (cls, _), d in DECLARATIONS.items() if cls is layer_class]
 
 
-def declare_block[L: nn.Module, P: BlockParts](
+def declare_block[L: nn.Module, P: BlockBinding](
     layer_class: type[L],
 ) -> Callable[[Callable[[L], P | None]], Callable[[L], P | None]]:
     """Declares a binding function for ``layer_class`` (the model owner's API).
 
     The function takes the layer, typed as ``layer_class``, so its attribute
     reads are type-checked against the model's class, and returns the
-    pattern's parts dataclass, or None where the layer does not conform.
+    pattern's binding dataclass, or None where the layer does not conform.
     """
 
-    def register(parts_of: Callable[[L], P | None]) -> Callable[[L], P | None]:
-        declaration = BlockDeclaration.of(layer_class, parts_of)
+    def register(binding_of: Callable[[L], P | None]) -> Callable[[L], P | None]:
+        declaration = BlockDeclaration.of(layer_class, binding_of)
         key = (layer_class, declaration.pattern)
         if key in DECLARATIONS:
             msg = (
@@ -159,7 +159,7 @@ def declare_block[L: nn.Module, P: BlockParts](
             )
             raise ValueError(msg)
         DECLARATIONS[key] = declaration
-        return parts_of
+        return binding_of
 
     return register
 

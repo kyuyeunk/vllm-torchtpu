@@ -15,7 +15,7 @@
 
 ``test_every_declaration_conforms`` is the merge gate: every declaration in
 ``models/vllm/*/registration.py`` must conform. The install tests check that
-the runner is built from the model's own parts, that the nested
+the runner is built from the model's own binding, that the nested
 ``AttentionRunner`` is constructed with the block's contract (attention
 unreduced) instead of a field write, and what the interim adapter still
 writes. Execution numerics and the collective order are
@@ -37,10 +37,10 @@ from vllm_torchtpu.blocks.attn_moe import pattern as pattern_mod
 from vllm_torchtpu.blocks.attn_moe.install import conform
 from vllm_torchtpu.blocks.attn_moe.plan import Collectives
 from vllm_torchtpu.blocks.attn_moe.runner import AttnMoERunner, ModelAttention
+from vllm_torchtpu.blocks.binding import as_kind
 from vllm_torchtpu.blocks.context import InstallContext
 from vllm_torchtpu.blocks.norm_attn import install as norm_attn
 from vllm_torchtpu.blocks.norm_attn.runner import AttentionRunner
-from vllm_torchtpu.blocks.parts import as_kind
 from vllm_torchtpu.blocks.stream import routed_runner
 
 QWEN3_5_FULL, QWEN3_5_LINEAR = _build.SPECS[:2]
@@ -56,15 +56,15 @@ def test_every_declaration_conforms(spec: _build.Spec) -> None:
     declaration = blocks.DECLARATIONS[(type(layer), pattern_mod.attn_then_moe)]
     assert declaration.when(layer)
     with set_current_vllm_config(_build.current_config()):
-        parts = conform(layer, declaration)
-    assert any(m is parts.out_proj for m in parts.attention.modules())
+        binding = conform(layer, declaration)
+    assert any(m is binding.out_proj for m in binding.attention.modules())
 
 
 def test_mismatch_stops_startup(monkeypatch: pytest.MonkeyPatch) -> None:
     """A declared layer that does not conform is a startup error."""
     layer = fixtures.ReorderedNorms(_build.build(_build.SPECS[0]))
     declaration = blocks.BlockDeclaration.of(
-        fixtures.ReorderedNorms, fixtures.renamed_parts
+        fixtures.ReorderedNorms, fixtures.renamed_binding
     )
     monkeypatch.setitem(
         blocks.DECLARATIONS,
@@ -140,11 +140,33 @@ def test_block_builds_attention_with_its_contract(spec: _build.Spec) -> None:
     assert runner.post_norm is layer.get_submodule("post_attention_layernorm")
     assert runner.router is layer.get_submodule("mlp.gate")
     assert runner.experts is experts
-    assert list(runner.parameters()) == []
+    assert not isinstance(runner, nn.Module)
     written = {(e.child, e.field) for e in contract_adapter.LEDGER}
     assert written == {("experts", "gate"), ("moe_config", "skip_final_all_reduce")}
     assert experts.gate is None
     assert experts.moe_config.skip_final_all_reduce is True
+
+
+@pytest.mark.parametrize("spec", DECLARED, ids=lambda s: s.name)
+def test_install_leaves_the_state_unchanged(spec: _build.Spec) -> None:
+    """The model owns the state; the runner is behaviour.
+
+    Installing the block (and the nested sub-block) keeps every parameter
+    tensor the model built, under the names it built them. The one exception
+    is the interim MoE write: where the MoE runner held the router as
+    ``experts.gate`` (Qwen3.5), the adapter sets it to None, which drops that
+    alias of ``mlp.gate.weight`` from the state_dict; the tensor stays.
+    """
+    layer = _build.build(spec)
+    before = dict(layer.named_parameters())
+    keys = set(layer.state_dict())
+    _ = _install(layer, _context())
+    after = dict(layer.named_parameters())
+    assert {id(t) for t in after.values()} == {id(t) for t in before.values()}
+    assert all(before[n] is t for n, t in after.items())
+    dropped = keys - set(layer.state_dict())
+    assert all(".experts.gate." in k for k in dropped), dropped
+    assert not set(layer.state_dict()) - keys
 
 
 def test_model_attention_fallback_keeps_the_interim_write() -> None:
@@ -156,14 +178,14 @@ def test_model_attention_fallback_keeps_the_interim_write() -> None:
     assert ("out_proj", "reduce_results") in {
         (e.child, e.field) for e in contract_adapter.LEDGER
     }
-    out_proj = conformed_parts(layer).out_proj
+    out_proj = conformed_binding(layer).out_proj
     assert out_proj.reduce_results is False
     with pytest.raises(contract_adapter.BlockContractError):
         out_proj.reduce_results = True
 
 
-def conformed_parts(layer: nn.Module) -> pattern_mod.AttnMoEParts:
-    """Conformed parts."""
+def conformed_binding(layer: nn.Module) -> pattern_mod.AttnMoEBinding:
+    """Conformed binding."""
     blocks.load_declarations()
     declaration = blocks.DECLARATIONS[(type(layer), pattern_mod.attn_then_moe)]
     with set_current_vllm_config(_build.current_config()):

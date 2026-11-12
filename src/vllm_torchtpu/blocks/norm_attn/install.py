@@ -17,7 +17,6 @@ import contextlib
 import dataclasses
 import logging
 from collections.abc import Callable
-from typing import TYPE_CHECKING, override
 
 import torch
 from torch import nn
@@ -27,25 +26,22 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 
-from vllm_torchtpu.blocks import BlockDeclaration, Pattern
+from vllm_torchtpu.blocks import BlockDeclaration, Pattern, calls
 from vllm_torchtpu.blocks import conformance as conf
+from vllm_torchtpu.blocks.binding import as_kind
 from vllm_torchtpu.blocks.context import InstallContext, Installed
-from vllm_torchtpu.blocks.layer_check import Arg, LayerParts, check_layer, norm_stub
+from vllm_torchtpu.blocks.layer_check import Arg, LayerBinding, check_layer, norm_stub
 from vllm_torchtpu.blocks.norm_attn import plan as plan_mod
-from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnParts, norm_then_attention
+from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnBinding, norm_then_attention
 from vllm_torchtpu.blocks.norm_attn.runner import (
-    AttentionParts,
+    AttentionBinding,
     AttentionRunner,
     AttnConfig,
     FusedOp,
     InputProj,
     reference_fused_qkv,
 )
-from vllm_torchtpu.blocks.parts import as_kind
 from vllm_torchtpu.blocks.stream import Stream, route
-
-if TYPE_CHECKING:
-    from vllm_torchtpu.blocks import calls
 
 # vllm_torchtpu.logger's proxy resolves to vLLM's logger of this name.
 logger = logging.getLogger("vllm." + __name__)
@@ -70,38 +66,40 @@ def _fail(layer: nn.Module, why: str) -> conf.BlockConformanceError:
     )
 
 
-def declared_parts(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnParts:
-    """The parts the binding function returns for ``layer``.
+def declared_binding(
+    layer: nn.Module, declaration: BlockDeclaration
+) -> NormAttnBinding:
+    """The binding the binding function returns for ``layer``.
 
     Raises:
-        BlockConformanceError: The function returns None or other parts, or a
+        BlockConformanceError: The function returns None or other binding, or a
             part is the wrong kind (named by its attribute).
     """
-    parts = declaration.parts(layer)
-    if not isinstance(parts, NormAttnParts):
+    binding = declaration.binding(layer)
+    if not isinstance(binding, NormAttnBinding):
         raise _fail(
             layer,
-            f"{declaration.parts_of.__qualname__} returns {type(parts).__name__}, "
-            "not NormAttnParts",
+            f"{declaration.binding_of.__qualname__} returns {type(binding).__name__}, "
+            "not NormAttnBinding",
         )
-    return parts
+    return binding
 
 
 def conform(layer: nn.Module, declaration: BlockDeclaration) -> Conformed:
     """Checks a declared layer against norm_then_attention.
 
-    Three checks, all on the meta device: the parts are the right kinds (when
-    the binding function builds them); with the parts opaque, the layer's
+    Three checks, all on the meta device: the binding are the right kinds (when
+    the binding function builds them); with the binding opaque, the layer's
     forward computes the pattern's graph and calls attention exactly as the
     declared ``attend`` does (the normed tokens and the positions, nothing
-    else); and, with attention's parts opaque, attention's own forward is the
+    else); and, with attention's binding opaque, attention's own forward is the
     runner's composition (``conform_attention``), so the runner can replace
     it.
 
     Raises:
         BlockConformanceError: Naming the part, edge and source line.
     """
-    declared = declared_parts(layer, declaration)
+    declared = declared_binding(layer, declaration)
     # Layers of one class differ in flags their forward branches on
     # (layer_type, layer_scale) and, built at other sizes, in their shapes.
     state: dict[str, object] = vars(layer)
@@ -109,12 +107,12 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> Conformed:
         sorted((k, v) for k, v in state.items() if isinstance(v, (bool, str)))
     )
     shapes = tuple(tuple(t.shape) for t in layer.parameters())
-    cache_key = (type(layer), declaration.parts_of, flags, shapes)
+    cache_key = (type(layer), declaration.binding_of, flags, shapes)
     if cache_key in _conformed:
         return _conformed[cache_key]
     reads = check_layer(
         layer,
-        LayerParts(
+        LayerBinding(
             input_norm=declared.input_norm,
             attention=declared.attention,
             post_norm=declared.post_norm,
@@ -139,7 +137,7 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> Conformed:
         )
 
     # Attention's own forward against the runner's composition. The declared
-    # parts are opaque there, so a forward that calls another module than the
+    # binding are opaque there, so a forward that calls another module than the
     # one declared computes another graph.
     config = conform_attention(declared, f" on {type(layer).__qualname__}")
     conformed = Conformed(config)
@@ -154,8 +152,8 @@ def _missing(where: str, what: str) -> conf.BlockConformanceError:
     )
 
 
-def attention_config(parts: NormAttnParts, where: str = "") -> AttnConfig:
-    """The properties the runner's composition reads, from the declared parts.
+def attention_config(binding: NormAttnBinding, where: str = "") -> AttnConfig:
+    """The properties the runner's composition reads, from the declared binding.
 
     Raises:
         BlockConformanceError: A property the runner needs is missing, or
@@ -163,10 +161,11 @@ def attention_config(parts: NormAttnParts, where: str = "") -> AttnConfig:
     """
     # The projection holds this rank's head counts; its query heads include
     # the declared output gate's copies.
-    qkv = as_kind(parts.qkv_proj, QKVParallelLinear)
+    qkv = as_kind(binding.qkv_proj, QKVParallelLinear)
     head_dim = qkv.head_size
-    for label, norm in (("q_norm", parts.q_norm), ("k_norm", parts.k_norm)):
-        weight = None if norm is None else next(norm.parameters(), None)
+    for label, norm in (("q_norm", binding.q_norm), ("k_norm", binding.k_norm)):
+        weights = [] if norm is None else list(as_kind(norm, nn.Module).parameters())
+        weight = weights[0] if weights else None
         if weight is not None and weight.numel() != head_dim:
             raise _missing(
                 where,
@@ -174,16 +173,16 @@ def attention_config(parts: NormAttnParts, where: str = "") -> AttnConfig:
                 f"per-head norm over head_dim {head_dim}",
             )
     return AttnConfig(
-        num_heads=qkv.num_heads // 2 if parts.output_gate else qkv.num_heads,
+        num_heads=qkv.num_heads // 2 if binding.output_gate else qkv.num_heads,
         num_kv_heads=qkv.num_kv_heads,
         head_dim=head_dim,
-        qk_norm=parts.q_norm is not None,
-        output_gate=parts.output_gate,
+        qk_norm=binding.q_norm is not None,
+        output_gate=binding.output_gate,
     )
 
 
-def conform_attention(parts: NormAttnParts, where: str = "") -> AttnConfig:
-    """Checks that attention's forward is the runner's composition of its parts.
+def conform_attention(binding: NormAttnBinding, where: str = "") -> AttnConfig:
+    """Checks that attention's forward is the runner's composition of its binding.
 
     With every declared part opaque, attention's own forward (called as the
     declared ``attend`` calls it) must export to the same graph as
@@ -193,9 +192,9 @@ def conform_attention(parts: NormAttnParts, where: str = "") -> AttnConfig:
     Raises:
         BlockConformanceError: Naming the part, edge and source line.
     """
-    config = attention_config(parts, where)
-    qkv_proj = as_kind(parts.qkv_proj, QKVParallelLinear)
-    o_proj = as_kind(parts.o_proj, RowParallelLinear)
+    config = attention_config(binding, where)
+    qkv_proj = as_kind(binding.qkv_proj, QKVParallelLinear)
+    o_proj = as_kind(binding.o_proj, RowParallelLinear)
 
     def projection(linear: LinearBase, width: int, label: str) -> Pattern:
         def stub(x: Tensor, *a: object, **k: object) -> object:
@@ -218,30 +217,30 @@ def conform_attention(parts: NormAttnParts, where: str = "") -> AttnConfig:
     def norm_stub(label: str) -> Callable[[Tensor], Tensor]:
         return lambda x: conf.unary(x, label)
 
-    stubs: list[tuple[nn.Module, Pattern]] = [
+    stubs: list[tuple[object, Pattern]] = [
         (
             qkv_proj,
             projection(qkv_proj, qkv_proj.output_size_per_partition, "qkv_proj"),
         ),
         (o_proj, projection(o_proj, o_proj.output_size_per_partition, "o_proj")),
-        (parts.rotary, rope_stub),
-        (parts.attn, attn_stub),
+        (binding.rotary, rope_stub),
+        (binding.attn, attn_stub),
     ]
-    if parts.q_norm is not None and parts.k_norm is not None:
+    if binding.q_norm is not None and binding.k_norm is not None:
         stubs += [
-            (parts.q_norm, norm_stub("q_norm")),
-            (parts.k_norm, norm_stub("k_norm")),
+            (binding.q_norm, norm_stub("q_norm")),
+            (binding.k_norm, norm_stub("k_norm")),
         ]
     runner = AttentionRunner(
         "conformance",
-        AttentionParts(
+        AttentionBinding(
             input_norm=nn.Identity(),
-            qkv_proj=parts.qkv_proj,
-            attn=parts.attn,
-            o_proj=parts.o_proj,
-            rotary=parts.rotary,
-            q_norm=parts.q_norm,
-            k_norm=parts.k_norm,
+            qkv_proj=binding.qkv_proj,
+            attn=binding.attn,
+            o_proj=binding.o_proj,
+            rotary=binding.rotary,
+            q_norm=binding.q_norm,
+            k_norm=binding.k_norm,
         ),
         config=config,
     )
@@ -258,59 +257,52 @@ def conform_attention(parts: NormAttnParts, where: str = "") -> AttnConfig:
     with contextlib.ExitStack() as stack:
         for module, stub in stubs:
             stack.enter_context(conf.opaque(module, stub))
-        got = conf.canonicalize(conf.export(parts.attend, args, parts.attention), names)
+        got = conf.canonicalize(
+            conf.export(binding.attend, args, binding.attention), names
+        )
         want = conf.canonicalize(conf.export(runner_fn, args, None), names)
     if error := conf.compare("norm_then_attention", got, want, f" (attention{where})"):
         raise conf.BlockConformanceError(error)
     return config
 
 
-class NormAttnLayer(nn.Module):
+class NormAttnLayer:
     """A declared layer's forward with no enclosing block: the runner, then the rest.
 
     Runs the sub-block through its ``AttentionRunner``, then the layer's
     post norm and MLP (opaque), which conformance has shown is all the layer
     computes. ``route`` makes it the layer's forward on the instance.
+    Composition only; the model owns the binding.
     """
 
-    runner: AttentionRunner  # pyright: ignore[reportUninitializedInstanceVariable] - set in __init__ by object.__setattr__
-    post_norm: "calls.ResidualNorm"  # pyright: ignore[reportUninitializedInstanceVariable] - set in __init__ by object.__setattr__
-    mlp: "calls.Mlp"  # pyright: ignore[reportUninitializedInstanceVariable] - set in __init__ by object.__setattr__
-    stream: Stream
+    def __init__(self, runner: AttentionRunner, binding: NormAttnBinding) -> None:
+        """Keeps the runner and the declared binding."""
+        self.runner: AttentionRunner = runner
+        self.post_norm: calls.ResidualNorm = binding.post_norm
+        self.mlp: calls.Mlp = binding.mlp
+        self.stream: Stream = binding.stream
 
-    def __init__(self, runner: AttentionRunner, parts: NormAttnParts) -> None:
-        """Keeps references to the parts; creates no parameter."""
-        super().__init__()
-        for name, part in (
-            ("runner", runner),
-            ("post_norm", parts.post_norm),
-            ("mlp", parts.mlp),
-        ):
-            object.__setattr__(self, name, part)  # a reference, not a child
-        self.stream = parts.stream
-
-    @override
-    def forward(self, *args: object, **kwargs: object) -> tuple[Tensor, Tensor]:
+    def __call__(self, *args: object, **kwargs: object) -> tuple[Tensor, Tensor]:
         """Takes the layer's own arguments: it stands in for its forward."""
         hidden, residual, positions = self.stream.unpack(*args, **kwargs)
-        x, stream = self.runner.forward(hidden, residual, positions)
+        x, stream = self.runner(hidden, residual, positions)
         x, stream = self.post_norm(x, stream)
         return self.mlp(x), stream
 
 
 def build_runner(  # noqa: PLR0913 - the runner's arguments, as AttentionRunner takes them
     name: str,
-    parts: AttentionParts,
+    binding: AttentionBinding,
     config: AttnConfig,
     input_proj: InputProj,
     fused_op: FusedOp | None = None,
     *,
     output_reduced: bool = True,
 ) -> AttentionRunner:
-    """The runner for one declared layer: the declared parts are its arguments."""
+    """The runner for one declared layer: the declared binding are its arguments."""
     return AttentionRunner(
         name,
-        parts,
+        binding,
         config=config,
         input_proj=input_proj,
         fused_op=fused_op if input_proj is InputProj.FUSED_QKV else None,
@@ -325,9 +317,9 @@ FUSED_OP_UNREDUCED = True
 """``FUSED_OP``'s capability: it honours ``runner.output_reduced=False``."""
 
 
-def fused_op_for(name: str, parts: NormAttnParts) -> tuple[FusedOp, bool, str]:
+def fused_op_for(name: str, binding: NormAttnBinding) -> tuple[FusedOp, bool, str]:
     """The fused value's op for this layer, its unreduced capability, and a note."""
-    del name, parts
+    del name, binding
     return FUSED_OP, FUSED_OP_UNREDUCED, ""
 
 
@@ -338,26 +330,26 @@ def resolve_runner(
     context: InstallContext,
     *,
     output_reduced: bool,
-) -> tuple[NormAttnParts, AttentionRunner, str]:
+) -> tuple[NormAttnBinding, AttentionRunner, str]:
     """Conforms, chooses the plan and builds the runner for one declared layer.
 
     The parent states the runner's contract (``output_reduced``); the plan
     takes only values that can honour it.
 
     Returns:
-        The parts, the runner, and what was chosen, for the install report.
+        The binding, the runner, and what was chosen, for the install report.
 
     Raises:
         BlockConformanceError: The layer does not conform.
         ValueError: A pinned value cannot run on this layer.
     """
     config = conform(layer, declaration).config
-    parts = declared_parts(layer, declaration)
-    fused_op, fused_unreduced, via = fused_op_for(name, parts)
+    binding = declared_binding(layer, declaration)
+    fused_op, fused_unreduced, via = fused_op_for(name, binding)
     pins = context.subblock_pins or plan_mod.Pins()
     plan, declined = plan_mod.choose(
         pins,
-        plan_mod.facts_of(parts, config),
+        plan_mod.facts_of(binding, config),
         chip=context.chip,
         fp8_kv_cache=context.fp8_kv_cache,
         where=type(layer).__qualname__,
@@ -367,7 +359,7 @@ def resolve_runner(
     for item in declined:  # The rule's value fell back: quiet.
         logger.debug("%s: %s", name, item)
     runner = build_runner(
-        name, parts, config, plan.input_proj, fused_op, output_reduced=output_reduced
+        name, binding, config, plan.input_proj, fused_op, output_reduced=output_reduced
     )
     source = "user" if pins else "rule"
     fused = plan.input_proj is InputProj.FUSED_QKV
@@ -375,17 +367,17 @@ def resolve_runner(
     via = via if fused else ""
     reduced = "" if output_reduced else " output_reduced=False"
     what = f"input_proj={plan.input_proj.value}{matmul}{reduced} ({source}){via}"
-    return parts, runner, what
+    return binding, runner, what
 
 
 def install_standalone(
     name: str, layer: nn.Module, declaration: BlockDeclaration, context: InstallContext
 ) -> Installed:
     """Routes a declared layer with no enclosing block through its runner."""
-    parts, runner, what = resolve_runner(
+    binding, runner, what = resolve_runner(
         name, layer, declaration, context, output_reduced=True
     )
-    route(layer, NormAttnLayer(runner, parts))
+    route(layer, NormAttnLayer(runner, binding))
     return Installed(name, type(layer).__qualname__, f"runner installed; {what}")
 
 

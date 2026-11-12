@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Synthetic parts for the runner execution tests, and a straight-line reference.
+"""Synthetic binding for the runner execution tests, and a straight-line reference.
 
 Each part has the contract of the vLLM building block it stands for: an
 RMSNorm taking ``(x, residual)``, linears returning ``(out, bias)``, a NeoX
@@ -20,6 +20,7 @@ rotary on ``(positions, q, k)``, a causal GQA core on ``(q, k, v)``. Shared by
 """
 
 import dataclasses
+from typing import override
 
 import torch
 import torch.nn.functional as F  # noqa: N812 - torch's alias
@@ -28,7 +29,7 @@ from vllm.model_executor.layers import layernorm, linear
 
 from vllm_torchtpu.blocks.norm_attn import runner as runner_mod
 from vllm_torchtpu.blocks.norm_attn.runner import (
-    AttentionParts,
+    AttentionBinding,
     AttentionRunner,
     AttnConfig,
     InputProj,
@@ -94,7 +95,8 @@ class WholeNorm(nn.Module):
 class UnquantizedLinearMethod(linear.UnquantizedLinearMethod):
     """vLLM's, by type (the capability checks it); the GEMM is this file's."""
 
-    def apply(  # pyright: ignore[reportIncompatibleMethodOverride]
+    @override
+    def apply(
         self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
         """The GEMM alone, as vLLM's ``apply``: no reduction over ranks."""
@@ -115,7 +117,7 @@ class Linear(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.randn(n_out, n_in) / n_in**0.5)
         self.bias = nn.Parameter(0.1 * torch.randn(n_out)) if bias else None
-        self.quant_method: object = UnquantizedLinearMethod()
+        self.quant_method: linear.UnquantizedLinearMethod = UnquantizedLinearMethod()
         self.return_bias = True  # vLLM's linears return (out, bias) by default.
         # RowParallelLinear's fields the unreduced-output capability reads.
         self.input_is_parallel = True
@@ -212,9 +214,9 @@ class Roles:
 
 
 class Attention(nn.Module):
-    """A synthetic attention role: the parts, and the properties vLLM's carry.
+    """A synthetic attention role: the binding, and the properties vLLM's carry.
 
-    ``fused_qkv_supports`` reads the properties; the runner receives the parts.
+    ``fused_qkv_supports`` reads the properties; the runner receives the binding.
     """
 
     def __init__(
@@ -252,12 +254,12 @@ class Attention(nn.Module):
 def setup_parts(
     roles: Roles, dtype: torch.dtype = torch.float32
 ) -> tuple[InputNorm, Attention]:
-    """Setup parts."""
+    """Setup binding."""
     torch.manual_seed(0)
     return InputNorm(HIDDEN).to(dtype), Attention(roles).to(dtype)
 
 
-def build_runner(  # noqa: PLR0913 - the parts and options a runner or reference takes
+def build_runner(  # noqa: PLR0913 - the binding and options a runner or reference takes
     norm: nn.Module,
     attention: Attention,
     config: AttnConfig,
@@ -267,7 +269,7 @@ def build_runner(  # noqa: PLR0913 - the parts and options a runner or reference
     output_reduced: bool = True,
 ) -> AttentionRunner:
     """Build runner."""
-    parts = AttentionParts(
+    binding = AttentionBinding(
         input_norm=norm,
         qkv_proj=attention.qkv_proj,
         attn=attention.attn,
@@ -278,7 +280,7 @@ def build_runner(  # noqa: PLR0913 - the parts and options a runner or reference
     )
     return AttentionRunner(
         "layer",
-        parts,
+        binding,
         config=config,
         input_proj=input_proj,
         fused_op=fused_op,
@@ -297,7 +299,7 @@ def make_inputs(
     return hidden, residual, torch.arange(TOKENS) * 3
 
 
-def reference_forward(  # noqa: PLR0913 - the parts and options a runner or reference takes
+def reference_forward(  # noqa: PLR0913 - the binding and options a runner or reference takes
     roles: Roles,
     norm: InputNorm,
     attention: Attention,
@@ -305,7 +307,7 @@ def reference_forward(  # noqa: PLR0913 - the parts and options a runner or refe
     residual: torch.Tensor | None,
     positions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The sub-block in straight-line float32 torch, from the parts' weights."""
+    """The sub-block in straight-line float32 torch, from the binding' weights."""
     c = roles.config()
     h, kvh, d, t = c.num_heads, c.num_kv_heads, c.head_dim, hidden.shape[0]
     stream = hidden if residual is None else hidden + residual

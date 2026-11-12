@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Execution tests: AttnMoERunner on synthetic parts, no model.
+"""Execution tests: AttnMoERunner on synthetic binding, no model.
 
-The block runner is built from tiny parts: the nested ``AttentionRunner``
-over ``synthetic.py``'s attention parts, an RMSNorm, a router linear and a
+The block runner is built from tiny binding: the nested ``AttentionRunner``
+over ``synthetic.py``'s attention binding, an RMSNorm, a router linear and a
 dense top-k expert mixture. Each block plan value (upstream's ``all_reduce``,
 PR #1492's ``reduce_scatter_all_gather``) runs with each attention plan value
 (``unfused``, ``fused_qkv``), and each is checked against the upstream
@@ -50,7 +50,7 @@ from vllm_torchtpu.blocks.attn_moe import plan as block_plan  # noqa: E402 - dit
 from vllm_torchtpu.blocks.attn_moe import runner as block_runner  # noqa: E402 - ditto
 from vllm_torchtpu.blocks.attn_moe.runner import (  # noqa: E402 - ditto
     AttnMoERunner,
-    MoEParts,
+    MoEBinding,
 )
 from vllm_torchtpu.blocks.norm_attn import plan as subblock_plan  # noqa: E402 - ditto
 from vllm_torchtpu.blocks.norm_attn.runner import (  # noqa: E402 - ditto
@@ -121,7 +121,7 @@ def collectives(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return calls
 
 
-# The MoE's synthetic parts.
+# The MoE's synthetic binding.
 
 
 class Experts(nn.Module):
@@ -145,8 +145,8 @@ class Experts(nn.Module):
 def _moe() -> tuple[InputNorm, Linear, Experts]:
     """float32 explicitly: an earlier file's meta builds set a bf16 default."""
     torch.manual_seed(2)
-    parts = InputNorm(HIDDEN), Linear(HIDDEN, NUM_EXPERTS), Experts()
-    return parts[0].float(), parts[1].float(), parts[2].float()
+    binding = InputNorm(HIDDEN), Linear(HIDDEN, NUM_EXPERTS), Experts()
+    return binding[0].float(), binding[1].float(), binding[2].float()
 
 
 def _attention(input_proj: InputProj) -> tuple[InputNorm, Attention, AttentionRunner]:
@@ -173,7 +173,7 @@ def _block(
     post_norm, router, experts = _moe()
     block = AttnMoERunner(
         "layer",
-        MoEParts(post_norm=post_norm, router=router, experts=experts),
+        MoEBinding(post_norm=post_norm, router=router, experts=experts),
         attention=attention_part,
         table=_table(collectives),
         tp=1,
@@ -183,13 +183,13 @@ def _block(
 
 
 def reference_block(
-    parts: "Parts",
+    binding: "Parts",
     hidden: torch.Tensor,
     residual: torch.Tensor | None,
     positions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Upstream's layer in straight-line torch: attention, norm, route, experts."""
-    norm, attention, post_norm, router, experts = parts
+    norm, attention, post_norm, router, experts = binding
     attn, stream = reference_forward(
         SUBBLOCK, norm, attention, hidden, residual, positions
     )
@@ -218,11 +218,11 @@ def test_block_equals_upstream(
     first: bool,  # noqa: FBT001 - a pytest parameter, passed by name
 ) -> None:
     """The residual stream (``out + residual``) matches upstream's layer."""
-    block, parts = _block(collectives_value, input_proj)
+    block, binding = _block(collectives_value, input_proj)
     hidden, residual, positions = make_inputs(first)
     with torch.no_grad():
         out, res = block(positions, hidden, residual)
-        want_out, want_res = reference_block(parts, hidden, residual, positions)
+        want_out, want_res = reference_block(binding, hidden, residual, positions)
     torch.testing.assert_close(out + res, want_out + want_res, atol=ATOL, rtol=0)
     if collectives_value is ALL_REDUCE:  # Upstream's split of the stream, too.
         torch.testing.assert_close(res, want_res, atol=ATOL, rtol=0)
@@ -262,7 +262,7 @@ def test_by_bucket(collectives: list[str]) -> None:
     )
     block = AttnMoERunner(
         "bucketed",
-        MoEParts(post_norm=post_norm, router=router, experts=experts),
+        MoEBinding(post_norm=post_norm, router=router, experts=experts),
         attention=attention_part,
         table=table,
         tp=1,
@@ -296,12 +296,12 @@ def test_compile_outside_warmup_keeps_all_reduce(
     assert collectives == ["rs", "ag", "ag", "ar"]
 
 
-def test_runner_owns_no_parameters() -> None:
+def test_runner_is_composition_only() -> None:
     """Runner owns no parameters."""
-    block, parts = _block(OVERLAP, FUSED)
-    assert not list(block.parameters())
-    assert not list(block.children())
-    del parts
+    block, binding = _block(OVERLAP, FUSED)
+    assert not isinstance(block, nn.Module)
+    assert not isinstance(block.attention, nn.Module)
+    del binding
 
 
 # The contract: the block builds attention unreduced; the capability guards it.

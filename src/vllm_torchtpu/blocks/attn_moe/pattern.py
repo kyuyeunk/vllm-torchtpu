@@ -14,11 +14,11 @@
 """The attn_then_moe pattern: a reference forward and what each role must be.
 
 Framework-owned. A model owner declares that a decoder layer conforms to this
-pattern with a binding function returning ``AttnMoEParts`` (``declare_block``).
+pattern with a binding function returning ``AttnMoEBinding`` (``declare_block``).
 The conformance check then holds the layer to two things:
 
-- **Kinds.** Each part is what its field says (``AttnMoEParts.problems``, run
-  when the parts are built): two RMSNorm-family norms called with a residual;
+- **Kinds.** Each part is what its field says (``AttnMoEBinding.problems``, run
+  when the binding are built): two RMSNorm-family norms called with a residual;
   an attention child holding an attention layer and ending in a
   ``RowParallelLinear`` to the hidden size; a MoE child owning the MoE runner
   and the ``GateLinear`` router.
@@ -38,9 +38,9 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import RowParallelLinear
 
 from vllm_torchtpu.blocks.attn_moe.plan import BlockKey, MoEPath, RouterMode
-from vllm_torchtpu.blocks.attn_moe.runner import MoEParts
+from vllm_torchtpu.blocks.attn_moe.runner import MoEBinding
+from vllm_torchtpu.blocks.binding import BlockBinding, as_kind
 from vllm_torchtpu.blocks.norm_attn.pattern import is_residual_norm
-from vllm_torchtpu.blocks.parts import BlockParts, as_kind
 from vllm_torchtpu.blocks.stream import Attend, Stream
 
 Norm = Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
@@ -78,10 +78,10 @@ def moe_runner_router(x: torch.Tensor, *, experts: Op) -> torch.Tensor:
     return experts(x)
 
 
-def block_key(parts: "AttnMoEParts", tp: int, dtype: torch.dtype) -> BlockKey:
-    """The plan's key, read from the declared parts."""
-    runner = as_kind(parts.experts, MoERunner)
-    router = as_kind(parts.router, GateLinear)
+def block_key(binding: "AttnMoEBinding", tp: int, dtype: torch.dtype) -> BlockKey:
+    """The plan's key, read from the declared binding."""
+    runner = as_kind(binding.experts, MoERunner)
+    router = as_kind(binding.router, GateLinear)
     cfg = runner.moe_config
     sp = bool(cfg.is_sequence_parallel)
     if cfg.moe_parallel_config.use_all2all_kernels:
@@ -94,7 +94,7 @@ def block_key(parts: "AttnMoEParts", tp: int, dtype: torch.dtype) -> BlockKey:
         tp=tp,
         hidden=router.input_size,
         dtype=dtype,
-        attention_kind=type(parts.attention),
+        attention_kind=type(binding.attention),
         router_mode=(
             RouterMode.FUSED_IN_EXPERTS
             if runner.gate is router
@@ -111,10 +111,10 @@ def block_key(parts: "AttnMoEParts", tp: int, dtype: torch.dtype) -> BlockKey:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class AttnMoEParts(MoEParts, BlockParts):
-    """A declared layer's parts for attn_then_moe.
+class AttnMoEBinding(MoEBinding, BlockBinding):
+    """A declared layer's binding for attn_then_moe.
 
-    The runner's parts (``MoEParts``: post norm, router, experts) plus the
+    The runner's binding (``MoEBinding``: post norm, router, experts) plus the
     layer's other roles: the input norm, the attention child (run whole, or
     through the nested ``AttentionRunner``), attention's output projection
     (declared, so the block never searches for it; only a layer without a
@@ -132,7 +132,7 @@ class AttnMoEParts(MoEParts, BlockParts):
     pattern: ClassVar[Callable[..., object]] = attn_then_moe
 
     @override
-    def layer_children(self) -> dict[str, nn.Module]:
+    def layer_children(self) -> dict[str, object]:
         return {
             "input_norm": self.input_norm,
             "attention": self.attention,
@@ -156,7 +156,7 @@ class AttnMoEParts(MoEParts, BlockParts):
             problems.append(("out_proj", out_proj, why))
         if not any(m is out_proj for m in self.attention.modules()):
             problems.append(("out_proj", out_proj, "is not a module of attention"))
-        kinds: tuple[tuple[str, nn.Module, type, str], ...] = (
+        kinds: tuple[tuple[str, object, type, str], ...] = (
             ("router", self.router, GateLinear, "a GateLinear"),
             ("experts", self.experts, MoERunner, "a MoE runner"),
         )
@@ -183,7 +183,7 @@ class RoutedMoE(Protocol):
     """A MoE child with vLLM's usual part names."""
 
     @property
-    def gate(self) -> nn.Module:
+    def gate(self) -> GateLinear:
         """The part's ``gate``."""
         ...
 
@@ -207,7 +207,7 @@ class PreNormMoELayer(Protocol):
         ...
 
 
-def pre_norm_moe_parts(  # noqa: PLR0913 - one argument per declared part
+def pre_norm_moe_binding(  # noqa: PLR0913 - one argument per declared part
     layer: PreNormMoELayer,
     attention: nn.Module,
     out_proj: RowParallelLinear,
@@ -215,9 +215,9 @@ def pre_norm_moe_parts(  # noqa: PLR0913 - one argument per declared part
     *,
     stream: Stream,
     attend: Attend,
-) -> AttnMoEParts:
-    """The parts of a layer, its attention and its MoE, under vLLM's usual names."""
-    return AttnMoEParts(
+) -> AttnMoEBinding:
+    """The binding of a layer, its attention and its MoE, under vLLM's usual names."""
+    return AttnMoEBinding(
         input_norm=layer.input_layernorm,
         attention=attention,
         out_proj=out_proj,

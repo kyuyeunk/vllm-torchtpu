@@ -28,8 +28,8 @@ import torch
 from torch import nn
 from vllm.model_executor.layers.linear import RowParallelLinear
 
-from vllm_torchtpu.blocks.attn_moe.pattern import AttnMoEParts
-from vllm_torchtpu.blocks.parts import as_kind
+from vllm_torchtpu.blocks.attn_moe.pattern import AttnMoEBinding
+from vllm_torchtpu.blocks.binding import as_kind
 from vllm_torchtpu.blocks.stream import attend_with_positions, hidden_residual_positions
 
 
@@ -87,9 +87,9 @@ class DeadBranchAndView(_Children):
         return self.ffn(hidden_states), residual
 
 
-def renamed_parts(layer: _Children) -> AttnMoEParts:
-    """The fixtures' binding function: the same parts under the new names."""
-    return AttnMoEParts(
+def renamed_binding(layer: _Children) -> AttnMoEBinding:
+    """The fixtures' binding function: the same binding under the new names."""
+    return AttnMoEBinding(
         input_norm=layer.pre_norm,
         attention=layer.mixer,
         out_proj=as_kind(layer.mixer.get_submodule("o_proj"), RowParallelLinear),

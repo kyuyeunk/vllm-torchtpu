@@ -42,8 +42,12 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
 
-from vllm_torchtpu.blocks.norm_attn.runner import AttentionParts, AttnConfig, InputProj
-from vllm_torchtpu.blocks.parts import as_kind
+from vllm_torchtpu.blocks.binding import as_kind
+from vllm_torchtpu.blocks.norm_attn.runner import (
+    AttentionBinding,
+    AttnConfig,
+    InputProj,
+)
 from vllm_torchtpu.layers.core.plan_marker import plan_of
 from vllm_torchtpu.layers.core.resolution import require_no_default
 from vllm_torchtpu.tpu_info import has_fp8_matmul
@@ -151,7 +155,7 @@ class NormFacts:
 class AttentionFacts:
     """What the capabilities read about one declared attention, typed.
 
-    Built once from the declared parts (``facts_of``), the one place vLLM's
+    Built once from the declared binding (``facts_of``), the one place vLLM's
     modules are read; capability conditions read only this record, so tests
     enumerate them without building a module.
     """
@@ -169,28 +173,28 @@ class AttentionFacts:
     o_proj_adds_bias: bool
 
 
-def _norm_facts(norm: nn.Module | None) -> NormFacts | None:
+def _norm_facts(norm: object) -> NormFacts | None:
     if norm is None:
         return None
-    weights = list(norm.parameters())  # A weightless norm has none.
+    weights = list(as_kind(norm, nn.Module).parameters())  # Weightless: none.
     width = weights[0].numel() if weights else 0
     rms = isinstance(norm, (RMSNorm, GemmaRMSNorm))
     return NormFacts(rms, width, type(norm).__name__)
 
 
-def facts_of(parts: AttentionParts, config: AttnConfig) -> AttentionFacts:
-    """The typed boundary: reads the declared parts' vLLM classes once."""
-    core = as_kind(parts.attn, Attention)
-    rotary = as_kind(parts.rotary, RotaryEmbeddingBase)
-    qkv = as_kind(parts.qkv_proj, QKVParallelLinear)
-    o_proj = as_kind(parts.o_proj, RowParallelLinear)
+def facts_of(binding: AttentionBinding, config: AttnConfig) -> AttentionFacts:
+    """The typed boundary: reads the declared binding' vLLM classes once."""
+    core = as_kind(binding.attn, Attention)
+    rotary = as_kind(binding.rotary, RotaryEmbeddingBase)
+    qkv = as_kind(binding.qkv_proj, QKVParallelLinear)
+    o_proj = as_kind(binding.o_proj, RowParallelLinear)
     method = qkv.quant_method
     return AttentionFacts(
         config=config,
         sinks=core.has_sink,
         kv_sharing=core.kv_sharing_target_layer_name is not None,
-        q_norm=_norm_facts(parts.q_norm),
-        k_norm=_norm_facts(parts.k_norm),
+        q_norm=_norm_facts(binding.q_norm),
+        k_norm=_norm_facts(binding.k_norm),
         neox_rope=rotary.is_neox_style,
         qkv_quant_supported=isinstance(
             method, (UnquantizedLinearMethod, Fp8LinearMethod)

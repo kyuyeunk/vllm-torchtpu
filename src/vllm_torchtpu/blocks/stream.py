@@ -180,19 +180,19 @@ def attend_without_positions(attention: AttentionWithoutPositions) -> Attend:
     return attend
 
 
-def route(layer: nn.Module, runner: nn.Module) -> None:
+def route(layer: nn.Module, runner: Callable[..., object]) -> None:
     """Makes ``runner`` the layer's forward, on this instance only.
 
-    The runner is stored as the instance's ``forward`` attribute, which
-    ``nn.Module.__call__`` reads, so neither the layer's class nor its module
-    tree changes: no mixin, no ``__class__`` rebinding, and the runner's parts
-    stay registered where the model put them. ``type(layer).forward`` stays
-    the model's forward, which ``Stream.call`` calls.
+    The runner is a plain object, not a module, so ``nn.Module.__setattr__``
+    stores it as an ordinary instance attribute: ``nn.Module.__call__`` reads
+    ``self.forward`` and finds it, while the layer's class, module tree,
+    parameters and ``state_dict`` are unchanged. ``type(layer).forward`` stays
+    the model's forward, which ``Stream.call`` calls. The model owns the
+    state; the runner is behaviour.
     """
-    object.__setattr__(layer, "forward", runner)
+    layer.forward = runner
 
 
-def routed_runner(layer: nn.Module) -> nn.Module | None:
-    """The runner ``route`` installed on ``layer``, or None."""
-    runner = vars(layer).get("forward")  # str-ok: the attribute route() sets
-    return runner if isinstance(runner, nn.Module) else None
+def routed_runner(layer: nn.Module) -> object:
+    """What ``route`` installed as the layer's forward (else its bound method)."""
+    return layer.forward

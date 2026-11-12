@@ -45,13 +45,13 @@ from vllm_torchtpu.blocks.attn_moe import contract_adapter
 from vllm_torchtpu.blocks.attn_moe import plan as plan_mod
 from vllm_torchtpu.blocks.attn_moe.install import apply_block, conform
 from vllm_torchtpu.blocks.attn_moe.pattern import (
-    AttnMoEParts,
+    AttnMoEBinding,
     attn_then_moe,
     block_key,
 )
+from vllm_torchtpu.blocks.binding import as_kind
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
 from vllm_torchtpu.blocks.context import InstallContext
-from vllm_torchtpu.blocks.parts import as_kind
 
 _BUCKETS = (16, 256, 1024, 4096, 8192, 16384)
 
@@ -82,12 +82,12 @@ def _cases() -> list[tuple[str, nn.Module, BlockDeclaration, bool]]:
         (fixtures.DeadBranchAndView, True),
     ):
         layer = cls(_build.build(full))
-        declaration = BlockDeclaration.of(cls, fixtures.renamed_parts)
+        declaration = BlockDeclaration.of(cls, fixtures.renamed_binding)
         cases.append((f"fixture {cls.__name__}", layer, declaration, expect))
     if PLANT_MISMATCH:
         layer = fixtures.ReorderedNorms(_build.build(full))
         declaration = BlockDeclaration.of(
-            fixtures.ReorderedNorms, fixtures.renamed_parts
+            fixtures.ReorderedNorms, fixtures.renamed_binding
         )
         cases.append(("declared ReorderedNorms (planted)", layer, declaration, True))
     return cases
@@ -110,9 +110,9 @@ def conformance() -> list[str]:
 
 def plan_table() -> list[str]:
     layer = _build.build(_build.SPECS[0])
-    parts = _declared(layer).parts(layer)
-    assert isinstance(parts, AttnMoEParts)
-    key = block_key(parts, tp=4, dtype=torch.bfloat16)
+    binding = _declared(layer).binding(layer)
+    assert isinstance(binding, AttnMoEBinding)
+    key = block_key(binding, tp=4, dtype=torch.bfloat16)
     key = dataclasses.replace(key, hidden=2048)  # Qwen3.5-35B-A3B
     fused = dataclasses.replace(key, fused_output_reduced=True)
     sp_moe = dataclasses.replace(key, sp_moe=True)
@@ -153,11 +153,11 @@ def outside_write() -> list[str]:
     layer = _build.build(_build.SPECS[0])
     declaration = _declared(layer)
     with set_current_vllm_config(_build.current_config()):
-        parts = conform(layer, declaration)
+        binding = conform(layer, declaration)
     table = plan_mod.BlockPlanTable(((8192, plan_mod.OVERLAP, plan_mod.Source.RULE),))
-    apply_block("layers.0", layer, parts, table, tp=4)
+    apply_block("layers.0", layer, binding, table, tp=4)
     try:
-        as_kind(parts.experts, MoERunner).moe_config.skip_final_all_reduce = False
+        as_kind(binding.experts, MoERunner).moe_config.skip_final_all_reduce = False
     except contract_adapter.BlockContractError as e:
         print(f"    raised: {e}")
         return []
@@ -168,7 +168,7 @@ def mismatch_raises() -> list[str]:
     layer = fixtures.ReorderedNorms(_build.build(_build.SPECS[0]))
     key = (fixtures.ReorderedNorms, attn_then_moe)
     blocks.DECLARATIONS[key] = BlockDeclaration.of(
-        fixtures.ReorderedNorms, fixtures.renamed_parts
+        fixtures.ReorderedNorms, fixtures.renamed_binding
     )
     context = InstallContext(
         tp=4,

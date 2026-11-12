@@ -15,18 +15,18 @@
 
 Shaped like vLLM's ``MoERunner`` (``layers/fused_moe/runner/moe_runner.py``):
 
-- ``__init__`` receives parts the model already built (the input norm, the
+- ``__init__`` receives binding the model already built (the input norm, the
   QKV projection, the optional per-head q/k norms, RoPE, the attention core,
   the output projection) and keeps references to them. It creates no
   parameter, so weight loading and the model's ``state_dict`` are unchanged;
-  the model keeps owning its parts.
-- ``forward`` calls the parts in order. The runner owns the composition only.
+  the model keeps owning its binding.
+- ``forward`` calls the binding in order. The runner owns the composition only.
 - ``_select_forward`` resolves the plan once, at install, as ``MoERunner``
   picks its ``_forward_entry``.
 
 Every model that declares ``norm_then_attention`` runs this one forward, so a
 fusion of the sub-block (``fused_qkv``, PR #3096's kernel) is one branch here,
-written once against the parts, never against a model class.
+written once against the binding, never against a model class.
 
 The runner's contract with its parent is a constructor argument,
 ``output_reduced``: whether its output is summed over tensor-parallel ranks.
@@ -40,13 +40,12 @@ before it builds.
 import dataclasses
 import enum
 from collections.abc import Callable
-from typing import TYPE_CHECKING, override
 
 import torch
 from torch import nn
 
-if TYPE_CHECKING:
-    from vllm_torchtpu.blocks import calls
+from vllm_torchtpu.blocks import calls
+from vllm_torchtpu.blocks.binding import as_kind
 
 
 class InputProj(enum.Enum):
@@ -101,11 +100,11 @@ class AttnConfig:
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class AttentionParts:
+class AttentionBinding:
     """What ``AttentionRunner`` composes: the model's own part objects.
 
     Execution needs only each part's call contract, so tests build this from
-    synthetic modules. A model's declaration builds ``NormAttnParts``, which
+    synthetic modules. A model's declaration builds ``NormAttnBinding``, which
     extends it with the layer's other roles and checks every kind.
 
     Attributes:
@@ -117,31 +116,23 @@ class AttentionParts:
         q_norm, k_norm: Per-head norms on q and k, both or neither.
     """
 
-    input_norm: nn.Module
-    qkv_proj: nn.Module
-    attn: nn.Module
-    o_proj: nn.Module
-    rotary: nn.Module
-    q_norm: nn.Module | None = None
-    k_norm: nn.Module | None = None
+    input_norm: calls.ResidualNorm
+    qkv_proj: calls.Linear
+    attn: calls.AttentionCore
+    o_proj: calls.RowLinear
+    rotary: calls.Rope
+    q_norm: calls.HeadNorm | None = None
+    k_norm: calls.HeadNorm | None = None
 
 
-class AttentionRunner(nn.Module):
-    """The sub-block's composition; the parts stay the model's.
+class AttentionRunner:
+    """The sub-block's composition. Composition only; the model owns the parts.
 
-    Parts are held as plain references (not registered submodules), so the
-    model's parameter tree, weight loading and checkpoints are unchanged.
+    A plain object, not an ``nn.Module``: it holds no parameter or buffer, and
+    the decoder layer holds it as an ordinary attribute, so the model's
+    parameter tree, ``state_dict`` and weight loading are unchanged.
     """
 
-    # The parts, typed by their call contracts (``calls``): assigned as plain
-    # references in __init__, so the model's parameter tree is unchanged.
-    input_norm: "calls.ResidualNorm"  # pyright: ignore[reportUninitializedInstanceVariable] - set in __init__ by object.__setattr__
-    qkv_proj: "calls.Linear"  # pyright: ignore[reportUninitializedInstanceVariable] - set in __init__ by object.__setattr__
-    attn: "calls.AttentionCore"  # pyright: ignore[reportUninitializedInstanceVariable] - set in __init__ by object.__setattr__
-    o_proj: "calls.RowLinear"  # pyright: ignore[reportUninitializedInstanceVariable] - set in __init__ by object.__setattr__
-    rotary: "calls.Rope"  # pyright: ignore[reportUninitializedInstanceVariable] - set in __init__ by object.__setattr__
-    q_norm: "calls.HeadNorm"  # pyright: ignore[reportUninitializedInstanceVariable] - set in __init__ by object.__setattr__
-    k_norm: "calls.HeadNorm"  # pyright: ignore[reportUninitializedInstanceVariable] - set in __init__ by object.__setattr__
     layer_name: str
     config: AttnConfig
     input_proj: InputProj
@@ -152,30 +143,24 @@ class AttentionRunner(nn.Module):
         tuple[torch.Tensor, torch.Tensor],
     ]
 
-    def __init__(  # noqa: PLR0913 - the parts, then the plan, the op and the contract
+    def __init__(  # noqa: PLR0913 - the binding, then the plan, the op and the contract
         self,
         layer_name: str,
-        parts: AttentionParts,
+        binding: AttentionBinding,
         *,
         config: AttnConfig,
         input_proj: InputProj = InputProj.UNFUSED,
         fused_op: FusedOp | None = None,
         output_reduced: bool = True,
     ) -> None:
-        """Keeps references to the parts; creates no parameter."""
-        super().__init__()
-        refs = (
-            ("input_norm", parts.input_norm),
-            ("qkv_proj", parts.qkv_proj),
-            ("attn", parts.attn),
-            ("o_proj", parts.o_proj),
-            ("rotary", parts.rotary),
-            ("q_norm", parts.q_norm),
-            ("k_norm", parts.k_norm),
-        )
-        for name, part in refs:
-            # A reference, not a child: the model keeps owning its parts.
-            object.__setattr__(self, name, part)
+        """Keeps references to the binding; creates no parameter."""
+        self.input_norm: calls.ResidualNorm = binding.input_norm
+        self.qkv_proj: calls.Linear = binding.qkv_proj
+        self.attn: calls.AttentionCore = binding.attn
+        self.o_proj: calls.RowLinear = binding.o_proj
+        self.rotary: calls.Rope = binding.rotary
+        self.q_norm: calls.HeadNorm | None = binding.q_norm
+        self.k_norm: calls.HeadNorm | None = binding.k_norm
         self.layer_name = layer_name
         self.config = config
         self.input_proj = input_proj
@@ -197,8 +182,7 @@ class AttentionRunner(nn.Module):
             return self._fused_qkv
         return self._unfused
 
-    @override
-    def forward(
+    def __call__(
         self,
         hidden: torch.Tensor,
         residual: torch.Tensor | None,
@@ -230,7 +214,7 @@ class AttentionRunner(nn.Module):
         residual: torch.Tensor | None,
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The fused op on the same parts; where it declines a call, unfused."""
+        """The fused op on the same binding; where it declines a call, unfused."""
         if self.fused_op is None:  # _select_forward checked
             raise ValueError(self.layer_name)
         out = self.fused_op(self, hidden, residual, positions)
@@ -259,9 +243,10 @@ class AttentionRunner(nn.Module):
         else:
             q, k, v = torch.split(qkv, [c.q_size, c.kv_size, c.kv_size], dim=-1)
             gate = None
-        if c.qk_norm:
-            q = self.q_norm(q.view(-1, c.num_heads, c.head_dim)).view(-1, c.q_size)
-            k = self.k_norm(k.view(-1, c.num_kv_heads, c.head_dim)).view(-1, c.kv_size)
+        q_norm, k_norm = self.q_norm, self.k_norm
+        if q_norm is not None and k_norm is not None:  # config.qk_norm
+            q = q_norm(q.view(-1, c.num_heads, c.head_dim)).view(-1, c.q_size)
+            k = k_norm(k.view(-1, c.num_kv_heads, c.head_dim)).view(-1, c.kv_size)
         q, k = self.rotary(positions, q, k)
         out = self.attn(q, k, v)
         if gate is not None:
@@ -280,7 +265,8 @@ class AttentionRunner(nn.Module):
         if self.output_reduced:
             out, _ = self.o_proj(x)
             return out
-        return self.o_proj.quant_method.apply(self.o_proj, x, None)
+        o_proj = self.o_proj
+        return o_proj.quant_method.apply(as_kind(o_proj, nn.Module), x, None)
 
 
 def reference_fused_qkv(
@@ -292,7 +278,7 @@ def reference_fused_qkv(
     """The fused value in plain torch: add, normalize and project in one call.
 
     Stands in for PR #3096's kernel on hosts without it. It calls the same
-    parts, keeping the platform's rounding points (the residual sum is
+    binding, keeping the platform's rounding points (the residual sum is
     rounded to the stream's dtype, as the fused add-norm does), so it equals
     unfused exactly; a kernel fuses these calls.
     """

@@ -36,6 +36,7 @@ around it and its source line, like a compiler error.
 
 import dataclasses
 import hashlib
+import inspect
 import operator
 import re
 from collections.abc import Callable, Sequence
@@ -135,17 +136,19 @@ class BlockConformanceError(ValueError):
 class Opaque:
     """Replaces ``module.forward`` with ``stub`` while exporting."""
 
-    def __init__(self, module: nn.Module, stub: Callable[..., object]) -> None:
+    def __init__(self, module: object, stub: Callable[..., object]) -> None:
         """Holds the module and the stub; ``__enter__`` swaps them."""
+        if not isinstance(module, nn.Module):
+            msg = f"an opaque part must be a module, not a {type(module).__name__}"
+            raise BlockConformanceError(msg)
         self.module: nn.Module = module
         self.stub: Callable[..., object] = stub
-        self.own: object = None
+        self.previous: Callable[..., object] = module.forward
 
     def __enter__(self) -> None:
         """Installs the stub as the instance's forward."""
-        own = vars(self.module)
-        self.own = own.get("forward")  # str-ok: nn.Module.__call__ reads it
-        object.__setattr__(self.module, "forward", self.stub)
+        self.previous = self.module.forward
+        self.module.forward = self.stub
 
     def __exit__(
         self,
@@ -153,14 +156,15 @@ class Opaque:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        """Restores the instance's own forward, or the class's."""
-        if self.own is None:
-            object.__delattr__(self.module, "forward")
+        """Restores what the instance's forward was: its class's, or its own."""
+        previous = self.previous
+        if inspect.ismethod(previous) and previous.__self__ is self.module:
+            del self.module.forward  # The class's forward again.
         else:
-            object.__setattr__(self.module, "forward", self.own)
+            self.module.forward = previous
 
 
-def opaque(module: nn.Module, stub: Callable[..., object]) -> Opaque:
+def opaque(module: object, stub: Callable[..., object]) -> Opaque:
     """A context in which ``stub`` runs as ``module``'s forward."""
     return Opaque(module, stub)
 
@@ -211,8 +215,8 @@ _COMMUTATIVE: frozenset[object] = frozenset(
 _FRAME = re.compile(r'File "([^"]+)", line (\d+), in (\S+)\n\s*(.*)')
 
 
-def _h(*parts: object) -> str:
-    return hashlib.blake2b(repr(parts).encode(), digest_size=10).hexdigest()
+def _h(*binding: object) -> str:
+    return hashlib.blake2b(repr(binding).encode(), digest_size=10).hexdigest()
 
 
 def _items(seq: tuple[object, ...] | list[object]) -> list[object]:

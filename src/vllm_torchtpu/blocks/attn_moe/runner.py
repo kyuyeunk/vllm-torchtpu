@@ -16,11 +16,11 @@
 Shaped like vLLM's ``MoERunner`` (``layers/fused_moe/runner/moe_runner.py``)
 and like ``AttentionRunner``, one scope up:
 
-- ``__init__`` receives parts already built: the attention part (the nested
+- ``__init__`` receives binding already built: the attention part (the nested
   ``AttentionRunner``, or the model's own input norm and attention), the post
   norm, the router, the experts, and the per-bucket plan table. It keeps
-  references; the parts stay registered where the model put them.
-- ``forward`` calls the parts. The runner owns the composition only: which
+  references; the binding stay registered where the model put them.
+- ``forward`` calls the binding. The runner owns the composition only: which
   collectives join attention to the MoE (PR #1492's overlap or upstream's
   all-reduce).
 - ``_select_forward`` picks the implementation once.
@@ -36,16 +36,15 @@ the two returned tensors differ from upstream's while their sum does not.
 
 import dataclasses
 from collections.abc import Callable
-from typing import TYPE_CHECKING, override
 
 import torch
-from torch import nn
 from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
 
+from vllm_torchtpu.blocks import calls
 from vllm_torchtpu.blocks.attn_moe.plan import (
     DEFAULT,
     OVERLAP,
@@ -55,9 +54,6 @@ from vllm_torchtpu.blocks.attn_moe.plan import (
 from vllm_torchtpu.blocks.stream import Attend, Stream
 from vllm_torchtpu.compilation import shape_variants
 
-if TYPE_CHECKING:
-    from vllm_torchtpu.blocks import calls
-
 Tensor = torch.Tensor
 Composition = Callable[[Tensor, Tensor | None, Tensor], tuple[Tensor, Tensor]]
 
@@ -65,8 +61,16 @@ CALLS: dict[str, dict[AttnMoEBlockPlan, int]] = {}
 """Eager runs per layer and plan value, for evidence that a value ran."""
 
 
-class ModelAttention(nn.Module):
-    """The attention part for a layer with no nested sub-block: the model's own parts.
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ModelAttentionBinding:
+    """The model's input norm, and how the layer calls its attention."""
+
+    input_norm: calls.ResidualNorm
+    attend: Attend
+
+
+class ModelAttention:
+    """The attention part for a layer with no nested sub-block: the model's own binding.
 
     Calls the model's input norm, then its attention module with the
     arguments conformance recorded. The model's attention calls its output
@@ -74,17 +78,12 @@ class ModelAttention(nn.Module):
     write (``contract_adapter``), not a constructor argument.
     """
 
-    input_norm: "calls.ResidualNorm"  # pyright: ignore[reportUninitializedInstanceVariable] - set in __init__ by object.__setattr__
-    attend: Attend
+    def __init__(self, binding: ModelAttentionBinding) -> None:
+        """Keeps the binding. Composition only; the model owns the binding."""
+        self.input_norm: calls.ResidualNorm = binding.input_norm
+        self.attend: Attend = binding.attend
 
-    def __init__(self, *, input_norm: nn.Module, attend: Attend) -> None:
-        """Keeps references to the parts; creates no parameter."""
-        super().__init__()
-        object.__setattr__(self, "input_norm", input_norm)  # a reference
-        self.attend = attend
-
-    @override
-    def forward(
+    def __call__(
         self,
         hidden: torch.Tensor,
         residual: torch.Tensor | None,
@@ -100,11 +99,11 @@ class ModelAttention(nn.Module):
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class MoEParts:
+class MoEBinding:
     """What ``AttnMoERunner`` calls after attention: the model's own objects.
 
     Execution needs only each part's call contract, so tests build this from
-    synthetic modules. A model's declaration builds ``AttnMoEParts``, which
+    synthetic modules. A model's declaration builds ``AttnMoEBinding``, which
     extends it with the layer's other roles and checks every kind.
 
     Attributes:
@@ -114,17 +113,17 @@ class MoEParts:
         experts: The MoE runner, taking ``(hidden_states, router_logits)``.
     """
 
-    post_norm: nn.Module
-    router: nn.Module
-    experts: nn.Module
+    post_norm: calls.ResidualNorm
+    router: calls.Router
+    experts: calls.Experts
 
 
-class AttnMoERunner(nn.Module):
-    """The block's composition; the parts stay the model's.
+class AttnMoERunner:
+    """The block's composition; the binding stay the model's.
 
     Args:
         layer_name: The decoder layer's module path.
-        parts: The post norm, the router and the experts.
+        binding: The post norm, the router and the experts.
         attention: The attention part: input norm -> attention -> out
             projection, returning the unreduced attention output and the
             residual stream. The nested ``AttentionRunner`` (built with
@@ -135,36 +134,27 @@ class AttnMoERunner(nn.Module):
             can stand in for it.
     """
 
-    attention: "calls.AttentionPart"  # pyright: ignore[reportUninitializedInstanceVariable] - set in __init__ by object.__setattr__
-    post_norm: "calls.ResidualNorm"  # pyright: ignore[reportUninitializedInstanceVariable] - set in __init__ by object.__setattr__
-    router: "calls.Router"  # pyright: ignore[reportUninitializedInstanceVariable] - set in __init__ by object.__setattr__
-    experts: "calls.Experts"  # pyright: ignore[reportUninitializedInstanceVariable] - set in __init__ by object.__setattr__
     layer_name: str
     table: BlockPlanTable
     tp: int
     stream: Stream
     _forward_entry: Composition
 
-    def __init__(  # noqa: PLR0913 - the parts, the attention part, the plan table, TP and the stream
+    def __init__(  # noqa: PLR0913 - the binding, the attention part, the plan table, TP and the stream
         self,
         layer_name: str,
-        parts: MoEParts,
+        binding: MoEBinding,
         *,
-        attention: nn.Module,
+        attention: calls.AttentionPart,
         table: BlockPlanTable,
         tp: int,
         stream: Stream,
     ) -> None:
-        """Keeps references to the parts; creates no parameter."""
-        super().__init__()
-        refs = (
-            ("attention", attention),
-            ("post_norm", parts.post_norm),
-            ("router", parts.router),
-            ("experts", parts.experts),
-        )
-        for name, part in refs:
-            object.__setattr__(self, name, part)  # a reference, not a child
+        """Keeps references to the binding; creates no parameter."""
+        self.post_norm: calls.ResidualNorm = binding.post_norm
+        self.router: calls.Router = binding.router
+        self.experts: calls.Experts = binding.experts
+        self.attention: calls.AttentionPart = attention
         self.layer_name = layer_name
         self.table = table
         self.tp = tp
@@ -177,8 +167,7 @@ class AttnMoERunner(nn.Module):
             return self._all_reduce
         return self._by_bucket
 
-    @override
-    def forward(self, *args: object, **kwargs: object) -> tuple[Tensor, Tensor]:
+    def __call__(self, *args: object, **kwargs: object) -> tuple[Tensor, Tensor]:
         """Takes the layer's own arguments: the runner stands in for its forward."""
         hidden, residual, positions = self.stream.unpack(*args, **kwargs)
         return self._forward_entry(hidden, residual, positions)

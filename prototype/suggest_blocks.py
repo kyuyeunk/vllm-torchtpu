@@ -40,7 +40,7 @@ from prototype import _build
 from prototype.subblock_reach import guess_stream
 from vllm_torchtpu.blocks import BlockDeclaration
 from vllm_torchtpu.blocks.attn_moe.install import conform
-from vllm_torchtpu.blocks.attn_moe.pattern import AttnMoEParts
+from vllm_torchtpu.blocks.attn_moe.pattern import AttnMoEBinding
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
 from vllm_torchtpu.blocks.norm_attn.pattern import is_residual_norm
 from vllm_torchtpu.blocks.stream import attend_with_positions, attend_without_positions
@@ -56,14 +56,14 @@ def _moe_parts(child: nn.Module) -> tuple[str, str] | None:
 
 
 def _binding(names: dict[str, str]):  # noqa: ANN202 - a binding function
-    def guessed(layer: nn.Module) -> AttnMoEParts:
+    def guessed(layer: nn.Module) -> AttnMoEBinding:
         moe = layer.get_submodule(names["moe"])
         attention = layer.get_submodule(names["attention"])
         projections = [
             m for m in attention.modules() if isinstance(m, RowParallelLinear)
         ]
         reads_positions = "positions" in inspect.signature(attention.forward).parameters
-        return AttnMoEParts(
+        return AttnMoEBinding(
             input_norm=layer.get_submodule(names["input_norm"]),
             attention=attention,
             out_proj=projections[-1],
@@ -139,8 +139,8 @@ def main() -> None:
         verdicts[spec.name] = "conforms"
         _, n = found
         print(f"  @declare_block({spec.layer_class})")
-        print(f"  def block(layer: {spec.layer_class}) -> AttnMoEParts:")
-        print("      return AttnMoEParts(")
+        print(f"  def block(layer: {spec.layer_class}) -> AttnMoEBinding:")
+        print("      return AttnMoEBinding(")
         for field in ("input_norm", "attention", "post_norm", "moe"):
             print(f"          {field}=layer.{n[field]},")
         print(f"          router=layer.{n['moe']}.{n['router']},")
