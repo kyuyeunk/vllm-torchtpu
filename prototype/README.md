@@ -1,7 +1,8 @@
+**Scopes group** (`prototype/scopes/`). Backs DATA_CONTRACTS.md section 5.3 (the tree in miniature) and section 5.10 (the guards). Siblings: `prototype/scopes/declared-blocks`, `prototype/scopes/fork-migration`.
+
 # Prototype: the attention layer boundary is the only contract
 
-Backs DATA_CONTRACTS.md section 5.3 (the tree in miniature) and section 5.10 (the
-guards). This prototype applies sections 3 and 5.1 to 5.3 to one upstream
+This prototype applies sections 3 and 5.1 to 5.3 to one upstream
 layer, vLLM's `Qwen3NextAttention`. It shows that once the layer is registered
 as an expansion point, only its boundary is a contract:
 
