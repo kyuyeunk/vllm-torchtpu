@@ -1,6 +1,8 @@
+**Records group** (`prototype/records/`). Backs DATA_CONTRACTS.md Figure 24 (section 5.4) and Appendix J. Siblings: `prototype/records/pool-layout`.
+
 # Prototype: the step plan
 
-Backs DATA_CONTRACTS.md Figure 24 (section 5.4) and Appendix J. Today the runner makes
+Today the runner makes
 each step's decisions in several places and leaves them on itself:
 
 - the chunk split is computed three times (`_count_input_chunks`,
