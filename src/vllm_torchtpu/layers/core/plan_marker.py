@@ -94,12 +94,10 @@ def _show(value: Any) -> str:
     return repr(value.value) if isinstance(value, enum.Enum) else repr(value)
 
 
-def changed_fields(a: Any, b: Any) -> list[str]:
+def changed_fields(a: Any, b: Any) -> list[dataclasses.Field[Any]]:
     """The fields two values of one plan type differ in."""
     return [
-        f.name
-        for f in dataclasses.fields(a)
-        if getattr(a, f.name) != getattr(b, f.name)
+        f for f in dataclasses.fields(a) if getattr(a, f.name) != getattr(b, f.name)
     ]
 
 
