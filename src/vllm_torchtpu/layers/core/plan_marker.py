@@ -14,8 +14,8 @@
 """Marks plan types with the module that owns their decision.
 
 A plan type is a frozen dataclass whose fields choose how a module computes,
-never what it computes. The marker records the owner so one checker
-(`tests/layers/core/plan_invariance.py`) can find every plan type and test
+never what it computes. The marker records the owner so one checker (the
+plan-check prototype, not on this branch) can find every plan type and test
 that flipping its fields leaves the owner's output within contract.
 
 Imports nothing outside the standard library, so plan modules stay pure.

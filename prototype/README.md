@@ -1,5 +1,7 @@
 # Prototype: the attention-to-MoE overlap as a declared block
 
+Backs DATA_CONTRACTS.md section 5.3 (the declared block that carries #1492) and Appendix I.2.
+
 PR #1492 overlaps the collectives that join attention and MoE under tensor
 parallelism: reduce-scatter `attn_partial + residual / tp`, run the norm and
 the router on this rank's token shard, all-gather, and fold attention's partial
@@ -7,6 +9,24 @@ sum into the MoE all-reduce. The optimization fits any decoder layer shaped
 `norm -> attention -> norm -> MoE` under TP > 1, but it landed as a Qwen3.5
 monkeypatch: keyed to the model's class and `model_type`, enabled by an
 environment flag, and writing three children's decisions after they are built.
+
+## Where to look
+
+| Claim | Code |
+|---|---|
+| The model owner declares | [`declare_block(...)`](../src/vllm_torchtpu/models/vllm/qwen3_5/registration.py#L28-L39) in `registration.py` (L28-L39) |
+| The declaration API and the installer | [`declare_block`](../src/vllm_torchtpu/blocks/__init__.py#L80-L90) in `__init__.py` (L80-L90) |
+|  | [`install`](../src/vllm_torchtpu/blocks/__init__.py#L149-L170) in `__init__.py` (L149-L170) |
+| The pattern | [`attn_then_moe`](../src/vllm_torchtpu/blocks/attn_moe/pattern.py#L48-L61) in `pattern.py` (L48-L61) |
+| Graph conformance names the edge and line | [`compare`](../src/vllm_torchtpu/blocks/conformance.py#L289-L325) in `conformance.py` (L289-L325) |
+| The per-layer check | [`conform`](../src/vllm_torchtpu/blocks/attn_moe/__init__.py#L88-L241) in `__init__.py` (L88-L241) |
+| The block plan | [`AttnMoEBlockPlan`](../src/vllm_torchtpu/blocks/attn_moe/plan.py#L54-L60) in `plan.py` (L54-L60) |
+| Precedence: user, model plan, rule, default | [`resolve_table`](../src/vllm_torchtpu/blocks/attn_moe/plan.py#L125-L168) in `plan.py` (L125-L168) |
+| Children's contracts set once, then read-only | [`bind_child_contracts`](../src/vllm_torchtpu/blocks/attn_moe/contract_adapter.py#L101-L148) in `contract_adapter.py` (L101-L148) |
+| #1492's forward, on roles | [`AttentionMoEBlock`](../src/vllm_torchtpu/blocks/attn_moe/forward.py#L50-L116) in `forward.py` (L50-L116) |
+| The runner hook | [`_install_blocks`](../src/vllm_torchtpu/runner/tpu_runner.py#L5786-L5800) in `tpu_runner.py` (L5786-L5800) |
+| The suggester proposes, never applies | [`propose`](../prototype/suggest_blocks.py#L48-L76) in `suggest_blocks.py` (L48-L76) |
+| An outside write raises | [`outside_write`](../prototype/check_block.py#L120-L133) in `check_block.py` (L120-L133) |
 
 Here the model owner **declares** that its layer conforms to a pattern; the
 framework **checks** the declaration and **owns** what runs under it.
