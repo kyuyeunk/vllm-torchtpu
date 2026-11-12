@@ -50,6 +50,7 @@ import jax.numpy as jnp
 from vllm_torchtpu.kernels.megablox import moe_onehot_unpermute_admission as owner
 from vllm_torchtpu.kernels.sparse_core import ragged_gather_reduce_fallback as fallback
 from vllm_torchtpu.kernels.sparse_core import ragged_gather_reduce_v3_partition as v3
+from vllm_torchtpu.layers.core.plan_marker import plan_of
 
 if TYPE_CHECKING:
     from jax.experimental.pallas import tpu as pltpu
@@ -248,6 +249,7 @@ class GmmOutSpec:
         return jax.dtypes.itemsize_bits(self.dtype) // 8
 
 
+@plan_of("moe.entry")
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class MoeEntryPlan:
     """Decisions `fused_moe_func` makes before routing.
@@ -262,6 +264,7 @@ class MoeEntryPlan:
     scrub_nonfinite: bool
 
 
+@plan_of("moe.routing")
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class MoeRoutingPlan:
     """How `prepare_routed_gmm_inputs` builds the routed layout.
@@ -297,6 +300,7 @@ class MoeRoutingPlan:
         )
 
 
+@plan_of("moe.combine")
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
 class MoeCombinePlan:
     """Decisions made after the second GMM.
@@ -311,6 +315,20 @@ class MoeCombinePlan:
     combine: Combine
     ep_gather_reduce_version: GatherReduceVersion | None = None
     local_v3_token_alignment: int | None = None
+
+    def __post_init__(self) -> None:
+        # Each optional field belongs to one combine, so a plan cannot carry
+        # a choice its combine would silently ignore.
+        ep_ragged = self.combine in (
+            Combine.EP_RAGGED_SC,
+            Combine.EP_RAGGED_TC_FALLBACK,
+        )
+        if (self.ep_gather_reduce_version is not None) != ep_ragged:
+            raise ValueError(f"gather-reduce version is for ep_ragged_* only: {self}")
+        if (self.local_v3_token_alignment is not None) != (
+            self.combine is Combine.LOCAL_V3
+        ):
+            raise ValueError(f"token alignment is for local_v3 only: {self}")
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True, slots=True)
