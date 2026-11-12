@@ -50,6 +50,8 @@ from typing import Any
 import torch
 from vllm.platforms.interface import PlatformEnum
 
+from vllm_torchtpu.layers.core.plan_marker import plan_of
+
 
 class Quant(enum.Enum):
     """An activation's quantization."""
@@ -212,6 +214,7 @@ class ActivationFormat:
     scale: Scale
 
 
+@plan_of("attention_layer")
 @dataclass(frozen=True)
 class UnfusedLayerPlan:
     qk_norm_rope_gate: QkPath
@@ -220,6 +223,7 @@ class UnfusedLayerPlan:
     o_proj_input: ActivationFormat  # handed to self.o_proj
 
 
+@plan_of("attention_layer")
 @dataclass(frozen=True)
 class FusedLayerPlan:
     """The whole layer as one kernel: no intermediate, no child contracts."""
