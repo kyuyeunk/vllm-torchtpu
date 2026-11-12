@@ -157,6 +157,29 @@ def fused_qkv_supports(
     return None
 
 
+def unreduced_output_supports(
+    plan: NormAttnPlan, attention: nn.Module, *, fused_unreduced: bool
+) -> str | None:
+    """Why ``plan`` cannot return attention's output unreduced over TP, or None.
+
+    The capability a parent block reads before it builds the runner with
+    ``output_reduced=False``. ``unfused`` runs the output projection without
+    its all-reduce (``AttentionRunner.project_out``), which needs a projection
+    that takes its input split over ranks and adds no bias: the platform adds
+    the bias after the all-reduce (``TpuRowParallelLinear``), so an unreduced
+    output has no point to add it at. ``fused_qkv`` also needs its op to
+    honour the flag (``fused_unreduced``, the op author's declaration).
+    """
+    o_proj = getattr(attention, "o_proj", None)
+    if o_proj is None or not getattr(o_proj, "input_is_parallel", False):
+        return "the output projection does not take a TP-split input"
+    if getattr(o_proj, "bias", None) is not None and not o_proj.skip_bias_add:
+        return "the output projection adds a bias, which TPU adds after the all-reduce"
+    if plan.input_proj == "fused_qkv" and not fused_unreduced:
+        return "the fused op always all-reduces its output"
+    return None
+
+
 def resolve(override: str, attention: nn.Module) -> tuple[NormAttnPlan, frozenset[str]]:
     """The plan and the fields the user pinned; the rest come from the rule.
 
@@ -186,8 +209,14 @@ def choose(
     chip: str = "",
     kv_cache_dtype: str = "",
     where: str = "",
+    output_reduced: bool = True,
+    fused_unreduced: bool = True,
 ) -> tuple[NormAttnPlan, frozenset[str], list[str]]:
     """The first value the pins allow that ``fused_qkv``'s capability accepts.
+
+    With ``output_reduced=False`` (a parent block reduces attention's output
+    itself) each value must also return an unreduced output
+    (``unreduced_output_supports``).
 
     Returns:
         The plan, the fields the user pinned, and why each faster value was
@@ -207,8 +236,12 @@ def choose(
             why = fused_qkv_supports(
                 attention, matmul=plan.matmul, chip=chip, kv_cache_dtype=kv_cache_dtype
             )
+        if why is None and not output_reduced:
+            why = unreduced_output_supports(
+                plan, attention, fused_unreduced=fused_unreduced
+            )
         if why is None:
             return plan, pinned, declined
         declined.append(f"{plan.input_proj}/{plan.matmul} declined: {why}")
-    pins = ",".join(f"{f}={getattr(first, f)}" for f in sorted(pinned))
+    pins = ",".join(f"{f}={getattr(first, f)}" for f in sorted(pinned)) or "(rule)"
     raise ValueError(f"TPU_SUBBLOCK_PLAN {pins} on {where}: {declined[0]}")

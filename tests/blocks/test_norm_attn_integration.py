@@ -31,9 +31,11 @@ from vllm.config.vllm import set_current_vllm_config
 from prototype import _build, check_subblock
 from vllm_torchtpu import blocks
 from vllm_torchtpu.blocks import norm_attn
+from vllm_torchtpu.blocks.attn_moe.runner import AttnMoERunner
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
 from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnRoles, norm_then_attention
 from vllm_torchtpu.blocks.norm_attn.runner import AttentionRunner
+from vllm_torchtpu.blocks.stream import routed_runner
 
 SPECS = (
     *check_subblock.FAMILIES,
@@ -236,7 +238,7 @@ def test_decoder_routes_through_the_runner(
 
 
 def test_scopes_nest_on_qwen3_5() -> None:
-    """Qwen3.5 declares both scopes; the block runs its front half in the runner."""
+    """Qwen3.5 declares both scopes; the block builds the runner as its front half."""
     layer = _build.build(check_subblock.FAMILIES[2])  # Qwen3.5-MoE, full attention
     context = blocks.InstallContext(
         tp=4,
@@ -248,11 +250,15 @@ def test_scopes_nest_on_qwen3_5() -> None:
     with set_current_vllm_config(_build.current_config()):
         report = blocks.install(torch.nn.ModuleDict({"l": layer}), context)
     outcomes = [item.outcome for item in report]
-    assert len(outcomes) == 2, outcomes
-    assert outcomes[1].startswith("runner inside block"), outcomes
-    runner = _runner_of(layer)
+    assert len(outcomes) == 1, outcomes  # The block installed the sub-block.
+    assert "nested AttentionRunner" in outcomes[0], outcomes
+    block = routed_runner(layer)
+    assert isinstance(block, AttnMoERunner)
+    runner = block.front
+    assert isinstance(runner, AttentionRunner)
     assert runner.qkv_proj is layer.get_submodule("self_attn.qkv_proj")
     assert runner.input_proj == "fused_qkv"
+    assert runner.output_reduced is False
 
 
 # The plan reads the platform from the install context.

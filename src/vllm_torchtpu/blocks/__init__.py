@@ -31,7 +31,11 @@ bucket, and installs the block's forward where the plan needs it. Layers
 whose plan is the default are left as upstream built them.
 
 Scopes nest, so one decoder class may declare several patterns: a block
-(``attn_then_moe``) and a sub-block inside it (``norm_then_attention``).
+(``attn_then_moe``) and a sub-block inside it (``norm_then_attention``). An
+implementation lists the patterns it nests (``nests``); where a layer declares
+both, the outer one receives the inner declaration and builds the inner
+runner itself, with the contract it needs, so the inner installer never runs
+on that layer.
 """
 
 import dataclasses
@@ -141,12 +145,16 @@ class Installed:
 
 
 class BlockImplementation(Protocol):
+    nests: tuple[Callable[..., Any], ...]
+    """Patterns this one builds inside itself when a layer declares both."""
+
     def install(
         self,
         name: str,
         layer: nn.Module,
         declaration: BlockDeclaration,
         context: InstallContext,
+        nested: dict[Callable[..., Any], BlockDeclaration],
     ) -> Installed: ...
 
 
@@ -180,12 +188,15 @@ def install(model: nn.Module, context: InstallContext) -> list[Installed]:
     report = []
     for name, module in list(model.named_modules()):
         cls = type(module)
-        for declaration in declarations_for(cls):
-            if not declaration.when(module):
-                continue
+        declared = [d for d in declarations_for(cls) if d.when(module)]
+        inner = {p for d in declared for p in IMPLEMENTATIONS[d.pattern].nests}
+        nested = {d.pattern: d for d in declared if d.pattern in inner}
+        for declaration in declared:
+            if declaration.pattern in inner:
+                continue  # The enclosing pattern's installer builds it.
             impl = IMPLEMENTATIONS[declaration.pattern]
             try:
-                report.append(impl.install(name, module, declaration, context))
+                report.append(impl.install(name, module, declaration, context, nested))
             except BlockConformanceError as e:
                 raise BlockConformanceError(
                     f"{name} ({cls.__qualname__}) is declared "

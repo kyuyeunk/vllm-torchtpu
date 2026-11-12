@@ -34,7 +34,6 @@ from vllm_torchtpu.blocks import (
     block_implementation,
 )
 from vllm_torchtpu.blocks import conformance as conf
-from vllm_torchtpu.blocks.attn_moe.forward import _arg
 from vllm_torchtpu.blocks.norm_attn import plan as plan_mod
 from vllm_torchtpu.blocks.norm_attn.pattern import (
     NormAttnRoles,
@@ -48,6 +47,7 @@ from vllm_torchtpu.blocks.norm_attn.runner import (
     FusedOp,
     reference_fused_qkv,
 )
+from vllm_torchtpu.blocks.stream import StreamParams
 from vllm_torchtpu.logger import init_logger
 
 _PATTERN = "norm_then_attention"
@@ -62,14 +62,9 @@ def _fail(layer: nn.Module, why: str) -> conf.BlockConformanceError:
 
 
 def original_class(layer: nn.Module) -> type:
-    """The model's own class, under any framework mixin an installer placed."""
-    from vllm_torchtpu.blocks.attn_moe.forward import (  # noqa: PLC0415
-        AttentionMoEBlock,
-    )
-
-    mixins = (AttentionMoEBlock, NormAttnDecoder)
+    """The model's own class, under the mixin a standalone install placed."""
     for cls in type(layer).__mro__:
-        if cls not in mixins and not any(m in cls.__bases__ for m in mixins):
+        if cls is not NormAttnDecoder and NormAttnDecoder not in cls.__bases__:
             return cls
     raise TypeError(type(layer))
 
@@ -363,18 +358,18 @@ class NormAttnDecoder(nn.Module):
     Runs the sub-block through its ``AttentionRunner``, then the rest of the
     layer (the second norm and the MLP, opaque), which conformance has shown
     is all the layer computes. The installer sets ``_norm_attn_roles``,
-    ``_norm_attn_order`` and ``_norm_attn_runner``.
+    ``_norm_attn_stream`` and ``_norm_attn_runner``. Inside a declared block
+    the block's runner owns the layer's forward instead.
     """
 
     _norm_attn_roles: NormAttnRoles
-    _norm_attn_order: tuple[str, ...]
+    _norm_attn_stream: StreamParams
     _norm_attn_runner: AttentionRunner
 
     def forward(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:  # noqa: ANN401
-        r, order = self._norm_attn_roles, self._norm_attn_order
-        hidden = _arg(args, kwargs, order, r.hidden_param)
-        residual = _arg(args, kwargs, order, r.residual_param)
-        positions = _arg(args, kwargs, order, r.positions_param)
+        r = self._norm_attn_roles
+        hidden, residual, positions = self._norm_attn_stream.bind(args, kwargs)
+        assert positions is not None  # conformance requires a positions parameter
         x, residual = self._norm_attn_runner(hidden, residual, positions)
         x, residual = self.get_submodule(r.post_norm)(x, residual)
         return self.get_submodule(r.mlp)(x), residual
@@ -397,6 +392,8 @@ def build_runner(
     roles: NormAttnRoles,
     input_proj: str,
     fused_op: FusedOp | None = None,
+    *,
+    output_reduced: bool = True,
 ) -> AttentionRunner:
     """The runner for one declared layer, holding the layer's own parts."""
     attention = layer.get_submodule(roles.attention)
@@ -413,16 +410,101 @@ def build_runner(
         config=roles.config,
         input_proj=input_proj,
         fused_op=fused_op if input_proj == "fused_qkv" else None,
+        output_reduced=output_reduced,
     )
 
 
 FUSED_OP: FusedOp = reference_fused_qkv
 """The fused value's implementation: the plain-torch reference, or a kernel."""
 
+FUSED_OP_UNREDUCED = True
+"""``FUSED_OP``'s capability: it honours ``runner.output_reduced=False``."""
+
+
+def fused_op_for(
+    name: str, layer: nn.Module, roles: NormAttnRoles
+) -> tuple[FusedOp, bool, str]:
+    """The fused value's op for this layer, its unreduced capability, and a note."""
+    del name, layer, roles
+    return FUSED_OP, FUSED_OP_UNREDUCED, ""
+
+
+def resolve_runner(
+    name: str,
+    layer: nn.Module,
+    declaration: BlockDeclaration,
+    context: InstallContext,
+    *,
+    output_reduced: bool,
+) -> tuple[NormAttnRoles, AttentionRunner, str]:
+    """Conforms, chooses the plan and builds the runner for one declared layer.
+
+    The parent states the runner's contract (``output_reduced``); the plan
+    takes only values that can honour it.
+
+    Returns:
+        The roles, the runner, and what was chosen, for the install report.
+
+    Raises:
+        BlockConformanceError: The layer does not conform.
+        ValueError: A pinned value cannot run on this layer.
+    """
+    roles = conform(layer, declaration)
+    attention = layer.get_submodule(roles.attention)
+    fused_op, fused_unreduced, via = fused_op_for(name, layer, roles)
+    where = original_class(layer).__qualname__
+    plan, pinned, declined = plan_mod.choose(
+        context.subblock_plan,
+        attention,
+        chip=context.chip,
+        kv_cache_dtype=context.kv_cache_dtype,
+        where=where,
+        output_reduced=output_reduced,
+        fused_unreduced=fused_unreduced,
+    )
+    for item in declined:  # The rule's value fell back: quiet.
+        logger.debug("%s: %s", name, item)
+    runner = build_runner(
+        name, layer, roles, plan.input_proj, fused_op, output_reduced=output_reduced
+    )
+    source = "user" if pinned else "rule"
+    matmul = f" matmul={plan.matmul}" if plan.input_proj == "fused_qkv" else ""
+    via = via if plan.input_proj == "fused_qkv" else ""
+    reduced = "" if output_reduced else " output_reduced=False"
+    return (
+        roles,
+        runner,
+        f"input_proj={plan.input_proj}{matmul}{reduced} ({source}){via}",
+    )
+
+
+def install_standalone(
+    name: str, layer: nn.Module, declaration: BlockDeclaration, context: InstallContext
+) -> Installed:
+    """Routes a declared layer with no enclosing block through its runner."""
+    cls = type(layer)
+    roles, runner, what = resolve_runner(
+        name, layer, declaration, context, output_reduced=True
+    )
+    stream = StreamParams.of(
+        layer, roles.hidden_param, roles.residual_param, roles.positions_param
+    )
+    object.__setattr__(layer, "_norm_attn_roles", roles)
+    object.__setattr__(layer, "_norm_attn_stream", stream)
+    object.__setattr__(layer, "_norm_attn_runner", runner)
+    layer.__class__ = _decoder_class(cls)
+    return Installed(name, cls.__qualname__, f"runner installed; {what}")
+
 
 @block_implementation(norm_then_attention)
 class NormThenAttention:
-    """Conforms, resolves and installs one declared norm_then_attention layer."""
+    """Conforms, resolves and installs one declared norm_then_attention layer.
+
+    Inside a declared block that nests this pattern, the block's installer
+    calls ``resolve_runner`` itself, with the block's contract.
+    """
+
+    nests: tuple[Any, ...] = ()
 
     def install(
         self,
@@ -430,42 +512,8 @@ class NormThenAttention:
         layer: nn.Module,
         declaration: BlockDeclaration,
         context: InstallContext,
+        nested: dict[Any, BlockDeclaration] | None = None,  # noqa: ARG002 - nests none
     ) -> Installed:
-        cls = type(layer)
-        if isinstance(layer, NormAttnDecoder) or hasattr(layer, "_norm_attn_runner"):
-            return Installed(name, cls.__qualname__, "already installed")
-        roles = conform(layer, declaration)
-        attention = layer.get_submodule(roles.attention)
-        plan, pinned, declined = plan_mod.choose(
-            context.subblock_plan,
-            attention,
-            chip=context.chip,
-            kv_cache_dtype=context.kv_cache_dtype,
-            where=cls.__qualname__,
-        )
-        for item in declined:  # The rule's value fell back: quiet.
-            logger.debug("%s: %s", name, item)
-        runner = build_runner(name, layer, roles, plan.input_proj, FUSED_OP)
-        source = "user" if pinned else "rule"
-        matmul = f" matmul={plan.matmul}" if plan.input_proj == "fused_qkv" else ""
-        what = f"input_proj={plan.input_proj}{matmul} ({source})"
-        from vllm_torchtpu.blocks.attn_moe.forward import (  # noqa: PLC0415
-            AttentionMoEBlock,
-        )
-
-        if isinstance(layer, AttentionMoEBlock):
-            # Scopes nest: attn_then_moe's block already owns the layer's
-            # forward and runs its front half through this runner.
-            object.__setattr__(layer, "_norm_attn_runner", runner)
-            return Installed(
-                name, original_class(layer).__qualname__, f"runner inside block; {what}"
-            )
-        object.__setattr__(layer, "_norm_attn_roles", roles)
-        object.__setattr__(
-            layer,
-            "_norm_attn_order",
-            tuple(inspect.signature(layer.forward).parameters),
-        )
-        object.__setattr__(layer, "_norm_attn_runner", runner)
-        layer.__class__ = _decoder_class(cls)
-        return Installed(name, cls.__qualname__, f"runner installed; {what}")
+        if isinstance(layer, NormAttnDecoder):
+            return Installed(name, type(layer).__qualname__, "already installed")
+        return install_standalone(name, layer, declaration, context)

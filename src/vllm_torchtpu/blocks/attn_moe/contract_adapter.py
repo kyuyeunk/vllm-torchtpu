@@ -13,21 +13,27 @@
 # limitations under the License.
 """Hands the block's resolved child contracts to children built without them.
 
-The overlap plan needs three child decisions: attention's output projection
-does not all-reduce, the MoE runner does not all-reduce, and the runner takes
-router logits instead of holding the router. vLLM exposes the first two as
-constructor arguments (``RowParallelLinear(reduce_results=...)``,
-``FusedMoEFactory(reduce_results=...)``), but most models hard-code them, so
-the block cannot pass them down at construction.
+The block needs three child decisions: attention's output is not reduced,
+the MoE runner does not all-reduce, and the runner takes router logits
+instead of holding the router.
 
-``bind_child_contracts`` is the one sanctioned place that sets those fields
-after construction. It runs once, from the block installer, before any compile
-and before anything that reads the fields (``arm_runner_models``, the MoE
-decode arming). Each write is recorded in a ledger, and the fields become
-read-only afterwards, so a later write raises instead of silently changing a
-decision the plan made. This is an interim: the exit is a construction-time
-contract scope that linear and MoE ``__init__`` read, and upstream passing
-``reduce_results`` through.
+- **Attention, at construction.** Where the layer also declares
+  ``norm_then_attention``, the block builds the nested ``AttentionRunner``
+  with ``output_reduced=False``; nothing here touches ``o_proj``. Only a
+  front half that is the model's own attention module (Qwen3.5's
+  linear-attention layers, which declare no sub-block) calls its projection
+  itself, and for that one this adapter still writes
+  ``o_proj.reduce_results``.
+- **The MoE, after construction (interim).** The model builds its MoE child;
+  vLLM exposes the decisions as constructor arguments
+  (``FusedMoEFactory(reduce_results=...)``) but models hard-code them, so the
+  block cannot pass them down. ``bind_child_contracts`` writes them once,
+  from the block installer, before any compile and before anything reads the
+  fields (``arm_runner_models``, the MoE decode arming). Each write goes to a
+  ledger and the fields become read-only, so a later write raises instead of
+  silently changing a decision the plan made. The exit is a
+  construction-time contract scope that ``FusedMoE.__init__`` reads, or
+  models passing ``reduce_results`` through.
 """
 
 import dataclasses
@@ -47,7 +53,6 @@ _FIELDS = {
 class ChildContracts:
     """What the plan hands each child. No defaults: the plan states each."""
 
-    out_proj_reduces: bool
     experts_hold_router: bool
     experts_reduce: bool
 
@@ -100,7 +105,7 @@ def _guard(obj: Any, fields: tuple[str, ...], owner: str) -> None:  # noqa: ANN4
 
 def bind_child_contracts(
     layer_name: str,
-    out_proj: nn.Module,
+    out_proj: nn.Module | None,
     experts: nn.Module,
     contracts: ChildContracts,
     source: str,
@@ -109,14 +114,15 @@ def bind_child_contracts(
 
     Args:
         layer_name: The decoder layer's module path, for the ledger.
-        out_proj: Attention's output projection (a RowParallelLinear).
+        out_proj: Attention's output projection, only where the front half is
+            the model's own attention module; None where the nested runner
+            was built with the contract.
         experts: The MoE runner.
         contracts: What the plan resolved for the children.
         source: Which plan source decided, for the ledger.
     """
     moe_config = experts.moe_config
-    writes = (
-        ("out_proj", out_proj, "reduce_results", contracts.out_proj_reduces),
+    writes = [
         (
             "experts",
             experts,
@@ -129,7 +135,9 @@ def bind_child_contracts(
             "skip_final_all_reduce",
             not contracts.experts_reduce,
         ),
-    )
+    ]
+    if out_proj is not None:  # The model's attention reduces unless told not to.
+        writes.append(("out_proj", out_proj, "reduce_results", False))
     for child, obj, field, value in writes:
         before = getattr(obj, field)
         setattr(obj, field, value)
@@ -143,6 +151,7 @@ def bind_child_contracts(
                 source,
             )
         )
-    _guard(out_proj, _FIELDS["out_proj"], "attn_then_moe")
+    if out_proj is not None:
+        _guard(out_proj, _FIELDS["out_proj"], "attn_then_moe")
     _guard(experts, _FIELDS["experts"], "attn_then_moe")
     _guard(moe_config, _FIELDS["moe_config"], "attn_then_moe")

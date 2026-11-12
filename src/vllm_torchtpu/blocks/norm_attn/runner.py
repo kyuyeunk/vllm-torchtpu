@@ -27,6 +27,14 @@ Shaped like vLLM's ``MoERunner`` (``layers/fused_moe/runner/moe_runner.py``):
 Every model that declares ``norm_then_attention`` runs this one forward, so a
 fusion of the sub-block (``fused_qkv``, PR #3096's kernel) is one branch here,
 written once against the parts, never against a model class.
+
+The runner's contract with its parent is a constructor argument,
+``output_reduced``: whether its output is summed over tensor-parallel ranks.
+A layer on its own needs the sum; a block that folds attention into a later
+collective (``attn_then_moe``) builds the runner with ``output_reduced=False``
+and does the reduction itself. Each plan value states whether it can return
+an unreduced output (``plan.unreduced_output_supports``); the parent asks
+before it builds.
 """
 
 import dataclasses
@@ -42,7 +50,11 @@ FUSED_CALLS: dict[str, int] = {}
 FusedOp = Callable[
     ["AttentionRunner", torch.Tensor, torch.Tensor | None, torch.Tensor], Any
 ]
-"""``op(runner, hidden, residual, positions) -> (out, residual)`` or None to decline."""
+"""``op(runner, hidden, residual, positions) -> (out, residual)`` or None to decline.
+
+The op reads ``runner.output_reduced`` and returns an output summed over TP
+ranks only when it is True.
+"""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -78,6 +90,15 @@ class AttentionRunner(nn.Module):
     model's parameter tree, weight loading and checkpoints are unchanged.
     """
 
+    input_norm: nn.Module
+    qkv_proj: nn.Module
+    attn: nn.Module
+    o_proj: nn.Module
+    rotary: nn.Module
+    q_norm: nn.Module
+    k_norm: nn.Module
+    fused_op: FusedOp | None
+
     def __init__(
         self,
         layer_name: str,
@@ -92,6 +113,7 @@ class AttentionRunner(nn.Module):
         config: AttnConfig,
         input_proj: str = "unfused",
         fused_op: FusedOp | None = None,
+        output_reduced: bool = True,
     ) -> None:
         super().__init__()
         parts = {
@@ -109,6 +131,7 @@ class AttentionRunner(nn.Module):
         self.config = config
         self.input_proj = input_proj
         self.fused_op = fused_op
+        self.output_reduced = output_reduced
         self._forward_entry = self._select_forward()
 
     def _select_forward(self) -> Callable[..., Any]:
@@ -136,13 +159,13 @@ class AttentionRunner(nn.Module):
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Upstream's order: norm, project, split, q/k norm, RoPE, attend, project."""
+        stream: torch.Tensor
         if residual is None:  # The first layer: the stream is its own residual.
-            residual = hidden
-            x = self.input_norm(hidden)
+            x, stream = self.input_norm(hidden), hidden
         else:
-            x, residual = self.input_norm(hidden, residual)
+            x, stream = self.input_norm(hidden, residual)
         qkv, _ = self.qkv_proj(x)
-        return self.attention_from_qkv(qkv, positions), residual
+        return self.attention_from_qkv(qkv, positions), stream
 
     def _fused_qkv(
         self,
@@ -151,6 +174,7 @@ class AttentionRunner(nn.Module):
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The fused op on the same parts; where it declines a call, unfused."""
+        assert self.fused_op is not None  # _select_forward checked
         out = self.fused_op(self, hidden, residual, positions)
         if out is None:
             return self._unfused(hidden, residual, positions)
@@ -181,8 +205,22 @@ class AttentionRunner(nn.Module):
         out = self.attn(q, k, v)
         if gate is not None:
             out = out * torch.sigmoid(gate)
-        out, _ = self.o_proj(out)
-        return out
+        return self.project_out(out)
+
+    def project_out(self, x: torch.Tensor) -> torch.Tensor:
+        """The output projection, reduced over TP ranks iff ``output_reduced``.
+
+        The unreduced form is ``RowParallelLinear.forward`` without its
+        all-reduce, the flag passed per call instead of written into the
+        projection: ``o_proj.reduce_results`` keeps the value the model built.
+        It applies no bias; ``unreduced_output_supports`` declines a
+        projection that has one.
+        """
+        if self.output_reduced:
+            out, _ = self.o_proj(x)
+            return out
+        o_proj: Any = self.o_proj  # a RowParallelLinear (conformance checked)
+        return o_proj.quant_method.apply(o_proj, x, None)
 
 
 def reference_fused_qkv(

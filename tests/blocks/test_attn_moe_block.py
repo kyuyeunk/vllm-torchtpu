@@ -11,29 +11,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The merge-time conformance check, and the block forward's collectives.
+"""Integration tests: each declared model registers with the block runner.
 
 ``test_every_declaration_conforms`` is the merge gate: every declaration in
-``models/vllm/*/registration.py`` must conform. The forward tests port PR
-#1492's call-order and warmup-gate tests to the role-based forward.
+``models/vllm/*/registration.py`` must conform. The install tests check that
+the runner is built from the model's own parts, that the nested
+``AttentionRunner`` is constructed with the block's contract (attention
+unreduced) instead of a field write, and what the interim adapter still
+writes. Execution numerics and the collective order are
+``test_attn_moe_runner.py``'s job (model-free).
 """
 
 import pytest
 import torch
 from torch import nn
 from vllm.config import set_current_vllm_config
-from vllm.model_executor.models.qwen3_5 import Qwen3_5RMSNorm
 
 from prototype import _build, fixtures
 from vllm_torchtpu import blocks
-from vllm_torchtpu.blocks import conformance
-from vllm_torchtpu.blocks.attn_moe import conform, forward
+from vllm_torchtpu.blocks import conformance, norm_attn
+from vllm_torchtpu.blocks.attn_moe import conform, contract_adapter
 from vllm_torchtpu.blocks.attn_moe import pattern as pattern_mod
-from vllm_torchtpu.blocks.attn_moe import plan as plan_mod
-from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.blocks.attn_moe.runner import AttnMoERunner, ModelAttention
+from vllm_torchtpu.blocks.norm_attn.runner import AttentionRunner
+from vllm_torchtpu.blocks.stream import routed_runner
+
+QWEN3_5_FULL, QWEN3_5_LINEAR = _build.SPECS[:2]
+GLM = next(s for s in _build.SPECS if s.name == "GLM-4 MoE")
+DECLARED = (QWEN3_5_FULL, QWEN3_5_LINEAR, GLM)
 
 
-@pytest.mark.parametrize("spec", _build.SPECS[:2], ids=lambda s: s.name)
+@pytest.mark.parametrize("spec", DECLARED, ids=lambda s: s.name)
 def test_every_declaration_conforms(spec: _build.Spec) -> None:
     layer = _build.build(spec)
     blocks.load_declarations()
@@ -73,113 +81,120 @@ def test_mismatch_stops_startup(monkeypatch: pytest.MonkeyPatch) -> None:
     assert type(layer) is fixtures.ReorderedNorms
 
 
-class _CpuRMSNorm(Qwen3_5RMSNorm):
-    def dispatch_forward(self, compile_native: bool = False):  # noqa: ANN201, ARG002
-        return self.forward_native
+OVERLAP_PIN = "collectives=reduce_scatter_all_gather"
 
 
-class _Fn(nn.Module):
-    def __init__(self, fn) -> None:  # noqa: ANN001
-        super().__init__()
-        self.fn = fn
-
-    def forward(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
-        return self.fn(*args, **kwargs)
-
-
-_ROLES = pattern_mod.AttnMoERoles(
-    input_norm="input_layernorm",
-    post_norm="post_attention_layernorm",
-    attention="self_attn",
-    out_proj="self_attn.o_proj",
-    moe="mlp",
-    experts="mlp.experts",
-    router="mlp.gate",
-    attention_args=(("positions", "positions"), ("hidden_states", "normed")),
-    hidden_param="hidden_states",
-    residual_param="residual",
-    positions_param="positions",
-)
-
-
-def _layer(
-    d: int, tp: int, table: plan_mod.BlockPlanTable, gate_rows: list[int]
-) -> nn.Module:
-    layer = forward.AttentionMoEBlock()
-    layer.input_layernorm = _CpuRMSNorm(d)
-    layer.post_attention_layernorm = _CpuRMSNorm(d)
-    layer.self_attn = _Fn(lambda hidden_states, positions: hidden_states)
-    layer.mlp = nn.Module()
-    layer.mlp.gate = _Fn(
-        lambda h: (gate_rows.append(h.shape[0]), torch.zeros(h.shape[0], 4), None)[1:]
+def _context(override: str = OVERLAP_PIN, buckets: tuple[int, ...] = (16, 8192)):  # noqa: ANN202
+    return blocks.InstallContext(
+        tp=4,
+        dtype="bfloat16",
+        buckets=buckets,
+        override=override,
+        model_plan="",
     )
-    layer.mlp.experts = _Fn(lambda hidden_states, router_logits: hidden_states)
-    layer._block_roles = _ROLES
-    layer._block_table = table
-    layer._block_order = ("hidden_states", "residual", "positions")
-    layer._block_tp = tp
+
+
+def _install(layer: nn.Module, context: blocks.InstallContext) -> list[str]:
+    with set_current_vllm_config(_build.current_config()):
+        report = blocks.install(nn.ModuleDict({"l": layer}), context)
+    return [item.outcome for item in report]
+
+
+def _block_runner(layer: nn.Module) -> AttnMoERunner:
+    runner = routed_runner(layer)
+    assert isinstance(runner, AttnMoERunner)
+    return runner
+
+
+@pytest.mark.parametrize("spec", [QWEN3_5_FULL, GLM], ids=lambda s: s.name)
+def test_block_builds_attention_with_its_contract(spec: _build.Spec) -> None:
+    """Both scopes declared: the block constructs the nested runner unreduced.
+
+    Attention's contract is a constructor argument, so ``o_proj`` keeps the
+    value the model built and no ledger entry names it. The MoE child's
+    contracts are still the interim writes.
+    """
+    layer = _build.build(spec)
+    cls = type(layer)
+    attention = layer.get_submodule("self_attn")
+    experts = layer.get_submodule("mlp.experts")
+    contract_adapter.LEDGER.clear()
+    outcomes = _install(layer, _context())
+    assert len(outcomes) == 1, outcomes
+    assert outcomes[0].startswith("AttnMoERunner installed"), outcomes
+    assert "nested AttentionRunner input_proj=" in outcomes[0], outcomes
+    assert "output_reduced=False" in outcomes[0], outcomes
+    assert type(layer) is cls  # No mixin, no __class__ rebinding.
+    runner = _block_runner(layer)
+    front = runner.front
+    assert isinstance(front, AttentionRunner)
+    assert front.output_reduced is False
+    assert front.o_proj is attention.o_proj
+    assert front.qkv_proj is attention.qkv_proj
+    assert attention.o_proj.reduce_results is True  # Not written.
+    assert runner.post_norm is layer.get_submodule("post_attention_layernorm")
+    assert runner.router is layer.get_submodule("mlp.gate")
+    assert runner.experts is experts
+    assert list(runner.parameters()) == []
+    written = {(e.child, e.field) for e in contract_adapter.LEDGER}
+    assert written == {("experts", "gate"), ("moe_config", "skip_final_all_reduce")}
+    assert experts.gate is None
+    assert experts.moe_config.skip_final_all_reduce is True
+
+
+def test_model_attention_front_keeps_the_interim_write() -> None:
+    """Qwen3.5's linear attention declares no sub-block: its o_proj is written."""
+    layer = _build.build(QWEN3_5_LINEAR)
+    contract_adapter.LEDGER.clear()
+    _install(layer, _context())
+    assert isinstance(_block_runner(layer).front, ModelAttention)
+    assert ("out_proj", "reduce_results") in {
+        (e.child, e.field) for e in contract_adapter.LEDGER
+    }
+    out_proj = layer.get_submodule(conform_roles(layer).out_proj)
+    assert out_proj.reduce_results is False
+    with pytest.raises(contract_adapter.BlockContractError):
+        out_proj.reduce_results = True
+
+
+def conform_roles(layer: nn.Module) -> pattern_mod.AttnMoERoles:
+    blocks.load_declarations()
+    declaration = blocks.DECLARATIONS[(type(layer), pattern_mod.attn_then_moe)]
+    with set_current_vllm_config(_build.current_config()):
+        return conform(layer, declaration)
+
+
+@pytest.mark.parametrize("spec", [QWEN3_5_FULL, GLM], ids=lambda s: s.name)
+def test_upstream_collectives_leave_the_sub_block_on_its_own(spec: _build.Spec) -> None:
+    """No bucket overlaps: the block stays upstream, the sub-block reduces itself."""
+    layer = _build.build(spec)
+    outcomes = _install(layer, _context(override="", buckets=(16,)))
+    assert "all_reduce on every bucket; sub-block runner installed" in outcomes[0]
+    assert isinstance(layer, norm_attn.NormAttnDecoder)
+    runner = layer.__dict__["_norm_attn_runner"]
+    assert isinstance(runner, AttentionRunner)
+    assert runner.output_reduced is True
+    assert routed_runner(layer) is None
+
+
+def _with_o_proj_bias(layer: nn.Module) -> nn.Module:
+    o_proj = layer.get_submodule("self_attn.o_proj")
+    o_proj.bias = nn.Parameter(torch.zeros(o_proj.output_size, device="meta"))
     return layer
 
 
-def _record(monkeypatch: pytest.MonkeyPatch, calls: list[str], tp: int) -> None:
-    monkeypatch.setattr(
-        forward,
-        "tensor_model_parallel_reduce_scatter",
-        lambda x, dim=0: (calls.append("rs"), x[: x.shape[0] // tp])[1],
-    )
-    monkeypatch.setattr(
-        forward,
-        "tensor_model_parallel_all_gather",
-        lambda x, dim=0: (calls.append("ag"), torch.cat([x] * tp, dim=0))[1],
-    )
-    monkeypatch.setattr(
-        forward,
-        "tensor_model_parallel_all_reduce",
-        lambda x: (calls.append("ar"), x)[1],
-    )
+def test_pinned_overlap_without_unreduced_attention_raises() -> None:
+    """Pinned: attention that cannot skip its reduce stops startup."""
+    layer = _with_o_proj_bias(_build.build(GLM))
+    with pytest.raises(ValueError, match="adds a bias"):
+        _install(layer, _context())
 
 
-def test_call_order_by_bucket_plan(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The rule's table picks ["ar", "ar"] or #1492's ["rs", "ag", "ag", "ar"]."""
-    calls: list[str] = []
-    gate_rows: list[int] = []
-    tp, d = 2, 4096
-    _record(monkeypatch, calls, tp)
-    key = pattern_mod.BlockKey(
-        kind="attn_then_moe",
-        tp=tp,
-        hidden=d,
-        dtype="bfloat16",
-        attention_kind="Attention",
-        router_mode="explicit",
-        has_shared_experts=True,
-        sp_moe=False,
-        fused_output_reduced=False,
-        moe_path="late_all_reduce",
-    )
-    table, _ = plan_mod.resolve_table(key, (2047, 2048))
-    layer = _layer(d, tp, table, gate_rows)
-    layer(torch.ones((2047, d), dtype=torch.bfloat16), None, torch.arange(2047))
-    assert (calls, gate_rows) == (["ar", "ar"], [2047])
-    calls.clear()
-    gate_rows.clear()
-    layer(torch.ones((2048, d), dtype=torch.bfloat16), None, torch.arange(2048))
-    assert (calls, gate_rows) == (["rs", "ag", "ag", "ar"], [1024])
-
-
-def test_compile_outside_warmup_keeps_all_reduce(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """#1492's warmup gate: a compile outside warmup keeps the all-reduce path."""
-    calls: list[str] = []
-    _record(monkeypatch, calls, 2)
-    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    table = plan_mod.BlockPlanTable(((16, plan_mod.OVERLAP, "rule"),))
-    layer = _layer(16, 2, table, [])
-    x = torch.ones((16, 16))
-    layer(x, None, torch.arange(16))
-    assert calls == ["ar", "ar"]
-    calls.clear()
-    with shape_variants.warmup():
-        layer(x, None, torch.arange(16))
-    assert calls == ["rs", "ag", "ag", "ar"]
+def test_rule_overlap_without_unreduced_attention_falls_back() -> None:
+    """Chosen by the rule: the block falls back to upstream's collectives."""
+    layer = _with_o_proj_bias(_build.build(GLM))
+    floor = 8 * 1024 * 1024 * 4 // (64 * 2)  # The rule's floor at TP 4, hidden 64.
+    outcomes = _install(layer, _context(override="", buckets=(16, floor)))
+    assert "all_reduce on every bucket (rule fell back" in outcomes[0], outcomes
+    assert "adds a bias" in outcomes[0], outcomes
+    assert routed_runner(layer) is None

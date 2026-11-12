@@ -21,7 +21,8 @@
 2. Plan per bucket: the declared Qwen3.5 block at its real size (hidden
    2048, bf16, TP 4) under the rule, the overrides and the cross-check.
 3. Outside write: after binding, writing a child decision the plan owns
-   raises.
+   raises (the MoE runner's ``skip_final_all_reduce``; attention's contract
+   is a constructor argument of the nested runner, not a field).
 4. A mismatch declines at install: the misordered fixture, declared, keeps its
    upstream forward and the report names the edge. CI still fails on it: set
    ``PLANT_MISMATCH = True`` and check 1 treats it as a declared model that
@@ -141,11 +142,11 @@ def outside_write() -> list[str]:
     table = plan_mod.BlockPlanTable(((8192, plan_mod.OVERLAP, "rule"),))
     apply_block("layers.0", layer, roles, table, tp=4)
     try:
-        layer.get_submodule(roles.out_proj).reduce_results = True
+        layer.get_submodule(roles.experts).moe_config.skip_final_all_reduce = False
     except contract_adapter.BlockContractError as e:
         print(f"    raised: {e}")
         return []
-    return ["out_proj.reduce_results = True was accepted after binding"]
+    return ["moe_config.skip_final_all_reduce = False was accepted after binding"]
 
 
 def mismatch_raises() -> list[str]:

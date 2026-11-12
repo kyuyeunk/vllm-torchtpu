@@ -15,8 +15,10 @@
 
 ``pattern`` is the reference forward and the role kinds; ``conform`` checks a
 declared layer against it; ``plan`` resolves which collectives join the two
-halves per bucket; ``contract_adapter`` hands the children the contracts that
-plan needs; ``forward`` runs the block through its roles.
+halves per bucket; ``runner`` is the one forward every installed block runs,
+built from the layer's parts (the nested ``AttentionRunner`` among them, with
+the block's contract stated at construction); ``contract_adapter`` writes the
+MoE child's contracts, which the model built without them.
 """
 
 import contextlib
@@ -31,6 +33,7 @@ from vllm_torchtpu.blocks import (
     InstallContext,
     Installed,
     block_implementation,
+    norm_attn,
 )
 from vllm_torchtpu.blocks import conformance as conf
 from vllm_torchtpu.blocks.attn_moe import plan as plan_mod
@@ -38,7 +41,6 @@ from vllm_torchtpu.blocks.attn_moe.contract_adapter import (
     ChildContracts,
     bind_child_contracts,
 )
-from vllm_torchtpu.blocks.attn_moe.forward import AttentionMoEBlock
 from vllm_torchtpu.blocks.attn_moe.pattern import (
     AttnMoERoles,
     attn_then_moe,
@@ -49,6 +51,11 @@ from vllm_torchtpu.blocks.attn_moe.pattern import (
     moe_runner_router,
     out_proj_of,
 )
+from vllm_torchtpu.blocks.attn_moe.runner import AttnMoERunner, ModelAttention
+from vllm_torchtpu.blocks.norm_attn import plan as subblock_plan
+from vllm_torchtpu.blocks.norm_attn.pattern import norm_then_attention
+from vllm_torchtpu.blocks.stream import StreamParams, route
+from vllm_torchtpu.logger import init_logger
 
 _STREAM = {"hidden": ("hidden_states", "x"), "residual": ("residual",)}
 _POSITIONS = ("positions", "position_ids")
@@ -241,20 +248,11 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> AttnMoERoles:
     return roles
 
 
-_block_classes: dict[type, type] = {}
+logger = init_logger(__name__)
 
-# What the overlap plan hands its children.
-_OVERLAP_CONTRACTS = ChildContracts(
-    out_proj_reduces=False, experts_hold_router=False, experts_reduce=False
-)
-
-
-def _block_class(cls: type) -> type:
-    if cls not in _block_classes:
-        block = type(cls.__name__, (AttentionMoEBlock, cls), {})
-        block.__qualname__ = cls.__qualname__
-        _block_classes[cls] = block
-    return _block_classes[cls]
+# What the block hands its MoE child, under either plan value: the block
+# reduces the MoE's output itself and computes the router's logits.
+_MOE_CONTRACTS = ChildContracts(experts_hold_router=False, experts_reduce=False)
 
 
 def _summary(table: plan_mod.BlockPlanTable) -> str:
@@ -268,32 +266,84 @@ def _summary(table: plan_mod.BlockPlanTable) -> str:
     )
 
 
+def build_runner(
+    name: str,
+    layer: nn.Module,
+    roles: AttnMoERoles,
+    table: plan_mod.BlockPlanTable,
+    tp: int,
+    front: nn.Module | None = None,
+) -> AttnMoERunner:
+    """The block's runner, from the layer's parts and the nested front half.
+
+    Args:
+        front: The nested ``AttentionRunner``, built with
+            ``output_reduced=False``; None runs the model's own norm and
+            attention (``ModelAttention``).
+    """
+    if front is None:
+        front = ModelAttention(
+            input_norm=layer.get_submodule(roles.input_norm),
+            attention=layer.get_submodule(roles.attention),
+            attention_args=roles.attention_args,
+            positions_param=roles.positions_param,
+        )
+    return AttnMoERunner(
+        name,
+        front=front,
+        post_norm=layer.get_submodule(roles.post_norm),
+        router=layer.get_submodule(roles.router),
+        experts=layer.get_submodule(roles.experts),
+        table=table,
+        tp=tp,
+        stream=StreamParams.of(
+            layer, roles.hidden_param, roles.residual_param, roles.positions_param
+        ),
+    )
+
+
 def apply_block(
     name: str,
     layer: nn.Module,
     roles: AttnMoERoles,
     table: plan_mod.BlockPlanTable,
     tp: int,
-) -> None:
-    """Binds the overlap's child contracts and swaps in the block forward."""
+    front: nn.Module | None = None,
+) -> AttnMoERunner:
+    """Builds the block's runner and makes it the layer's forward.
+
+    The MoE child's contracts are written (the interim adapter); attention's
+    is a constructor argument of ``front`` when there is one.
+    """
     bind_child_contracts(
         name,
-        layer.get_submodule(roles.out_proj),
+        None if front is not None else layer.get_submodule(roles.out_proj),
         layer.get_submodule(roles.experts),
-        _OVERLAP_CONTRACTS,
+        _MOE_CONTRACTS,
         source=_summary(table),
     )
-    order = tuple(inspect.signature(layer.forward).parameters)
-    layer.__class__ = _block_class(type(layer))
-    layer._block_roles = roles
-    layer._block_table = table
-    layer._block_order = order
-    layer._block_tp = tp
+    runner = build_runner(name, layer, roles, table, tp, front)
+    route(layer, runner)
+    return runner
+
+
+def _all_default(table: plan_mod.BlockPlanTable) -> plan_mod.BlockPlanTable:
+    return plan_mod.BlockPlanTable(
+        tuple((b, plan_mod.DEFAULT, "default") for b, _, _ in table.entries)
+    )
 
 
 @block_implementation(attn_then_moe)
 class AttnThenMoE:
-    """Conforms, resolves and installs one declared attn_then_moe layer."""
+    """Conforms, resolves and installs one declared attn_then_moe layer.
+
+    Where the layer also declares ``norm_then_attention``, the block builds
+    that sub-block's runner itself, stating its contract
+    (``output_reduced=False``); a block left at upstream's collectives leaves
+    the sub-block to run on its own.
+    """
+
+    nests = (norm_then_attention,)
 
     def install(
         self,
@@ -301,15 +351,44 @@ class AttnThenMoE:
         layer: nn.Module,
         declaration: BlockDeclaration,
         context: InstallContext,
+        nested: dict[Any, BlockDeclaration],
     ) -> Installed:
         roles = conform(layer, declaration)
         key = block_key(layer, declaration.bind(layer), context.tp, context.dtype)
         table, fell_back = plan_mod.resolve_table(
             key, context.buckets, context.override, context.model_plan
         )
+        inner = nested.get(norm_then_attention)
+        if inner is not None and table.uses("reduce_scatter_all_gather"):
+            # The block needs attention unreduced: ask the floor value first.
+            sub_roles = norm_attn.conform(layer, inner)
+            floor = subblock_plan.NormAttnPlan("unfused", "bf16")
+            why = subblock_plan.unreduced_output_supports(
+                floor,
+                layer.get_submodule(sub_roles.attention),
+                fused_unreduced=False,
+            )
+            if why and any(s in ("user", "model plan") for _, _, s in table.entries):
+                raise ValueError(
+                    f"{name}: block plan pinned to reduce_scatter_all_gather, but "
+                    f"attention cannot return an unreduced output: {why}"
+                )
+            if why:  # The rule's choice cannot run: upstream's collectives.
+                logger.debug("%s: overlap declined: %s", name, why)
+                table, fell_back = _all_default(table), (*fell_back, why)
         cls = type(layer).__qualname__
         if not table.uses("reduce_scatter_all_gather"):
             why = f" (rule fell back: {'; '.join(fell_back)})" if fell_back else ""
-            return Installed(name, cls, f"conforms; {_summary(table)}{why}")
-        apply_block(name, layer, roles, table, context.tp)
-        return Installed(name, cls, f"installed; {_summary(table)}")
+            outcome = f"conforms; {_summary(table)}{why}"
+            if inner is not None:
+                sub = norm_attn.install_standalone(name, layer, inner, context)
+                outcome += f"; sub-block {sub.outcome}"
+            return Installed(name, cls, outcome)
+        front, what = None, ""
+        if inner is not None:
+            _, front, chosen = norm_attn.resolve_runner(
+                name, layer, inner, context, output_reduced=False
+            )
+            what = f"; nested AttentionRunner {chosen}"
+        apply_block(name, layer, roles, table, context.tp, front)
+        return Installed(name, cls, f"AttnMoERunner installed; {_summary(table)}{what}")
