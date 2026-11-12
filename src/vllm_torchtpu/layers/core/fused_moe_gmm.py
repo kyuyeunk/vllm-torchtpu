@@ -86,7 +86,21 @@ _COUNTING_SORT_BLOCK = 512
 _COUNTING_SORT_SCATTER_MAX_ROWS = _COUNTING_SORT_BLOCK
 
 
-def resolve_onehot_permute_threshold() -> int:
+def _runtime_tpu_info() -> pltpu.TpuInfo:
+    """The chip the current trace targets: this module's one runtime read."""
+    return pltpu.get_tpu_info()
+
+
+def _tpu_info_or_none() -> pltpu.TpuInfo | None:
+    """`_runtime_tpu_info()`, or None on hosts JAX has no TPU description for."""
+    try:
+        return _runtime_tpu_info()
+    except ValueError:
+        # get_tpu_info raises for unsupported device kinds (e.g. CPU hosts).
+        return None
+
+
+def resolve_onehot_permute_threshold(target: pltpu.TpuInfo | None = None) -> int:
     """Routed-row count at/below which MoE permute+combine run as TensorCore
     one-hot matmuls instead of the SparseCore gather/reduce kernels.
 
@@ -94,15 +108,17 @@ def resolve_onehot_permute_threshold() -> int:
     _ONEHOT_AUTO_CAP)`` on SparseCore TPUs and 0 elsewhere. An explicit
     ``ONEHOT_MOE_PERMUTE_THRESHOLD`` wins: 0 disables the one-hot path, a
     positive value forces that threshold.
+
+    ``target`` is the chip; None reads it from the runtime, and only once the
+    env override has been ruled out, so an explicit override never touches
+    the runtime.
     """
     explicit = envs.ONEHOT_MOE_PERMUTE_THRESHOLD
     if explicit is not None and explicit >= 0:
         return explicit
-    try:
-        sc_info = pltpu.get_tpu_info().sparse_core
-    except ValueError:
-        # get_tpu_info raises for unsupported device kinds (e.g. CPU hosts).
-        return 0
+    if target is None:
+        target = _tpu_info_or_none()
+    sc_info = target.sparse_core if target is not None else None
     if sc_info is None:
         return 0
     block_rows = sc_info.num_lanes * sc_info.num_cores * sc_info.num_subcores

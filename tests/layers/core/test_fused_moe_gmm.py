@@ -13,6 +13,7 @@
 # limitations under the License.
 """Tests for the local-routing fused MoE GMM wrapper."""
 
+import dataclasses
 import types
 from unittest.mock import patch
 
@@ -20,6 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import apply_act_fn, interleave_lane
@@ -947,14 +949,9 @@ def test_fused_moe_func_int4_packed_matches_reference():
     )
 
 
-def _fake_tpu_info(sparse_core):
-    return types.SimpleNamespace(sparse_core=sparse_core)
-
-
-def _fake_sc_info(num_lanes, num_cores, num_subcores):
-    return types.SimpleNamespace(
-        num_lanes=num_lanes, num_cores=num_cores, num_subcores=num_subcores
-    )
+_TPU_7X = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+_TPU_V6E = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_V6E, 1)
+_TPU_V5E = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_V5E, 1)
 
 
 def test_onehot_threshold_env_parsing(monkeypatch):
@@ -969,9 +966,9 @@ def test_onehot_threshold_env_parsing(monkeypatch):
 
 def test_onehot_threshold_explicit_env_skips_tpu_info(monkeypatch):
     def _fail():
-        raise AssertionError("get_tpu_info must not be called")
+        raise AssertionError("the runtime chip must not be read")
 
-    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", _fail)
+    monkeypatch.setattr(fused_moe_gmm, "_runtime_tpu_info", _fail)
     monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", 0, raising=False)
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
 
@@ -979,39 +976,26 @@ def test_onehot_threshold_explicit_env_skips_tpu_info(monkeypatch):
 @pytest.mark.parametrize("explicit", [None, -1])
 def test_onehot_threshold_auto_is_one_below_real_blocks(monkeypatch, explicit):
     monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", explicit, raising=False)
-    # 16 lanes x 2 cores x 16 subcores = 512-row block (v7x geometry) and a
-    # 256-row block (v6e) both sit at or below the cap, so block - 1 wins:
-    # a full block stays on the SparseCore path. None and -1 both select
-    # auto.
-    for sc_info, expected in (
-        (_fake_sc_info(16, 2, 16), 511),
-        (_fake_sc_info(8, 2, 16), 255),
-    ):
-        monkeypatch.setattr(
-            fused_moe_gmm.pltpu,
-            "get_tpu_info",
-            lambda info=sc_info: _fake_tpu_info(info),
-        )
-        assert fused_moe_gmm.resolve_onehot_permute_threshold() == expected
+    # 16 lanes x 2 cores x 16 subcores = 512-row block (TPU7x) and a 256-row
+    # block (v6e) both sit at or below the cap, so block - 1 wins: a full
+    # block stays on the SparseCore path. None and -1 both select auto.
+    for chip, expected in ((_TPU_7X, 511), (_TPU_V6E, 255)):
+        assert fused_moe_gmm.resolve_onehot_permute_threshold(chip) == expected
 
 
 def test_onehot_threshold_auto_caps_oversized_block(monkeypatch):
     monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
     # A hypothetical 1024-row block exceeds the cap, so the cap wins.
-    monkeypatch.setattr(
-        fused_moe_gmm.pltpu,
-        "get_tpu_info",
-        lambda: _fake_tpu_info(_fake_sc_info(32, 2, 16)),
+    assert _TPU_7X.sparse_core is not None
+    chip = dataclasses.replace(
+        _TPU_7X, sparse_core=dataclasses.replace(_TPU_7X.sparse_core, num_lanes=32)
     )
-    assert fused_moe_gmm.resolve_onehot_permute_threshold() == 512
+    assert fused_moe_gmm.resolve_onehot_permute_threshold(chip) == 512
 
 
 def test_onehot_threshold_auto_zero_without_sparse_core(monkeypatch):
     monkeypatch.setattr(envs, "ONEHOT_MOE_PERMUTE_THRESHOLD", None, raising=False)
-    monkeypatch.setattr(
-        fused_moe_gmm.pltpu, "get_tpu_info", lambda: _fake_tpu_info(None)
-    )
-    assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
+    assert fused_moe_gmm.resolve_onehot_permute_threshold(_TPU_V5E) == 0
 
 
 def test_onehot_threshold_auto_zero_on_non_tpu_host(monkeypatch):
@@ -1020,7 +1004,7 @@ def test_onehot_threshold_auto_zero_on_non_tpu_host(monkeypatch):
     def _raise():
         raise ValueError("Unsupported TPU device kind: cpu")
 
-    monkeypatch.setattr(fused_moe_gmm.pltpu, "get_tpu_info", _raise)
+    monkeypatch.setattr(fused_moe_gmm, "_runtime_tpu_info", _raise)
     assert fused_moe_gmm.resolve_onehot_permute_threshold() == 0
 
 
