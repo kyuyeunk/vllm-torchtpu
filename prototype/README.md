@@ -1,11 +1,24 @@
 # Prototype: the pool's layout as a staged record
 
-Backs DATA_CONTRACTS.md section 5.4 (Figures 24 and 25) and Appendix A.4's
+Backs DATA_CONTRACTS.md section 5.4 (Figure 23) and Appendix A.4's
 #211. Today the pool's block size is written into `cache_config` by the
 platform and copied or re-read by each reader; nothing says when the value
 is final. In #211 the runner copied `block_size` 16 in `__init__`, the worker
 raised it to 2048 after `load_model`, and the mamba seed-copy collector
 strode its table with the stale 16 and walked off it.
+
+## Where to look
+
+| Claim | Code |
+|---|---|
+| An early read raises; the guard holds no value | [`PoolStage, PoolLayout`](../src/vllm_torchtpu/pool_layout.py#L33-L90) in `pool_layout.py` (L33-L90) |
+| The page's one producer marks it final | [`mark_page_final`](../src/vllm_torchtpu/pool_layout.py#L98-L105) in `pool_layout.py` (L98-L105) |
+| Stage 2 is final here | [`mark_page_final call`](../src/vllm_torchtpu/platforms/tpu_platform.py#L1370-L1372) in `tpu_platform.py` (L1370-L1372) |
+| The runner keeps no copy | [`block_size, _refresh_smem_request_caps`](../src/vllm_torchtpu/runner/tpu_runner.py#L8593-L8614) in `tpu_runner.py` (L8593-L8614) |
+| KV transfer reads the guard | [`_measure_stage3_layout`](../src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py#L3492-L3535) in `tpu_connector.py` (L3492-L3535) |
+| One source for "is it HND?": vLLM's resolved layout | [`_raiden_seq_on_lane_layout`](../src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py#L632-L640) in `tpu_connector.py` (L632-L640) |
+| The ratchet (30) and the single writer | [`two tests`](../tests/test_pool_layout.py#L201-L215) in `test_pool_layout.py` (L201-L215) |
+| #211, planted | [`STALE_COPY`](../prototype/early_read.py#L26-L27) in `early_read.py` (L26-L27) |
 
 This branch keeps each fact in the record that already holds it and guards
 reads that come before that record is final:
