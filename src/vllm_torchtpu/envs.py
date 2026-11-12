@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     TPU_BLOCK_PLAN: str = ""
+    TPU_SUBBLOCK_PLAN: str = ""
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
@@ -444,6 +445,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "collectives=all_reduce" or "collectives=reduce_scatter_all_gather".
     # Empty: the rule (overlap at >= 8 MiB of activations per chip).
     "TPU_BLOCK_PLAN": env_str("TPU_BLOCK_PLAN", ""),
+    # The pre-norm attention sub-block's plan, e.g. input_proj=unfused.
+    "TPU_SUBBLOCK_PLAN": env_str("TPU_SUBBLOCK_PLAN", ""),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many

@@ -63,6 +63,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_MOE_HIERARCHICAL_EP` | `False` | Enables two-level intra-chip / inter-chip hierarchical Expert Parallelism on dual-core TPU v7x hosts. |
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
 | `TPU_BLOCK_PLAN` | `""` | Pins the `attn_then_moe` block plan for every bucket: `collectives=all_reduce` or `collectives=reduce_scatter_all_gather`. Empty: overlap on buckets >= 8 MiB of activations per rank. |
+| `TPU_SUBBLOCK_PLAN` | `""` | Pins the `norm_then_attention` sub-block plan: `input_proj=unfused` or `input_proj=fused_qkv`. Empty: `fused_qkv` on every layer whose declaration conforms. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
 | `ENABLE_QUANTIZED_MATMUL_KERNEL` | `False` | Dispatches quantized linear layers to the custom Pallas quantized matmul kernel. |

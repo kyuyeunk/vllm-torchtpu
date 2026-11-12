@@ -5796,6 +5796,7 @@ class TPUModelRunner(GPUModelRunner):
                     buckets=tuple(self.num_tokens_paddings),
                     override=envs.TPU_BLOCK_PLAN,
                     model_plan=getattr(hf_config, "tpu_block_plan", "") or "",
+                    subblock_plan=envs.TPU_SUBBLOCK_PLAN,
                 ),
             )
 
