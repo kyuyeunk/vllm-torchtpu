@@ -423,12 +423,16 @@ def _world() -> None:
 
 
 @contextlib.contextmanager
-def _config_for(hf: Any, use_mla: bool) -> Iterator[VllmConfig]:  # noqa: ANN401
+def _config_for(
+    hf: Any,  # noqa: ANN401
+    use_mla: bool,
+    dtype: torch.dtype,
+) -> Iterator[VllmConfig]:
     config = VllmConfig()
     config.model_config = _AnyModelConfig(  # pyright: ignore[reportAttributeAccessIssue]
         hf_config=hf,
         hf_text_config=hf,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         is_attention_free=False,
         use_mla=use_mla,
         max_model_len=128,
@@ -447,11 +451,22 @@ def current_config() -> VllmConfig:
 
 
 def build(
-    spec: Spec, prefix: str = "model.layers.0", device: str = "meta"
+    spec: Spec,
+    prefix: str = "model.layers.0",
+    device: str = "meta",
+    dtype: torch.dtype = torch.bfloat16,
 ) -> torch.nn.Module:
     """Builds the spec's decoder layer through its own constructor."""
     _world()
     hf = spec.config()
-    with _config_for(hf, spec.use_mla) as config, torch.device(device), spec.stub():
+    default = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    with (
+        _config_for(hf, spec.use_mla, dtype) as config,
+        torch.device(device),
+        spec.stub(),
+        contextlib.ExitStack() as restore,
+    ):
+        restore.callback(torch.set_default_dtype, default)
         _LAST[:] = [config]
         return spec.make(Built(config, hf, prefix))
