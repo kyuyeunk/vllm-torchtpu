@@ -206,7 +206,11 @@ from vllm_torchtpu.spec_decode.utils import (
     normalize_draft_config,
 )
 from vllm_torchtpu.structured_decoding import StructuredDecodingManager
-from vllm_torchtpu.tpu_info import get_libtpu_version, get_tpu_library_path
+from vllm_torchtpu.tpu_info import (
+    get_chip_version,
+    get_libtpu_version,
+    get_tpu_library_path,
+)
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
 from vllm_torchtpu.tracing.utils import (
@@ -5797,6 +5801,7 @@ class TPUModelRunner(GPUModelRunner):
                     override=envs.TPU_BLOCK_PLAN,
                     model_plan=getattr(hf_config, "tpu_block_plan", "") or "",
                     subblock_plan=envs.TPU_SUBBLOCK_PLAN,
+                    chip=get_chip_version().value,
                 ),
             )
 

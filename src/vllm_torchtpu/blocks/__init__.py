@@ -125,6 +125,8 @@ class InstallContext:
     override: str
     model_plan: str
     subblock_plan: str = ""
+    # The chip's `pltpu.ChipVersion` value; empty off-TPU (no chip facts).
+    chip: str = ""
 
 
 @dataclasses.dataclass(frozen=True)

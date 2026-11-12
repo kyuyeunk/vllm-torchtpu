@@ -87,6 +87,17 @@ def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
         return pltpu.ChipVersion.TPU_7X
 
 
+def has_fp8_matmul(chip: pltpu.ChipVersion | None = None) -> bool:
+    """Whether the chip's MXU multiplies FP8 faster than bf16.
+
+    Read from JAX's chip table rather than a list of chip names: v6e accepts
+    an fp8 x fp8 dot but runs it at the bf16 rate (no native FP8 matmul);
+    v7x runs it at twice the bf16 rate. Host-side, like `get_chip_version`.
+    """
+    info = pltpu.get_tpu_info_for_chip(chip or get_chip_version(), 1)
+    return info.fp8_ops_per_second > info.bf16_ops_per_second
+
+
 def get_libtpu_version() -> str | None:
     """Version of the pip ``libtpu`` package, or None if it is not installed.
 

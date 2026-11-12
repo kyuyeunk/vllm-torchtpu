@@ -28,13 +28,20 @@ override (``TPU_SUBBLOCK_PLAN``) comes first, as for every plan.
 import dataclasses
 from typing import Literal, get_args
 
+import torch
+from jax.experimental.pallas import tpu as pltpu
 from torch import nn
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 
 from vllm_torchtpu.layers.core.plan_marker import plan_of
 from vllm_torchtpu.layers.core.resolution import require_no_default
+from vllm_torchtpu.tpu_info import has_fp8_matmul
 
 InputProj = Literal["unfused", "fused_qkv"]
+# How fused_qkv multiplies: the checkpoint's FP8 weights against quantized
+# activations (#3096's fp8 variant), or bf16 weights (its bf16 variant; FP8
+# weights are dequantized once at load). Unfused ignores it.
+Matmul = Literal["fp8", "bf16"]
 
 
 @plan_of("blocks.norm_then_attention")
@@ -44,14 +51,30 @@ class NormAttnPlan:
     """How one conforming sub-block reaches attention's projection."""
 
     input_proj: InputProj
+    matmul: Matmul
 
 
-RULE = NormAttnPlan(input_proj="fused_qkv")
+def _fp8_weights(attention: nn.Module) -> bool:
+    weight = getattr(getattr(attention, "qkv_proj", None), "weight", None)
+    return weight is not None and weight.dtype == torch.float8_e4m3fn
+
+
+def rule(attention: nn.Module) -> NormAttnPlan:
+    """Fused everywhere, in the checkpoint's precision."""
+    return NormAttnPlan("fused_qkv", "fp8" if _fp8_weights(attention) else "bf16")
+
+
+def candidates(first: NormAttnPlan) -> list[NormAttnPlan]:
+    """``first``, then the values to fall back to, fastest first."""
+    order = [first, NormAttnPlan("fused_qkv", "bf16"), NormAttnPlan("unfused", "bf16")]
+    return list(dict.fromkeys(order))
 
 
 def fused_qkv_supports(
     attention: nn.Module,
     *,
+    matmul: Matmul = "bf16",
+    chip: str = "",
     head_dim: int | None = None,
     num_heads: int | None = None,
     num_kv_heads: int | None = None,
@@ -69,6 +92,10 @@ def fused_qkv_supports(
     weights stored (K, N) (``fused_attn_proj.py:101``) and no DCP (``:244``).
     A ``layer_scale`` or sequence-parallel layer (``fused_attn_proj.py:457-459``)
     fails this pattern's conformance check instead.
+
+    The chip is the third description, after the model's and the kernel's:
+    the fp8 variant needs FP8 matmul (``chip`` is a `pltpu.ChipVersion`
+    value; empty off-TPU, where only the model and the kernel are checked).
     """
     inner = [m for m in attention.modules() if m is not attention]
     # Sinks need RPA v3's kernel; fused_qkv writes the batched-RPA layout
@@ -106,24 +133,32 @@ def fused_qkv_supports(
     # fused_attn_proj.py:88-103: unquantized or per-channel FP8 only.
     if qkv is not None and not ("Unquantized" in method or "Fp8" in method):
         return f"qkv_proj quantized by {method}"
+    if matmul == "fp8" and not _fp8_weights(attention):
+        return "the fp8 variant needs FP8 weights; qkv_proj's are not"
+    # quantized_matmul.py:111-112 and :164 run an fp8 x fp8 dot on any chip;
+    # #3096 has no chip guard, so this condition is ours, read from the chip.
+    if matmul == "fp8" and chip and not has_fp8_matmul(pltpu.ChipVersion(chip)):
+        return f"the fp8 variant needs FP8 matmul; chip {chip} has none"
     return None
 
 
-def resolve(override: str) -> tuple[NormAttnPlan, str]:
-    """The plan and its source: the user's override, else the rule.
+def resolve(override: str, attention: nn.Module) -> tuple[NormAttnPlan, frozenset[str]]:
+    """The plan and the fields the user pinned; the rest come from the rule.
 
     Raises:
         ValueError: The override names an unknown key or value.
     """
+    plan = rule(attention)
     if not override:
-        return RULE, "rule"
+        return plan, frozenset()
     pins = dict(item.split("=", 1) for item in override.split(","))
-    if unknown := sorted(set(pins) - {"input_proj"}):
+    allowed = {"input_proj": InputProj, "matmul": Matmul}
+    if unknown := sorted(set(pins) - set(allowed)):
         raise ValueError(f"TPU_SUBBLOCK_PLAN: unknown keys {unknown}")
-    value = pins["input_proj"]
-    if value not in get_args(InputProj):
-        raise ValueError(
-            f"TPU_SUBBLOCK_PLAN: input_proj={value} is not one of "
-            f"{list(get_args(InputProj))}"
-        )
-    return NormAttnPlan(input_proj=value), "user"  # type: ignore[arg-type]
+    for key, value in pins.items():
+        if value not in get_args(allowed[key]):
+            raise ValueError(
+                f"TPU_SUBBLOCK_PLAN: {key}={value} is not one of "
+                f"{list(get_args(allowed[key]))}"
+            )
+    return dataclasses.replace(plan, **pins), frozenset(pins)

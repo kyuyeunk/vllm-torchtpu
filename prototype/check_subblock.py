@@ -155,7 +155,7 @@ def _runnable(spec: _build.Spec) -> nn.Module:
     return layer
 
 
-def _context(plan: str = "") -> blocks.InstallContext:
+def _context(plan: str = "", chip: str = "") -> blocks.InstallContext:
     return blocks.InstallContext(
         tp=1,
         dtype="float32",
@@ -163,6 +163,7 @@ def _context(plan: str = "") -> blocks.InstallContext:
         override="",
         model_plan="",
         subblock_plan=plan,
+        chip=chip,
     )
 
 
@@ -275,7 +276,7 @@ def counts() -> list[str]:
     for what, items in PR_3096.items():
         print(f"    #3096 {what}: {len(items)}")
     print(
-        "    here: 1 plan value (FusedNormProjection), 6 declarations, "
+        "    here: 1 plan value (FusedNormProjection), 7 declarations, "
         "1 conformance check (norm_attn.conform)"
     )
     return []

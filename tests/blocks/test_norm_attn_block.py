@@ -14,6 +14,7 @@
 """The norm_then_attention sub-block: declarations conform, mismatches decline."""
 
 import pytest
+import torch
 from vllm.config import set_current_vllm_config
 
 from prototype import _build, check_subblock
@@ -61,5 +62,39 @@ def test_pin_that_cannot_run_stops_startup() -> None:
     with (
         set_current_vllm_config(_build.current_config()),
         pytest.raises(ValueError, match="sinks"),
+    ):
+        impl.install("l", layer, declaration, context)
+
+
+def _fp8_llama() -> tuple:
+    """A meta Llama layer whose qkv_proj holds FP8 weights, and its declaration."""
+    layer = _build.build(check_subblock.FAMILIES[0])
+    qkv = layer.self_attn.qkv_proj
+    qkv.weight = torch.nn.Parameter(
+        qkv.weight.to(torch.float8_e4m3fn), requires_grad=False
+    )
+    blocks.load_declarations()
+    return layer, blocks.DECLARATIONS[(type(layer), norm_then_attention)]
+
+
+@pytest.mark.parametrize(("chip", "matmul"), [("v6e", "bf16"), ("7x", "fp8")])
+def test_fp8_variant_follows_the_chip(chip: str, matmul: str) -> None:
+    """FP8 weights take the fp8 variant only where the chip has FP8 matmul."""
+    layer, declaration = _fp8_llama()
+    impl = blocks.IMPLEMENTATIONS[norm_then_attention]
+    context = check_subblock._context(chip=chip)  # noqa: SLF001
+    with set_current_vllm_config(_build.current_config()):
+        outcome = impl.install("l", layer, declaration, context).outcome
+    assert f"input_proj=fused_qkv matmul={matmul}" in outcome
+
+
+def test_fp8_pin_on_a_chip_without_fp8_matmul_stops_startup() -> None:
+    """A user pin to matmul=fp8 on v6e is a startup error."""
+    layer, declaration = _fp8_llama()
+    impl = blocks.IMPLEMENTATIONS[norm_then_attention]
+    context = check_subblock._context("matmul=fp8", chip="v6e")  # noqa: SLF001
+    with (
+        set_current_vllm_config(_build.current_config()),
+        pytest.raises(ValueError, match="chip v6e has none"),
     ):
         impl.install("l", layer, declaration, context)

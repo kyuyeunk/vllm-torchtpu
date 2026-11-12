@@ -45,6 +45,7 @@ from vllm_torchtpu.blocks.norm_attn.pattern import (
     norm_then_attention,
     qkv_proj_of,
 )
+from vllm_torchtpu.logger import init_logger
 
 _PATTERN = "norm_then_attention"
 _TOKENS = 8
@@ -242,6 +243,9 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> NormAttnRoles:
     return roles
 
 
+logger = init_logger(__name__)
+
+
 def conf_core_types() -> tuple[type, ...]:
     from vllm.model_executor.layers.attention_layer_base import (  # noqa: PLC0415
         AttentionLayerBase,
@@ -262,22 +266,33 @@ class NormThenAttention:
         context: InstallContext,
     ) -> Installed:
         roles = conform(layer, declaration)
-        plan, source = plan_mod.resolve(context.subblock_plan)
+        attention = layer.get_submodule(roles.attention)
+        first, pinned = plan_mod.resolve(context.subblock_plan, attention)
         cls = type(layer).__qualname__
-        if plan.input_proj == "fused_qkv" and (
-            why := plan_mod.fused_qkv_supports(layer.get_submodule(roles.attention))
-        ):
-            if source == "user":  # A pin that cannot run raises at startup.
-                raise ValueError(
-                    f"TPU_SUBBLOCK_PLAN input_proj=fused_qkv on {cls}: {why}"
+        declined: list[str] = []
+        for plan in plan_mod.candidates(first):
+            if any(getattr(plan, f) != getattr(first, f) for f in pinned):
+                continue  # A fallback never moves a field the user pinned.
+            why = None
+            if plan.input_proj == "fused_qkv":
+                why = plan_mod.fused_qkv_supports(
+                    attention, matmul=plan.matmul, chip=context.chip
                 )
-            return Installed(
-                name, cls, f"conforms; input_proj=unfused (fused_qkv declined: {why})"
-            )
+            if why is None:
+                break
+            declined.append(f"{plan.input_proj}/{plan.matmul} declined: {why}")
+        else:  # Every value the pins allow is declined: stop at startup.
+            pins = ",".join(f"{f}={getattr(first, f)}" for f in sorted(pinned))
+            raise ValueError(f"TPU_SUBBLOCK_PLAN {pins} on {cls}: {declined[0]}")
+        source = "user" if pinned else "rule"
+        note = f" ({'; '.join(declined)})" if declined else f" ({source})"
         if plan.input_proj == "unfused":
-            return Installed(name, cls, f"conforms; input_proj=unfused ({source})")
+            return Installed(name, cls, f"conforms; input_proj=unfused{note}")
         if isinstance(layer.get_submodule(roles.input_norm), AddOnly):
             return Installed(name, cls, "already installed")
         install_fused_qkv(layer, roles.input_norm, roles.qkv_proj)
         assert isinstance(layer.get_submodule(roles.qkv_proj), FusedNormProjection)
-        return Installed(name, cls, f"installed; input_proj=fused_qkv ({source})")
+        logger.debug("%s: matmul=%s", name, plan.matmul)
+        return Installed(
+            name, cls, f"installed; input_proj=fused_qkv matmul={plan.matmul}{note}"
+        )
