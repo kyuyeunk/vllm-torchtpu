@@ -44,7 +44,7 @@ kernel; section B below routes #3096's kernel itself behind it.
 | Per model: conforms, fused value matches upstream | [`family`](check_subblock.py#L152-L180), [`new_models`](check_subblock.py#L182-L190) |
 | The planted mismatch | [`ScaledAttention`](check_subblock.py#L84-L92), [`planted`](check_subblock.py#L193-L220) |
 | The count against #3096 | [`PR_3096`](check_subblock.py#L224-L247) |
-| Reach over current models, from real configs | [`CANDIDATES`](subblock_reach.py#L61-L191), [`check`](subblock_reach.py#L269-L282) |
+| Reach over current models, from real configs | [`CANDIDATES`](subblock_reach.py#L61-L191), [`check`](subblock_reach.py#L266-L294) |
 | The startup override | `TPU_SUBBLOCK_PLAN` in `envs.py`, passed by the runner's `_install_blocks` |
 
 ## Running it

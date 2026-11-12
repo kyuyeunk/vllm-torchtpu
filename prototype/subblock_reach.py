@@ -191,6 +191,68 @@ CANDIDATES = (
     ),
 )
 
+# Pattern-level candidates from vLLM main's static scan (files whose decoder
+# forward is plain pre-norm), checked with ``--main`` against a vLLM main
+# checkout; the families v0.33.0 lacks are only checkable there.
+_M = "vllm.model_executor.models."
+MAIN_CANDIDATES = (
+    Candidate(
+        "Mistral",
+        "mistralai/Mixtral-8x22B-Instruct-v0.1",
+        _M + "mixtral",
+        "MixtralDecoderLayer",
+    ),
+    Candidate("GLM (Zhipu)", "zai-org/GLM-4-32B-0414", _M + "glm4", "Glm4DecoderLayer"),
+    Candidate(
+        "Tencent",
+        "tencent/Hunyuan-A13B-Instruct",
+        _M + "hunyuan_v1",
+        "HunYuanDecoderLayer",
+    ),
+    Candidate(
+        "inclusionAI",
+        "inclusionAI/Ling-lite-1.5",
+        _M + "bailing_moe",
+        "BailingMoeBlock",
+    ),
+    Candidate(
+        "NVIDIA", "nvidia/Minitron-8B-Base", _M + "nemotron", "NemotronDecoderLayer"
+    ),
+    Candidate(
+        "Upstage",
+        "upstage/solar-pro-preview-instruct",
+        _M + "solar",
+        "SolarDecoderLayer",
+    ),
+    Candidate("Arcee", "arcee-ai/Trinity-Mini", _M + "afmoe", "AfmoeDecoderLayer"),
+    Candidate("Qwen", "Qwen/Qwen2.5-72B-Instruct", _M + "qwen2", "Qwen2DecoderLayer"),
+    Candidate(
+        "Qwen", "Qwen/Qwen1.5-MoE-A2.7B", _M + "qwen2_moe", "Qwen2MoeDecoderLayer"
+    ),
+    Candidate("Google", "google/gemma-7b", _M + "gemma", "GemmaDecoderLayer"),
+    Candidate("AllenAI", "allenai/Molmo-7B-D-0924", _M + "molmo", "MolmoDecoderLayer"),
+    Candidate(
+        "StepFun",
+        "stepfun-ai/step3",
+        _M + "step3_text",
+        "Step3TextDecoderLayer",
+        text_config=True,
+    ),
+    Candidate(
+        "LG",
+        "LGAI-EXAONE/K-EXAONE-236B-A23B",
+        _M + "exaone_moe",
+        "ExaoneMoeDecoderLayer",
+    ),
+    Candidate(
+        "Shanghai AI Lab",
+        "internlm/Intern-S1-Pro",
+        _M + "interns1_pro",
+        "InternS1ProMoeDecoderLayer",
+        text_config=True,
+    ),
+)
+
 _SHRINK_HEADS = dict(
     hidden_size=128,
     num_attention_heads=4,
@@ -297,7 +359,7 @@ def check(c: Candidate) -> tuple[str, str]:
 
 def main() -> None:
     rows = []
-    for c in CANDIDATES:
+    for c in MAIN_CANDIDATES if "--main" in sys.argv else CANDIDATES:
         verdict, why = check(c)
         target = "#3096" if c.layer_class in PR_3096_TARGETS else ""
         rows.append((c, verdict, why, target))
