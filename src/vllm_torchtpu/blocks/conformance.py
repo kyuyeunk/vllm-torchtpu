@@ -224,6 +224,10 @@ def canonicalize(
             label = f"input:{roles[n.name]}" if n.name in roles else f"state:{n.name}"
         elif getattr(n.target, "__name__", "") == "getitem":
             label = f"getitem[{n.args[1]}]"
+        elif target in _SHAPE_ONLY:
+            # A reshape is its result's shape: view(t, 4, d) and view(-1, 4, d)
+            # are the same op.
+            label = _h(target, _meta(n))
         else:
             label = _h(target, _const(n.args), _const(n.kwargs), _meta(n))
         hashes = [fwd[a] for a in ins]
