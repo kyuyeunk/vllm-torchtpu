@@ -36,6 +36,7 @@ from prototype import _build
 from vllm_torchtpu.blocks import BlockDeclaration, norm_attn
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
 from vllm_torchtpu.blocks.norm_attn.pattern import norm_then_attention
+from vllm_torchtpu.blocks.norm_attn.plan import fused_qkv_supports
 
 # #3096 patches these decoder classes (fused_attn_proj_patch.py).
 PR_3096_TARGETS = {
@@ -281,10 +282,11 @@ def check(c: Candidate) -> tuple[str, str]:
     )
     try:
         with set_current_vllm_config(_build.current_config()):
-            norm_attn.conform(layer, declaration)
+            roles = norm_attn.conform(layer, declaration)
     except (BlockConformanceError, AttributeError) as e:
         return "declines", str(e).split(", but ", 1)[-1][:110]
-    return "conforms", ""
+    why = fused_qkv_supports(layer.get_submodule(roles.attention))
+    return "conforms", f"fused_qkv: {'declines: ' + why if why else 'can serve it'}"
 
 
 def main() -> None:

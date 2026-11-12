@@ -29,6 +29,7 @@ import dataclasses
 from typing import Literal, get_args
 
 from torch import nn
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 
 from vllm_torchtpu.layers.core.plan_marker import plan_of
 from vllm_torchtpu.layers.core.resolution import require_no_default
@@ -60,6 +61,13 @@ def fused_qkv_supports(attention: nn.Module) -> str | None:
         return "attention sinks need RPA v3; fused_qkv writes the batched-RPA layout"
     if getattr(attention, "head_dim", None) == 64:
         return "head_dim 64 runs on RPA v3; fused_qkv writes the batched-RPA layout"
+    for name in ("q_norm", "k_norm"):
+        norm = getattr(attention, name, None)
+        if norm is not None and not isinstance(norm, (RMSNorm, GemmaRMSNorm)):
+            return (
+                f"{name} is {type(norm).__name__} (a norm over the whole projection); "
+                "fused_qkv fuses a per-head RMSNorm"
+            )
     return None
 
 
