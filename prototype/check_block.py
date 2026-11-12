@@ -22,6 +22,10 @@
    2048, bf16, TP 4) under the rule, the overrides and the cross-check.
 3. Outside write: after binding, writing a child decision the plan owns
    raises.
+4. A mismatch declines at install: the misordered fixture, declared, keeps its
+   upstream forward and the report names the edge. CI still fails on it: set
+   ``PLANT_MISMATCH = True`` and check 1 treats it as a declared model that
+   must conform, so the command exits 1.
 """
 
 import dataclasses
@@ -40,6 +44,10 @@ from vllm_torchtpu.blocks.attn_moe.pattern import attn_then_moe, block_key
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
 
 _BUCKETS = (16, 256, 1024, 4096, 8192, 16384)
+
+# Comment in to see CI fail: the misordered fixture becomes a declared model.
+PLANT_MISMATCH = False
+# PLANT_MISMATCH = True
 
 
 def _declared(layer: nn.Module) -> BlockDeclaration:
@@ -68,6 +76,15 @@ def _cases() -> list[tuple[str, nn.Module, BlockDeclaration, bool]]:
             cls, attn_then_moe, fixtures.RENAMED_ROLES, lambda _: True
         )
         cases.append((f"fixture {cls.__name__}", layer, declaration, expect))
+    if PLANT_MISMATCH:
+        layer = fixtures.ReorderedNorms(_build.build(full))
+        declaration = BlockDeclaration(
+            fixtures.ReorderedNorms,
+            attn_then_moe,
+            fixtures.RENAMED_ROLES,
+            lambda _: True,
+        )
+        cases.append(("declared ReorderedNorms (planted)", layer, declaration, True))
     return cases
 
 
@@ -131,6 +148,27 @@ def outside_write() -> list[str]:
     return ["out_proj.reduce_results = True was accepted after binding"]
 
 
+def mismatch_declines() -> list[str]:
+    layer = fixtures.ReorderedNorms(_build.build(_build.SPECS[0]))
+    blocks.DECLARATIONS[fixtures.ReorderedNorms] = BlockDeclaration(
+        fixtures.ReorderedNorms, attn_then_moe, fixtures.RENAMED_ROLES, lambda _: True
+    )
+    context = blocks.InstallContext(
+        tp=4,
+        dtype="bfloat16",
+        buckets=_BUCKETS,
+        override="",
+        model_plan="",
+    )
+    with set_current_vllm_config(_build.current_config()):
+        (item,) = blocks.install(nn.ModuleDict({"layer": layer}), context)
+    del blocks.DECLARATIONS[fixtures.ReorderedNorms]
+    print(f"    {item.layer_class}: {item.outcome}")
+    if not item.outcome.startswith("declined: ") or hasattr(layer, "_block_roles"):
+        return ["the mismatched layer was not declined"]
+    return []
+
+
 def _run(check: Callable[[], list[str]], title: str) -> bool:
     print(title)
     failures = check()
@@ -144,6 +182,7 @@ def main() -> None:
     ok = _run(conformance, "1 conformance: declared layers and planted fixtures")
     ok &= _run(plan_table, "2 plan per bucket (al = all_reduce, re = overlap)")
     ok &= _run(outside_write, "3 outside write raises after binding")
+    ok &= _run(mismatch_declines, "4 a mismatch declines at install")
     sys.exit(0 if ok else 1)
 
 

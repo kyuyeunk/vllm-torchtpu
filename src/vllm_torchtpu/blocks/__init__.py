@@ -40,6 +40,7 @@ from typing import Any, Protocol
 
 from torch import nn
 
+from vllm_torchtpu.blocks.conformance import BlockConformanceError
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -149,19 +150,29 @@ def block_implementation(
 def install(model: nn.Module, context: InstallContext) -> list[Installed]:
     """Checks and installs every declared block in ``model``.
 
-    Raises:
-        BlockConformanceError: A declared layer does not compute its pattern.
+    A layer that does not conform to its declared pattern is declined: it
+    keeps its upstream forward and its children keep their contracts, so
+    serving loses only the block's optimization. CI fails on the same
+    mismatch (``prototype.check_block`` and the conformance test).
     """
     from vllm_torchtpu.blocks import attn_moe  # noqa: F401 - registers itself
 
     load_declarations()
     report = []
+    declined: set[type[Any]] = set()
     for name, module in list(model.named_modules()):
         declaration = DECLARATIONS.get(type(module))
         if declaration is None or not declaration.when(module):
             continue
         impl = IMPLEMENTATIONS[declaration.pattern]
-        report.append(impl.install(name, module, declaration, context))
+        try:
+            report.append(impl.install(name, module, declaration, context))
+        except BlockConformanceError as e:
+            cls = type(module)
+            if cls not in declined:
+                declined.add(cls)
+                logger.warning("block declined for %s: %s", cls.__qualname__, e)
+            report.append(Installed(name, cls.__qualname__, f"declined: {e}"))
     counts: dict[str, int] = {}
     for item in report:
         counts[item.outcome] = counts.get(item.outcome, 0) + 1
