@@ -29,7 +29,7 @@ as an expansion point, only its boundary is a contract:
 | Plan types marked with their owner | [`UnfusedLayerPlan, FusedLayerPlan`](../src/vllm_torchtpu/layers/attention_layer_plan.py#L217-L232) in `attention_layer_plan.py` (L217-L232) |
 | Plan invariance, structural tier and numerics on a CPU | [`check_config`](../prototype/check_attention_plans.py#L96-L184) in `check_attention_plans.py` (L96-L184) |
 | The layer with seeded weights, no TPU runtime, attention as a reference child | [`RefAttention, build_real`](../prototype/_cpu.py#L55-L101) in `_cpu.py` (L55-L101) |
-| Numerics tier for a TPU (prepared) | [`main`](../prototype/check_attention_values.py#L42-L73) in `check_attention_values.py` (L42-L73) |
+| Numerics tier for a TPU (prepared) | [`main`](../prototype/check_attention_values.py#L42-L76) in `check_attention_values.py` (L42-L76) |
 
 It writes no new kernel. The whole layer as one fused kernel is a plan value
 (`layer=fused`) whose `supports()` declines with "no fused attention-layer
