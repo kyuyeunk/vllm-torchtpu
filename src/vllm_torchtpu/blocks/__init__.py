@@ -124,6 +124,7 @@ class InstallContext:
     buckets: tuple[int, ...]
     override: str
     model_plan: str
+    subblock_plan: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -166,7 +167,7 @@ def install(model: nn.Module, context: InstallContext) -> list[Installed]:
     serving loses only the block's optimization. CI fails on the same
     mismatch (``prototype.check_block`` and the conformance test).
     """
-    from vllm_torchtpu.blocks import attn_moe  # noqa: F401 - registers itself
+    from vllm_torchtpu.blocks import attn_moe, norm_attn  # noqa: F401 - register
 
     load_declarations()
     report = []
