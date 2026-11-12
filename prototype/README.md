@@ -232,7 +232,7 @@ warmup-gate tests, ported to the role-based forward:
 
 ## TPU results
 
-Qwen3.5-35B-A3B-FP8, one v7x host, TP 4 with expert parallelism, vLLM
+Qwen3.5-35B-A3B-FP8, one v6e host, TP 4 with expert parallelism, vLLM
 v0.33.0, cold compile caches. **default** is `origin/main`; **#1492** is
 `origin/main` with `TPU_ATTN_MOE_OVERLAP=1`; **block** is this branch's
 runtime code. The golden ran this runtime code; the throughput ran an earlier
