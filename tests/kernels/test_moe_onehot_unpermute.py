@@ -22,6 +22,7 @@ import pytest
 from jax._src.pallas.mosaic import tpu_info
 
 from vllm_torchtpu.kernels.megablox import moe_onehot_unpermute
+from vllm_torchtpu.kernels.megablox import moe_onehot_unpermute_admission as admission
 
 
 def _shape(shape, dtype):
@@ -74,12 +75,12 @@ def test_qwen35_target_shape_traces_on_cpu():
 def test_qwen35_target_shape_fits_explicit_vmem_budget():
     with _cpu_tpu7_registry():
         info = _tpu7_info()
-        explicit = moe_onehot_unpermute._explicit_vmem_bytes(
+        explicit = admission.explicit_vmem_bytes(
             route_capacity=2560,
             hidden_size=4096,
             num_tokens=256,
         )
-        estimated = explicit + moe_onehot_unpermute._VMEM_WORKSPACE_MARGIN_BYTES
+        estimated = explicit + admission.VMEM_WORKSPACE_MARGIN_BYTES
 
     assert explicit == 8409088
     assert estimated == 12603392

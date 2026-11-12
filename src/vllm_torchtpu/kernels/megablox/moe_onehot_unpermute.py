@@ -22,16 +22,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-_ROUTE_BLOCK_SIZE = 128
-_VMEM_WORKSPACE_MARGIN_BYTES = 4 * 1024 * 1024
+from vllm_torchtpu.kernels.megablox import moe_onehot_unpermute_admission as admission
 
-
-def _explicit_vmem_bytes(route_capacity: int, hidden_size: int, num_tokens: int) -> int:
-    """Size of the explicitly allocated VMEM buffers used by the kernel."""
-    owner_and_store = num_tokens * hidden_size * (4 + 2)
-    double_buffered_routes = 2 * _ROUTE_BLOCK_SIZE * hidden_size * 2
-    route_metadata = route_capacity * (4 + 4)
-    return owner_and_store + double_buffered_routes + route_metadata
+_ROUTE_BLOCK_SIZE = admission.ROUTE_BLOCK_SIZE
 
 
 def can_use_blockwise_onehot_unpermute(
@@ -43,33 +36,25 @@ def can_use_blockwise_onehot_unpermute(
     num_tokens: int,
 ) -> bool:
     """Return whether this one-hot shape satisfies kernel safety constraints."""
-    if route_output.ndim != 2 or route_output.dtype != jnp.bfloat16:
+    if not admission.shape_admits(
+        route_shape=route_output.shape,
+        route_dtype=route_output.dtype,
+        token_indices_shape=token_indices_sorted.shape,
+        token_indices_dtype=token_indices_sorted.dtype,
+        weights_shape=topk_weights_sorted.shape,
+        weights_dtype=topk_weights_sorted.dtype,
+        valid_count_shape=valid_count.shape,
+        valid_count_dtype=valid_count.dtype,
+    ):
         return False
     route_capacity, hidden_size = route_output.shape
-    if token_indices_sorted.shape != (route_capacity,):
-        return False
-    if token_indices_sorted.dtype != jnp.int32:
-        return False
-    if topk_weights_sorted.shape != (route_capacity,):
-        return False
-    if topk_weights_sorted.dtype != jnp.bfloat16:
-        return False
-    if valid_count.shape != (1,) or valid_count.dtype != jnp.int32:
-        return False
-
-    tpu_info = pltpu.get_tpu_info()
-    if route_capacity % _ROUTE_BLOCK_SIZE:
-        return False
-    if hidden_size % tpu_info.mxu_column_size:
-        return False
-    if num_tokens % tpu_info.get_sublane_tiling(route_output.dtype):
-        return False
-    vmem_limit_bytes = int(tpu_info.vmem_capacity_bytes * 0.9)
-    required_vmem_bytes = (
-        _explicit_vmem_bytes(route_capacity, hidden_size, num_tokens)
-        + _VMEM_WORKSPACE_MARGIN_BYTES
+    return admission.chip_admits(
+        route_capacity=route_capacity,
+        hidden_size=hidden_size,
+        num_tokens=num_tokens,
+        dtype=route_output.dtype,
+        chip=pltpu.get_tpu_info(),
     )
-    return required_vmem_bytes <= vmem_limit_bytes
 
 
 def _make_route_block_selector(
