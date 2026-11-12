@@ -29,6 +29,7 @@ from vllm_torchtpu import blocks
 from vllm_torchtpu.blocks.attn_moe import conform, forward
 from vllm_torchtpu.blocks.attn_moe import pattern as pattern_mod
 from vllm_torchtpu.blocks.attn_moe import plan as plan_mod
+from vllm_torchtpu.blocks.conformance import BlockConformanceError
 from vllm_torchtpu.blocks.stream import (
     attend_with_positions,
     hidden_residual_positions,
@@ -48,8 +49,8 @@ def test_every_declaration_conforms(spec: _build.Spec) -> None:
     assert any(m is parts.out_proj for m in parts.attention.modules())
 
 
-def test_mismatch_declines_at_install(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A declared layer that does not conform keeps its upstream forward."""
+def test_mismatch_raises_at_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A declared layer that does not conform raises, naming the edge."""
     layer = fixtures.ReorderedNorms(_build.build(_build.SPECS[0]))
     declaration = blocks.BlockDeclaration.of(
         fixtures.ReorderedNorms, fixtures.renamed_parts
@@ -60,10 +61,11 @@ def test_mismatch_declines_at_install(monkeypatch: pytest.MonkeyPatch) -> None:
         dtype=torch.bfloat16,
         buckets=(16, 8192),
     )
-    with set_current_vllm_config(_build.current_config()):
-        (item,) = blocks.install(nn.ModuleDict({"layer": layer}), context)
-    assert item.layer_class == fixtures.ReorderedNorms.__qualname__
-    assert type(layer) is fixtures.ReorderedNorms
+    with (
+        set_current_vllm_config(_build.current_config()),
+        pytest.raises(BlockConformanceError, match=r"post_norm .* fixtures\.py:\d+"),
+    ):
+        blocks.install(nn.ModuleDict({"layer": layer}), context)
 
 
 class _CpuRMSNorm(Qwen3_5RMSNorm):

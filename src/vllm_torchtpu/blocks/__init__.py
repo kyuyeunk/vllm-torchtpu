@@ -25,7 +25,7 @@ Ownership is split at the declaration:
   check, the block plan, the child-contract adapter and the block forward
   live here, in a shared package. A declaration that does not conform fails
   the merge-time check (``tests/blocks``), naming the role edge and source
-  line; at startup the layer is declined and keeps its upstream forward.
+  line, and raises at startup with the same message.
 
 ``install`` runs once after the weights load. For each module whose class is
 declared, it checks conformance, resolves the block's plan per compiled
@@ -193,16 +193,16 @@ def block_implementation(
 def install(model: nn.Module, context: InstallContext) -> list[Installed]:
     """Checks and installs every declared block in ``model``.
 
-    A layer that does not conform to its declared pattern is declined: it
-    keeps its upstream forward and its children keep their contracts, so
-    serving loses only the block's optimization. CI fails on the same
-    mismatch (``prototype.check_block`` and the conformance test).
+    A layer that does not conform to its declared pattern raises
+    ``BlockConformanceError`` naming the role edge and source line: a silent
+    decline would hide the bug. Where the rule's plan value cannot serve a
+    case, the plan falls back to the next capable value (debug log only); a
+    pinned value that cannot run raises in ``resolve_table``.
     """
     from vllm_torchtpu.blocks import attn_moe  # noqa: F401 - registers itself
 
     load_declarations()
     report = []
-    declined: set[type[Any]] = set()
     for name, module in list(model.named_modules()):
         declaration = DECLARATIONS.get(type(module))
         if declaration is None:
@@ -213,14 +213,10 @@ def install(model: nn.Module, context: InstallContext) -> list[Installed]:
                 continue
             report.append(impl.install(name, module, declaration, context))
         except BlockConformanceError as e:
-            cls = type(module)
-            if cls not in declined:
-                declined.add(cls)
-                logger.warning("block declined for %s: %s", cls.__qualname__, e)
-            report.append(Installed(name, cls.__qualname__, f"declined: {e}"))
-    counts: dict[str, int] = {}
+            cls = type(module).__qualname__
+            raise BlockConformanceError(f"{name} ({cls}): {e}") from e
     for item in report:
-        counts[item.outcome] = counts.get(item.outcome, 0) + 1
-    for outcome, count in sorted(counts.items()):
-        logger.info("block install: %d layer(s): %s", count, outcome)
+        logger.debug(
+            "block plan: %s (%s): %s", item.name, item.layer_class, item.outcome
+        )
     return report

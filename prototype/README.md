@@ -16,9 +16,9 @@ environment flag, and writing three children's decisions after they are built.
 |---|---|
 | The model owner declares, with a typed binding function | [`qwen3_5_block`](../src/vllm_torchtpu/models/vllm/qwen3_5/registration.py#L34-L62) in `qwen3_5/registration.py` (L34-L62); ten more models declare the same way, e.g. [`mixtral/registration.py`](../src/vllm_torchtpu/models/vllm/mixtral/registration.py) |
 | The declaration API and the installer | [`declare_block`](../src/vllm_torchtpu/blocks/__init__.py#L109-L125) in `__init__.py` (L109-L125) |
-|  | [`install`](../src/vllm_torchtpu/blocks/__init__.py#L193-L226) in `__init__.py` (L193-L226) |
-| A mismatch declines at startup: the layer keeps its upstream forward | the `except BlockConformanceError` in [`install`](../src/vllm_torchtpu/blocks/__init__.py#L215-L220) (L215-L220); shown by [`mismatch_declines`](../prototype/check_block.py#L160-L178) in `check_block.py` (L160-L178) |
-| CI fails on the same mismatch | [`conformance`](../prototype/check_block.py#L92-L104) in `check_block.py` (L92-L104), with `PLANT_MISMATCH` (L52-L53) declaring the misordered fixture; `test_mismatch_declines_at_install` in `tests/blocks/` |
+|  | [`install`](../src/vllm_torchtpu/blocks/__init__.py#L193-L222) in `__init__.py` (L193-L222) |
+| A declared mismatch raises at startup, naming the edge and line | the `raise BlockConformanceError` in [`install`](../src/vllm_torchtpu/blocks/__init__.py#L215-L217) (L215-L217); shown by [`mismatch_raises`](../prototype/check_block.py#L159-L177) in `check_block.py` (L159-L177) |
+| CI fails on the same mismatch | [`conformance`](../prototype/check_block.py#L91-L103) in `check_block.py` (L91-L103), with `PLANT_MISMATCH` (L51-L52) declaring the misordered fixture; `test_mismatch_raises_at_install` in `tests/blocks/` |
 | The pattern | [`attn_then_moe`](../src/vllm_torchtpu/blocks/attn_moe/pattern.py#L54-L67) in `pattern.py` (L54-L67) |
 | The parts a binding function returns, kinds checked when built | [`AttnMoEParts`](../src/vllm_torchtpu/blocks/attn_moe/pattern.py#L136-L197) in `pattern.py` (L136-L197) |
 | How the layer's forward and its attention are called, with no parameter name read | [`Stream`](../src/vllm_torchtpu/blocks/stream.py#L36-L52) in `stream.py` (L36-L52) |
@@ -32,7 +32,7 @@ environment flag, and writing three children's decisions after they are built.
 | The suggester proposes, never applies | [`propose`](../prototype/suggest_blocks.py#L84-L139) in `suggest_blocks.py` (L84-L139) |
 | Every declared layer's forward equals upstream on a CPU (TP 1) | [`check`](../prototype/forward_equivalence.py#L160-L189) and the stand-ins [`_stand_ins`](../prototype/forward_equivalence.py#L93-L144) in `forward_equivalence.py` |
 | Nemotron-H's layer is built on a CPU to be checked | [`_gated_experts_on_cpu`](../prototype/_build.py#L105-L131) in `_build.py` (L105-L131) |
-| An outside write raises | [`outside_write`](../prototype/check_block.py#L146-L157) in `check_block.py` (L146-L157) |
+| An outside write raises | [`outside_write`](../prototype/check_block.py#L145-L156) in `check_block.py` (L145-L156) |
 
 Here the model owner **declares** that its layer conforms to a pattern; the
 framework **checks** the declaration and **owns** what runs under it.
@@ -40,7 +40,7 @@ framework **checks** the declaration and **owns** what runs under it.
 ```mermaid
 flowchart LR
   D["models/vllm/qwen3_5/registration.py<br/>declare_block(...)<br/>(model owner)"] --> C{"conformance<br/>part kinds + graph<br/>vs the pattern"}
-  C -->|error: role edge + line| X["merge fails;<br/>startup declines"]
+  C -->|error: role edge + line| X["merge fails;<br/>startup raises"]
   C -->|parts| R{"plan per bucket<br/>user > model plan > rule > default"}
   R -->|all_reduce on every bucket| U["left as upstream built it"]
   R -->|overlap on some buckets| B["bind child contracts<br/>block forward"]
@@ -117,7 +117,8 @@ def attn_then_moe(hidden, residual, *, in_norm, attn, post_norm, moe):
 - **Plan.** `AttnMoEBlockPlan(collectives)`, resolved per compiled bucket:
   the user's `TPU_BLOCK_PLAN`, then the model plan (the model config's
   `tpu_block_plan`), then #1492's rule (overlap at 8 MiB of activations per
-  chip), then the default. A pinned value that cannot run raises at startup.
+  chip), then the default. A pinned value that cannot run raises at startup;
+  where the rule's value cannot run, it falls back quietly to the default.
 - **Child contracts.** `bind_child_contracts` is the one sanctioned place
   that sets the three child fields, once, at install; they are read-only
   afterwards.
@@ -172,16 +173,16 @@ the read-only guard. Output (warnings omitted):
 3 outside write raises after binding
     raised: TpuRowParallelLinear.reduce_results is decided by the attn_then_moe block plan; pin TPU_BLOCK_PLAN instead
   -> PASS
-4 a mismatch declines at install
-    ReorderedNorms: declined: declared attn_then_moe, but role post_norm runs after the block input at fixtures.py:70, where the pattern does not call it
+4 a declared mismatch raises at startup
+    raised: layer (ReorderedNorms): declared attn_then_moe, but role post_norm runs after the block input at fixtures.py:70, where the pattern does not call it
   -> PASS
 ```
 
-**A mismatch declines at startup and fails in CI.** At startup the runner keeps
-serving: a declared layer that does not conform keeps its upstream forward, its
-children keep their contracts, and one warning per class names the edge. The
-same mismatch fails CI: with `PLANT_MISMATCH = True` commented in, check 1
-treats the misordered fixture as a declared model and the command exits 1:
+**A declared mismatch fails CI and raises at startup.** A silent decline would
+hide the bug (a TPU device bug once made every layer decline silently), so a
+declared layer that does not conform stops startup with the edge and line.
+CI catches it first: with `PLANT_MISMATCH = True` commented in, check 1 treats
+the misordered fixture as a declared model and the command exits 1:
 
 ```text
 1 conformance: declared layers and planted fixtures
