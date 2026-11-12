@@ -36,7 +36,7 @@ from vllm_torchtpu.compilation import shape_variants
 def test_every_declaration_conforms(spec: _build.Spec) -> None:
     layer = _build.build(spec)
     blocks.load_declarations()
-    declaration = blocks.DECLARATIONS[type(layer)]
+    declaration = blocks.DECLARATIONS[(type(layer), pattern_mod.attn_then_moe)]
     assert declaration.when(layer)
     with set_current_vllm_config(_build.current_config()):
         roles = conform(layer, declaration)
@@ -52,7 +52,11 @@ def test_mismatch_declines_at_install(monkeypatch: pytest.MonkeyPatch) -> None:
         fixtures.RENAMED_ROLES,
         lambda _: True,
     )
-    monkeypatch.setitem(blocks.DECLARATIONS, fixtures.ReorderedNorms, declaration)
+    monkeypatch.setitem(
+        blocks.DECLARATIONS,
+        (fixtures.ReorderedNorms, pattern_mod.attn_then_moe),
+        declaration,
+    )
     context = blocks.InstallContext(
         tp=4,
         dtype="bfloat16",

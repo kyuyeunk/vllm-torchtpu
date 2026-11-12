@@ -52,7 +52,7 @@ PLANT_MISMATCH = False
 
 def _declared(layer: nn.Module) -> BlockDeclaration:
     blocks.load_declarations()
-    return blocks.DECLARATIONS[type(layer)]
+    return blocks.DECLARATIONS[(type(layer), attn_then_moe)]
 
 
 def _cases() -> list[tuple[str, nn.Module, BlockDeclaration, bool]]:
@@ -150,7 +150,7 @@ def outside_write() -> list[str]:
 
 def mismatch_declines() -> list[str]:
     layer = fixtures.ReorderedNorms(_build.build(_build.SPECS[0]))
-    blocks.DECLARATIONS[fixtures.ReorderedNorms] = BlockDeclaration(
+    blocks.DECLARATIONS[(fixtures.ReorderedNorms, attn_then_moe)] = BlockDeclaration(
         fixtures.ReorderedNorms, attn_then_moe, fixtures.RENAMED_ROLES, lambda _: True
     )
     context = blocks.InstallContext(
@@ -162,7 +162,7 @@ def mismatch_declines() -> list[str]:
     )
     with set_current_vllm_config(_build.current_config()):
         (item,) = blocks.install(nn.ModuleDict({"layer": layer}), context)
-    del blocks.DECLARATIONS[fixtures.ReorderedNorms]
+    del blocks.DECLARATIONS[(fixtures.ReorderedNorms, attn_then_moe)]
     print(f"    {item.layer_class}: {item.outcome}")
     if not item.outcome.startswith("declined: ") or hasattr(layer, "_block_roles"):
         return ["the mismatched layer was not declined"]

@@ -29,6 +29,9 @@ Ownership is split at the declaration:
 declared, it checks conformance, resolves the block's plan per compiled
 bucket, and installs the block's forward where the plan needs it. Layers
 whose plan is the default are left as upstream built them.
+
+Scopes nest, so one decoder class may declare several patterns: a block
+(``attn_then_moe``) and a sub-block inside it (``norm_then_attention``).
 """
 
 import dataclasses
@@ -75,7 +78,12 @@ class BlockDeclaration:
         return bound
 
 
-DECLARATIONS: dict[type, BlockDeclaration] = {}
+DECLARATIONS: dict[tuple[type, Callable[..., Any]], BlockDeclaration] = {}
+
+
+def declarations_for(layer_class: type) -> list[BlockDeclaration]:
+    """Every pattern ``layer_class`` is declared to conform to."""
+    return [d for (cls, _), d in DECLARATIONS.items() if cls is layer_class]
 
 
 def declare_block(
@@ -86,9 +94,12 @@ def declare_block(
     when: Callable[[nn.Module], bool] = lambda layer: True,
 ) -> None:
     """Declares that ``layer_class`` conforms to ``pattern`` (model owner's API)."""
-    if layer_class in DECLARATIONS:
-        raise ValueError(f"{layer_class.__qualname__} is already declared")
-    DECLARATIONS[layer_class] = BlockDeclaration(layer_class, pattern, roles, when)
+    key = (layer_class, pattern)
+    if key in DECLARATIONS:
+        raise ValueError(
+            f"{layer_class.__qualname__} is already declared for {pattern.__name__}"
+        )
+    DECLARATIONS[key] = BlockDeclaration(layer_class, pattern, roles, when)
 
 
 def load_declarations() -> None:
@@ -159,20 +170,20 @@ def install(model: nn.Module, context: InstallContext) -> list[Installed]:
 
     load_declarations()
     report = []
-    declined: set[type[Any]] = set()
+    declined: set[tuple[type[Any], str]] = set()
     for name, module in list(model.named_modules()):
-        declaration = DECLARATIONS.get(type(module))
-        if declaration is None or not declaration.when(module):
-            continue
-        impl = IMPLEMENTATIONS[declaration.pattern]
-        try:
-            report.append(impl.install(name, module, declaration, context))
-        except BlockConformanceError as e:
-            cls = type(module)
-            if cls not in declined:
-                declined.add(cls)
-                logger.warning("block declined for %s: %s", cls.__qualname__, e)
-            report.append(Installed(name, cls.__qualname__, f"declined: {e}"))
+        cls = type(module)
+        for declaration in declarations_for(cls):
+            if not declaration.when(module):
+                continue
+            impl = IMPLEMENTATIONS[declaration.pattern]
+            try:
+                report.append(impl.install(name, module, declaration, context))
+            except BlockConformanceError as e:
+                if (cls, declaration.pattern.__name__) not in declined:
+                    declined.add((cls, declaration.pattern.__name__))
+                    logger.warning("block declined for %s: %s", cls.__qualname__, e)
+                report.append(Installed(name, cls.__qualname__, f"declined: {e}"))
     counts: dict[str, int] = {}
     for item in report:
         counts[item.outcome] = counts.get(item.outcome, 0) + 1
