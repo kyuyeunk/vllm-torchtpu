@@ -14,9 +14,10 @@
 """Qwen3.5's block declarations. Owned by the Qwen3.5 model owner.
 
 The MoE decoder layer conforms to attn_then_moe. Full-attention layers bind
-``self_attn``, linear-attention (Gated DeltaNet) layers ``linear_attn``. What
-runs under the declaration (the overlap plan, its rule and the block forward)
-is the framework's.
+``self_attn``, linear-attention (Gated DeltaNet) layers ``linear_attn``.
+Full-attention layers' front half also conforms to norm_then_attention, the
+sub-block nested in the block. What runs under the declarations (the plans,
+their rules and the forwards) is the framework's.
 """
 
 from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
@@ -24,6 +25,7 @@ from vllm.model_executor.models.qwen3_next import Qwen3NextSparseMoeBlock
 
 from vllm_torchtpu.blocks import declare_block
 from vllm_torchtpu.blocks.attn_moe.pattern import attn_then_moe
+from vllm_torchtpu.blocks.norm_attn.pattern import norm_then_attention
 
 declare_block(
     Qwen3_5DecoderLayer,
@@ -36,4 +38,16 @@ declare_block(
     },
     # Dense Qwen3.5 builds the same class with an MLP.
     when=lambda layer: isinstance(layer.mlp, Qwen3NextSparseMoeBlock),
+)
+
+declare_block(
+    Qwen3_5DecoderLayer,
+    pattern=norm_then_attention,
+    roles={
+        "in_norm": "input_layernorm",
+        "attn": "self_attn",
+        "post_norm": "post_attention_layernorm",
+        "mlp": "mlp",
+    },
+    when=lambda layer: layer.layer_type == "full_attention",
 )
