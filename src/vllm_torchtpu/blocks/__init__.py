@@ -127,6 +127,10 @@ class InstallContext:
     subblock_plan: str = ""
     # The chip's `pltpu.ChipVersion` value; empty off-TPU (no chip facts).
     chip: str = ""
+    # vLLM's KV cache dtype (``cache_dtype``); empty when unknown. The TPU
+    # runner leaves it empty while the fused value is the plain-torch
+    # reference, which writes no KV cache; a kernel build passes it.
+    kv_cache_dtype: str = ""
 
 
 @dataclasses.dataclass(frozen=True)

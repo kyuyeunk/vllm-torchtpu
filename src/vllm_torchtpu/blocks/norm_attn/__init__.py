@@ -436,24 +436,13 @@ class NormThenAttention:
             return Installed(name, cls.__qualname__, "already installed")
         roles = conform(layer, declaration)
         attention = layer.get_submodule(roles.attention)
-        first, pinned = plan_mod.resolve(context.subblock_plan, attention)
-        declined: list[str] = []
-        for plan in plan_mod.candidates(first):
-            if any(getattr(plan, f) != getattr(first, f) for f in pinned):
-                continue  # A fallback never moves a field the user pinned.
-            why = None
-            if plan.input_proj == "fused_qkv":
-                why = plan_mod.fused_qkv_supports(
-                    attention, matmul=plan.matmul, chip=context.chip
-                )
-            if why is None:
-                break
-            declined.append(f"{plan.input_proj}/{plan.matmul} declined: {why}")
-        else:  # Every value the pins allow is declined: stop at startup.
-            pins = ",".join(f"{f}={getattr(first, f)}" for f in sorted(pinned))
-            raise ValueError(
-                f"TPU_SUBBLOCK_PLAN {pins} on {cls.__qualname__}: {declined[0]}"
-            )
+        plan, pinned, declined = plan_mod.choose(
+            context.subblock_plan,
+            attention,
+            chip=context.chip,
+            kv_cache_dtype=context.kv_cache_dtype,
+            where=cls.__qualname__,
+        )
         for item in declined:  # The rule's value fell back: quiet.
             logger.debug("%s: %s", name, item)
         runner = build_runner(name, layer, roles, plan.input_proj, FUSED_OP)

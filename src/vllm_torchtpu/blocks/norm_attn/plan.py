@@ -42,6 +42,8 @@ InputProj = Literal["unfused", "fused_qkv"]
 # activations (#3096's fp8 variant), or bf16 weights (its bf16 variant; FP8
 # weights are dequantized once at load). Unfused ignores it.
 Matmul = Literal["fp8", "bf16"]
+# vLLM's ``cache_dtype`` values that name an e4m3 KV cache.
+FP8_KV_CACHE = frozenset({"fp8", "fp8_e4m3"})
 
 
 @plan_of("blocks.norm_then_attention")
@@ -75,6 +77,7 @@ def fused_qkv_supports(
     *,
     matmul: Matmul = "bf16",
     chip: str = "",
+    kv_cache_dtype: str = "",
     head_dim: int | None = None,
     num_heads: int | None = None,
     num_kv_heads: int | None = None,
@@ -88,14 +91,16 @@ def fused_qkv_supports(
     Head sizes may be given (a shrunk layer's are not the model's). Facts
     only the platform knows are checked when the kernel is built on it:
     the batched-RPA attention backend (``layers/adapter/fused_attn_proj.py:242``),
-    an FP8 KV cache and bf16 queries (``gqa/config.py:142-143``),
-    weights stored (K, N) (``fused_attn_proj.py:101``) and no DCP (``:244``).
+    bf16 queries (``gqa/config.py:142``), weights stored (K, N)
+    (``fused_attn_proj.py:101``) and no DCP (``:244``).
     A ``layer_scale`` or sequence-parallel layer (``fused_attn_proj.py:457-459``)
     fails this pattern's conformance check instead.
 
     The chip is the third description, after the model's and the kernel's:
     the fp8 variant needs FP8 matmul (``chip`` is a `pltpu.ChipVersion`
     value; empty off-TPU, where only the model and the kernel are checked).
+    ``kv_cache_dtype`` is the platform's KV cache setting (vLLM's
+    ``cache_dtype``); empty when unknown, which skips its condition.
     """
     inner = [m for m in attention.modules() if m is not attention]
     # Sinks need RPA v3's kernel; fused_qkv writes the batched-RPA layout
@@ -123,6 +128,13 @@ def fused_qkv_supports(
                 f"{name} is {type(norm).__name__} (a norm over the whole projection); "
                 "fused_qkv fuses a per-head RMSNorm"
             )
+        weight = getattr(norm, "weight", None)
+        if weight is not None and head_dim and weight.numel() != head_dim:
+            return (
+                f"{name} normalizes {weight.numel()} values (a TP-wide norm over "
+                f"the whole projection); fused_qkv fuses a per-head RMSNorm over "
+                f"{head_dim}"
+            )
     rotary = getattr(attention, "rotary_emb", None)
     # The kernel rotates NeoX-style pairs only (common/model_config.py:59-71,
     # common/rope.py:17); #3096's adapter does not check this.
@@ -133,6 +145,9 @@ def fused_qkv_supports(
     # fused_attn_proj.py:88-103: unquantized or per-channel FP8 only.
     if qkv is not None and not ("Unquantized" in method or "Fp8" in method):
         return f"qkv_proj quantized by {method}"
+    # gqa/config.py:143: the kernel writes an FP8 (e4m3) KV cache only.
+    if kv_cache_dtype and kv_cache_dtype not in FP8_KV_CACHE:
+        return f"KV cache {kv_cache_dtype}; fused_qkv writes an FP8 (e4m3) KV cache"
     if matmul == "fp8" and not _fp8_weights(attention):
         return "the fp8 variant needs FP8 weights; qkv_proj's are not"
     # quantized_matmul.py:111-112 and :164 run an fp8 x fp8 dot on any chip;
@@ -162,3 +177,38 @@ def resolve(override: str, attention: nn.Module) -> tuple[NormAttnPlan, frozense
                 f"{list(get_args(allowed[key]))}"
             )
     return dataclasses.replace(plan, **pins), frozenset(pins)
+
+
+def choose(
+    override: str,
+    attention: nn.Module,
+    *,
+    chip: str = "",
+    kv_cache_dtype: str = "",
+    where: str = "",
+) -> tuple[NormAttnPlan, frozenset[str], list[str]]:
+    """The first value the pins allow that ``fused_qkv``'s capability accepts.
+
+    Returns:
+        The plan, the fields the user pinned, and why each faster value was
+        declined (the rule's value falling back is quiet).
+
+    Raises:
+        ValueError: Every value the pins allow is declined: a pin that
+            cannot run stops startup.
+    """
+    first, pinned = resolve(override, attention)
+    declined: list[str] = []
+    for plan in candidates(first):
+        if any(getattr(plan, f) != getattr(first, f) for f in pinned):
+            continue  # A fallback never moves a field the user pinned.
+        why = None
+        if plan.input_proj == "fused_qkv":
+            why = fused_qkv_supports(
+                attention, matmul=plan.matmul, chip=chip, kv_cache_dtype=kv_cache_dtype
+            )
+        if why is None:
+            return plan, pinned, declined
+        declined.append(f"{plan.input_proj}/{plan.matmul} declined: {why}")
+    pins = ",".join(f"{f}={getattr(first, f)}" for f in sorted(pinned))
+    raise ValueError(f"TPU_SUBBLOCK_PLAN {pins} on {where}: {declined[0]}")
