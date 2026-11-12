@@ -146,20 +146,28 @@ def plan(
 
 
 _V3 = plan(Combine.EP_RAGGED_SC, GatherReduceVersion.V3)
+_V1 = plan(Combine.EP_RAGGED_SC, GatherReduceVersion.V1)
 _ONEHOT = plan(Combine.EP_ONEHOT)
+
+# Comment in to replay the EP kernel chosen at import time, not by the plan.
+REPLAY_IMPORT_TIME_KERNEL = False
+# REPLAY_IMPORT_TIME_KERNEL = True
 
 # Findings, kept as a ratchet: each must still appear, and nothing else may.
 KNOWN = {
-    # The EP gather-reduce kernel is chosen at import time, so the plan's
-    # version never reaches it: the version field is unread, and EP v3 runs
-    # (and compiles) as the import-time kernel even where v3 is declined.
-    *(Finding(Kind.UNREAD, chip, field="ep_gather_reduce_version") for chip in CHIPS),
-    *(Finding(Kind.COMPILES, V6E, s.name, _V3) for s in SHAPES),
+    # EP v3 at top-1: declared capable (local v3 checks topk >= 2, EP v3 does
+    # not), but its route-pair metadata fails to trace.
+    Finding(Kind.FAILS, TPU7X, TP_T2048_K1.name, _V3),
     # The input facts allow more second-GMM rows than routes, but the one-hot
-    # combine contracts over routes, so it fails to compile on a padded output.
-    *(Finding(Kind.FAILS, chip, EP_T16_PAD.name, _ONEHOT) for chip in CHIPS),
-    # v3 is declared BF16-only, yet local v3 compiles with FP32 input; only a
-    # TPU7x run can show whether it fails or rounds.
+    # combine contracts over routes, and it and the v1 gather-reduce kernel
+    # both fail to compile on a padded output.
+    *(
+        Finding(Kind.FAILS, chip, EP_T16_PAD.name, p)
+        for chip in CHIPS
+        for p in (_ONEHOT, _V1)
+    ),
+    # v3 is declared BF16-only, yet local and EP v3 compile with FP32 input;
+    # only a TPU7x run can show whether they fail or round.
     Finding(Kind.COMPILES, TPU7X, TP_T64_F32.name, _V3),
     *(
         Finding(
@@ -173,6 +181,17 @@ KNOWN = {
     # The v3 kernel derives its own token alignment, so on the one chip where
     # local v3 runs, every alignment compiles to the same program.
     Finding(Kind.UNREAD, TPU7X, field="local_v3_token_alignment"),
+}
+
+KNOWN_V3_TOP1 = Finding(Kind.FAILS, TPU7X, TP_T2048_K1.name, _V3)
+PADDED_V1 = {Finding(Kind.FAILS, chip, EP_T16_PAD.name, _V1) for chip in CHIPS}
+
+# With the replay, the version is unread again, EP v3 runs as the
+# import-time kernel even where v3 is declined, and EP v1 is the import-time
+# kernel too, so it no longer fails on the padded output.
+REPLAYED = {
+    *(Finding(Kind.UNREAD, chip, field="ep_gather_reduce_version") for chip in CHIPS),
+    *(Finding(Kind.COMPILES, V6E, s.name, _V3) for s in SHAPES),
 }
 
 
@@ -246,6 +265,12 @@ def _lines(findings: set[Finding]) -> list[str]:
 def main() -> None:
     """Prints the findings and checks them against `KNOWN`."""
     start = time.perf_counter()
+    known = KNOWN
+    if REPLAY_IMPORT_TIME_KERNEL:
+        fused_moe_gmm._ep_gather_reduce = (  # noqa: SLF001 - the replay's seam
+            lambda version: fused_moe_gmm.ragged_gather_reduce
+        )
+        known = (KNOWN - {KNOWN_V3_TOP1, *PADDED_V1}) | REPLAYED
     findings = check_structure(
         entry,
         cases,
@@ -258,8 +283,8 @@ def main() -> None:
     for line in _lines(findings):
         print(line)
     print(f"findings: {len(findings)} in {time.perf_counter() - start:.0f} s")
-    assert findings == KNOWN, (
-        f"new: {_lines(findings - KNOWN)}, gone: {_lines(KNOWN - findings)}"
+    assert findings == known, (
+        f"new: {_lines(findings - known)}, gone: {_lines(known - findings)}"
     )
 
 

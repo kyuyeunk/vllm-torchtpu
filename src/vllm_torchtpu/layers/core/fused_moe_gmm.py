@@ -619,6 +619,23 @@ def resolve_combine_plan(
     return moe_plan.plan_combine(process, op, out, target, owner_output=owner_output)
 
 
+def _ep_gather_reduce(version: moe_plan.GatherReduceVersion | None):
+    if version is None:
+        raise ValueError("an EP gather-reduce combine needs a kernel version")
+    # The import-time selection serves the configured version, so tests that
+    # patch it still steer the combine; an overriding plan may name another.
+    if version is _EP_GATHER_REDUCE_VERSION:
+        return ragged_gather_reduce
+    # Looked up at call time, so tests that patch a kernel name still steer it.
+    match version:
+        case moe_plan.GatherReduceVersion.V1:
+            return ragged_gather_reduce_v1
+        case moe_plan.GatherReduceVersion.V2:
+            return ragged_gather_reduce_v2
+        case moe_plan.GatherReduceVersion.V3:
+            return ragged_gather_reduce_v3
+
+
 def moe_combine(
     gmm2_res: jax.Array,
     group_sizes: jax.Array,
@@ -704,7 +721,7 @@ def moe_combine(
             )
             return (combine @ gmm2_res).astype(out_dtype)
         case Combine.EP_RAGGED_SC | Combine.EP_RAGGED_TC_FALLBACK:
-            return ragged_gather_reduce(
+            return _ep_gather_reduce(plan.ep_gather_reduce_version)(
                 gmm2_res,
                 argsort_revert_indices,
                 topk_weights_flat,
