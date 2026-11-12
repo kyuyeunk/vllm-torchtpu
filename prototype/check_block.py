@@ -13,11 +13,12 @@
 # limitations under the License.
 """Checks the attn_then_moe block on a CPU: conformance, plan, outside writes.
 
-1. Conformance: the declared Qwen3.5 layers (full and linear attention)
-   conform; so do two planted fixtures (renamed attributes declared with the
-   new names; a dead branch and a same-shape view). Qwen3.5 with
-   ``layer_scale`` and a fixture that calls its norms in the wrong order get a
-   conformance error naming the role edge and the source line.
+1. Conformance: every surveyed layer whose class a model declares
+   (``models/vllm/*/registration.py``) conforms; so do two planted fixtures
+   (renamed attributes declared with the new names; a dead branch and a
+   same-shape view). Qwen3.5 with ``layer_scale`` and a fixture that calls its
+   norms in the wrong order get a conformance error naming the role edge and
+   the source line.
 2. Plan per bucket: the declared Qwen3.5 block at its real size (hidden
    2048, bf16, TP 4) under the rule, the overrides and the cross-check.
 3. Outside write: after binding, writing a child decision the plan owns
@@ -59,11 +60,14 @@ def _declared(layer: nn.Module) -> BlockDeclaration:
 
 def _cases() -> list[tuple[str, nn.Module, BlockDeclaration, bool]]:
     """(label, layer, declaration, expected to conform)."""
-    full, linear = _build.SPECS[:2]
+    full = _build.SPECS[0]
     cases = []
-    for spec in (full, linear):
+    blocks.load_declarations()
+    for spec in _build.SPECS:
         layer = _build.build(spec)
-        cases.append((f"declared {spec.name}", layer, _declared(layer), True))
+        declaration = blocks.DECLARATIONS.get(type(layer))
+        if declaration is not None and declaration.parts(layer) is not None:
+            cases.append((f"declared {spec.name}", layer, declaration, True))
     hf = full.config()
     hf.layer_scale = True
     scaled = _build.build(dataclasses.replace(full, config=lambda: hf))

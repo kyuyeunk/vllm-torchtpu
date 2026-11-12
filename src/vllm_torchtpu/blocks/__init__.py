@@ -24,8 +24,8 @@ Ownership is split at the declaration:
 - **The framework runs what is declared.** The pattern, the conformance
   check, the block plan, the child-contract adapter and the block forward
   live here, in a shared package. A declaration that does not conform fails
-  the merge-time check (``tests/blocks``) and the startup install, with the
-  role edge and source line.
+  the merge-time check (``tests/blocks``), naming the role edge and source
+  line; at startup the layer is declined and keeps its upstream forward.
 
 ``install`` runs once after the weights load. For each module whose class is
 declared, it checks conformance, resolves the block's plan per compiled

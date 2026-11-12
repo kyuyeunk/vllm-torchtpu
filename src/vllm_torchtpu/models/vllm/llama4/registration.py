@@ -1,0 +1,43 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Llama 4's block declarations. Owned by the Llama 4 model owner.
+
+The MoE decoder layer conforms to attn_then_moe. Layers off
+``interleave_moe_layer_step`` build an MLP instead. What runs under the
+declaration is the framework's.
+"""
+
+from vllm.model_executor.models.llama4 import Llama4DecoderLayer, Llama4MoE
+
+from vllm_torchtpu.blocks import declare_block
+from vllm_torchtpu.blocks.attn_moe.pattern import AttnMoEParts, pre_norm_moe_parts
+from vllm_torchtpu.blocks.stream import attend_with_positions, positions_first
+
+
+@declare_block(Llama4DecoderLayer)
+def llama4_block(layer: Llama4DecoderLayer) -> AttnMoEParts | None:
+    """The attention-then-MoE block (attn_then_moe), on the MoE layers."""
+    if not isinstance(layer.feed_forward, Llama4MoE):  # A dense layer.
+        return None
+    attention, moe = layer.self_attn, layer.feed_forward
+    return pre_norm_moe_parts(
+        layer,
+        attention,
+        attention.o_proj,
+        moe,
+        router=moe.router,
+        experts=moe.experts,
+        stream=positions_first(layer),
+        attend=attend_with_positions(attention),
+    )
