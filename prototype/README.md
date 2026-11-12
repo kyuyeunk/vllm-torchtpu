@@ -1,8 +1,6 @@
-# Prototype: the MoE decision module
+**Decisions group** (`prototype/decisions/`). Backs DATA_CONTRACTS.md section 6 (the MoE decision module built with today's rules, and the six places that still decide the combine), section 7's "one table per family" row, and Appendix A.7. Siblings: `prototype/decisions/moe-combine`.
 
-Backs DATA_CONTRACTS.md section 6 (the MoE decision module built with today's rules, and the
-six places that still decide the combine), section 7's "one table per family" row, and
-Appendix A.7.
+# Prototype: the MoE decision module
 
 Today `moe_gmm` and its helpers choose MoE kernel paths inline: which sort, which permute, which
 combine, and which kernel fallback, each from environment reads and chip queries made in the middle
@@ -134,6 +132,6 @@ divisible by 3, and every alignment is 64 times a power of two.
 - **The fused MoE custom op with static configuration**, the enforcement checks and their
   baselines: on the production-style build, not here.
 - **`GmmOutSpec.rows` still restates the routed-row count** here, as on the production-style build;
-  the combine prototypes (`prototype/combine-plan` and its stack) replace it with `GmmOut`, which
+  the combine prototypes (`prototype/decisions/moe-combine`) replace it with `GmmOut`, which
   derives the count.
 - Production would also need the existing test suite updated for the new call shapes.
