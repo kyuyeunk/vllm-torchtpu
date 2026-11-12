@@ -1,7 +1,8 @@
 # Prototype: the plan check on the full MoE decision module
 
-Backs DATA_CONTRACTS.md section 5.8 (the plan-invariance check, its two tiers) and Table 13
-(what the check found on the MoE combine).
+**Checks group** (`prototype/checks/`). Backs DATA_CONTRACTS.md section 5.8 (the plan-invariance
+check, its two tiers) and Table 13 (what the check found on the MoE combine). Siblings:
+`prototype/checks/hierarchy`, `prototype/checks/reach-in-lints`.
 
 This branch is [`prototype/decisions/centralized-moe-plan`](https://github.com/kyuyeunk/vllm-torchtpu/tree/prototype/decisions/centralized-moe-plan)
 (`a64038a6a`: today's MoE rules gathered into pure modules, with the full three-field
