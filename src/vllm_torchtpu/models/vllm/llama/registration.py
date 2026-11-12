@@ -18,6 +18,7 @@ from vllm.model_executor.models.llama import LlamaAttention, LlamaDecoderLayer
 from vllm_torchtpu.blocks import declare_block
 from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnParts, pre_norm_parts
 from vllm_torchtpu.blocks.parts import as_kind
+from vllm_torchtpu.blocks.stream import positions_first
 
 
 @declare_block(LlamaDecoderLayer)
@@ -28,5 +29,9 @@ def llama_attention(layer: LlamaDecoderLayer) -> NormAttnParts:
     so the binding names the class it covers.
     """
     return pre_norm_parts(
-        layer, as_kind(layer.self_attn, LlamaAttention), output_gate=False
+        layer,
+        as_kind(layer.self_attn, LlamaAttention),
+        qk_norm=None,
+        output_gate=False,
+        stream=positions_first(layer),
     )

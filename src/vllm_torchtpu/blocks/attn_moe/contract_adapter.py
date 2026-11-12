@@ -37,9 +37,13 @@ instead of holding the router.
 """
 
 import dataclasses
-from typing import Any
+from typing import override
 
 from torch import nn
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+from vllm.model_executor.layers.linear import RowParallelLinear
+
+from vllm_torchtpu.blocks.parts import as_kind
 
 
 @dataclasses.dataclass(frozen=True)
@@ -52,6 +56,8 @@ class ChildContracts:
 
 @dataclasses.dataclass(frozen=True)
 class LedgerEntry:
+    """A ledger line: one write the adapter made, and who decided it."""
+
     layer: str
     child: str
     field: str
@@ -62,43 +68,49 @@ class LedgerEntry:
 
 LEDGER: list[LedgerEntry] = []
 
-_guarded: dict[type, type] = {}
+_guarded: dict[tuple[type, str], type] = {}
 
 
 class BlockContractError(AttributeError):
     """A child decision owned by a block plan was written after binding."""
 
 
-def _guarded_class(base: type) -> type:
-    """``base`` with the block-owned fields made read-only."""
+def _guarded_class(base: type, field: str) -> type:
+    """``base`` with ``field`` made read-only (the block plan decided it)."""
 
-    class Guarded(base):
-        def __setattr__(self, name: str, value: Any) -> None:  # noqa: ANN401
-            if name in getattr(self, "_block_owned", ()):
-                raise BlockContractError(
-                    f"{type(self).__qualname__}.{name} is decided by the "
-                    f"{self._block_owner} block plan; pin TPU_BLOCK_PLAN instead"
+    class Guarded(base):  # pyright: ignore[reportUntypedBaseClass] - the child's own class
+        @override
+        def __setattr__(self, name: str, value: object) -> None:
+            # Python's attribute protocol hands the name over as a string.
+            if name == field:  # str-ok: the guarded attribute's own name
+                msg = (
+                    f"{base.__qualname__}.{name} is decided by the "
+                    "attn_then_moe block plan; pin TPU_BLOCK_PLAN instead"
                 )
-            super().__setattr__(name, value)
+                raise BlockContractError(msg)
+            super().__setattr__(name, value)  # pyright: ignore[reportUnknownMemberType] - the child's own __setattr__
 
     Guarded.__name__ = base.__name__
     Guarded.__qualname__ = base.__qualname__
     return Guarded
 
 
-def _guard(obj: Any, fields: tuple[str, ...], owner: str) -> None:  # noqa: ANN401
-    """Makes ``fields`` of ``obj`` read-only by rebinding its class."""
-    base = type(obj)
-    if base not in _guarded:
-        _guarded[base] = _guarded_class(base)
-    object.__setattr__(obj, "_block_owned", fields)
-    object.__setattr__(obj, "_block_owner", owner)
-    obj.__class__ = _guarded[base]
+def _guard(obj: object, field: str) -> None:
+    """Makes ``obj.field`` read-only by rebinding its class."""
+    key = (type(obj), field)
+    if key not in _guarded:
+        _guarded[key] = _guarded_class(*key)
+    obj.__class__ = _guarded[key]
+
+
+def _render(value: object) -> str:
+    """A module by its class (its repr is its whole tree); a flag by its repr."""
+    return type(value).__name__ if isinstance(value, nn.Module) else repr(value)
 
 
 def bind_child_contracts(
     layer_name: str,
-    out_proj: nn.Module | None,
+    out_proj: RowParallelLinear | None,
     experts: nn.Module,
     contracts: ChildContracts,
     source: str,
@@ -114,37 +126,28 @@ def bind_child_contracts(
         contracts: What the plan resolved for the children.
         source: Which plan source decided, for the ledger.
     """
-    moe_config = experts.moe_config
-    writes = [
-        (
-            "experts",
-            experts,
-            "gate",
-            experts.gate if contracts.experts_hold_router else None,
-        ),
-        (
-            "moe_config",
-            moe_config,
-            "skip_final_all_reduce",
-            not contracts.experts_reduce,
-        ),
-    ]
-    if out_proj is not None:  # The model's attention reduces unless told not to.
-        writes.append(("out_proj", out_proj, "reduce_results", False))
-    for child, obj, field, value in writes:
-        before = getattr(obj, field)
-        setattr(obj, field, value)
+    runner = as_kind(experts, MoERunner)
+    moe_config = runner.moe_config
+
+    def record(child: str, field: str, *, before: object, after: object) -> None:
         LEDGER.append(
             LedgerEntry(
-                layer_name,
-                child,
-                field,
-                type(before).__name__ if field == "gate" else repr(before),
-                type(value).__name__ if field == "gate" else repr(value),
-                source,
+                layer_name, child, field, _render(before), _render(after), source
             )
         )
+
+    gate = runner.gate
+    runner.gate = gate if contracts.experts_hold_router else None
+    record("experts", "gate", before=gate, after=runner.gate)
+    skip = moe_config.skip_final_all_reduce
+    moe_config.skip_final_all_reduce = not contracts.experts_reduce
+    after = not contracts.experts_reduce
+    record("moe_config", "skip_final_all_reduce", before=skip, after=after)
+    if out_proj is not None:  # The model's attention reduces unless told not to.
+        reduces = out_proj.reduce_results
+        out_proj.reduce_results = False
+        record("out_proj", "reduce_results", before=reduces, after=False)
     if out_proj is not None:
-        _guard(out_proj, ("reduce_results",), "attn_then_moe")
-    _guard(experts, ("gate",), "attn_then_moe")
-    _guard(moe_config, ("skip_final_all_reduce",), "attn_then_moe")
+        _guard(out_proj, "reduce_results")
+    _guard(runner, "gate")
+    _guard(moe_config, "skip_final_all_reduce")

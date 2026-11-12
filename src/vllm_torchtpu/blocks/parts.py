@@ -34,7 +34,7 @@ kind error as ``field=attribute is ...``.
 """
 
 from collections.abc import Callable
-from typing import Any, ClassVar
+from typing import ClassVar
 
 from torch import nn
 
@@ -48,17 +48,18 @@ class BlockParts:
     implement ``layer_children`` and ``problems``.
     """
 
-    pattern: ClassVar[Callable[..., Any]]
+    pattern: ClassVar[Callable[..., object]]
 
     def layer_children(self) -> dict[str, nn.Module]:
         """The parts that are direct children of the decoder layer, by field."""
         raise NotImplementedError
 
-    def problems(self) -> list[tuple[str, str]]:
-        """(field, why) for each part that is not its field's kind."""
+    def problems(self) -> list[tuple[str, object, str]]:
+        """(field, part, why) for each part that is not its field's kind."""
         raise NotImplementedError
 
     def __post_init__(self) -> None:
+        """Checks every part's kind as the dataclass is built."""
         if problems := self.problems():
             raise PartsKindError(self, problems)
 
@@ -66,22 +67,33 @@ class BlockParts:
 class PartsKindError(BlockConformanceError):
     """A part of the wrong kind, raised as the parts dataclass is built."""
 
-    def __init__(self, parts: BlockParts, problems: list[tuple[str, str]]) -> None:
-        self.parts = parts
-        self.problems = problems
+    def __init__(
+        self, parts: BlockParts, problems: list[tuple[str, object, str]]
+    ) -> None:
+        """Keeps references to the parts; creates no parameter."""
+        self.parts: BlockParts = parts
+        self.problems: list[tuple[str, object, str]] = problems
         super().__init__(self.describe(None))
 
     def describe(self, layer: nn.Module | None) -> str:
         """The problems, each part named by its attribute on ``layer`` if given."""
-        words = []
-        for field, why in self.problems:
-            part = getattr(self.parts, field, None)
+        words: list[str] = []
+        for field, part, why in self.problems:
             where = field
             if layer is not None and isinstance(part, nn.Module):
-                found = [n for n, m in layer.named_modules() if m is part and n]
+                found = [n for n, m in named_modules(layer) if m is part and n]
                 where = f"{field}={found[0]}" if found else field
             words.append(f"{where} {why}")
         return f"declared {self.parts.pattern.__name__}, but " + "; ".join(words)
+
+
+def named_modules(root: nn.Module) -> list[tuple[str, nn.Module]]:
+    """``root.named_modules()``, typed (torch annotates it loosely)."""
+    found: list[tuple[str, nn.Module]] = []
+    for name, module in root.named_modules():  # pyright: ignore[reportUnknownVariableType] - typed below
+        if isinstance(name, str) and isinstance(module, nn.Module):
+            found.append((name, module))
+    return found
 
 
 def attribute_of(parent: nn.Module, part: nn.Module, field: str) -> str:
@@ -90,13 +102,14 @@ def attribute_of(parent: nn.Module, part: nn.Module, field: str) -> str:
     Raises:
         BlockConformanceError: ``part`` is not a module of ``parent``.
     """
-    for name, module in parent.named_modules():
+    for name, module in named_modules(parent):
         if module is part and name:
             return name
-    raise BlockConformanceError(
+    msg = (
         f"{field} is a {type(part).__name__} that is not a module of "
         f"{type(parent).__qualname__}"
     )
+    raise BlockConformanceError(msg)
 
 
 def as_kind[T](module: object, kind: type[T]) -> T:
@@ -111,24 +124,6 @@ def as_kind[T](module: object, kind: type[T]) -> T:
         BlockConformanceError: ``module`` is not a ``kind``.
     """
     if not isinstance(module, kind):
-        raise BlockConformanceError(
-            f"expected a {kind.__qualname__}, found a {type(module).__qualname__}"
-        )
+        msg = f"expected a {kind.__qualname__}, found a {type(module).__qualname__}"
+        raise BlockConformanceError(msg)
     return module
-
-
-def require(obj: object, attribute: str, field: str) -> Any:  # noqa: ANN401 - the attribute's own type
-    """``obj.attribute``, raising a conformance error naming ``field`` if absent.
-
-    For a property read off an untyped part, where a default would turn a
-    missing attribute into a silent guess.
-
-    Raises:
-        BlockConformanceError: ``obj`` has no ``attribute``.
-    """
-    try:
-        return getattr(obj, attribute)
-    except AttributeError:
-        raise BlockConformanceError(
-            f"{field} is a {type(obj).__qualname__} without {attribute}"
-        ) from None

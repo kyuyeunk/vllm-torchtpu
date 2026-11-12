@@ -26,6 +26,11 @@ from vllm.model_executor.models.qwen3_next import Qwen3NextSparseMoeBlock
 from vllm_torchtpu.blocks import declare_block
 from vllm_torchtpu.blocks.attn_moe.pattern import AttnMoEParts, pre_norm_moe_parts
 from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnParts, pre_norm_parts
+from vllm_torchtpu.blocks.stream import (
+    attend_with_positions,
+    attend_without_positions,
+    hidden_residual_positions,
+)
 
 
 @declare_block(Qwen3_5DecoderLayer)
@@ -33,17 +38,38 @@ def qwen3_5_block(layer: Qwen3_5DecoderLayer) -> AttnMoEParts | None:
     """The attention-then-MoE block, for either attention kind."""
     if not isinstance(layer.mlp, Qwen3NextSparseMoeBlock):  # Dense Qwen3.5.
         return None
-    if layer.layer_type == "full_attention":
+    stream = hidden_residual_positions(layer)
+    if layer.layer_type == "full_attention":  # str-ok: the model's own layer_type
         attention = layer.self_attn
-        return pre_norm_moe_parts(layer, attention, attention.o_proj, layer.mlp)
-    attention = layer.linear_attn  # Gated DeltaNet
-    return pre_norm_moe_parts(layer, attention, attention.out_proj, layer.mlp)
+        return pre_norm_moe_parts(
+            layer,
+            attention,
+            attention.o_proj,
+            layer.mlp,
+            stream=stream,
+            attend=attend_with_positions(attention),
+        )
+    gdn = layer.linear_attn  # Gated DeltaNet reads no positions.
+    return pre_norm_moe_parts(
+        layer,
+        gdn,
+        gdn.out_proj,
+        layer.mlp,
+        stream=stream,
+        attend=attend_without_positions(gdn),
+    )
 
 
 @declare_block(Qwen3_5DecoderLayer)
 def qwen3_5_attention(layer: Qwen3_5DecoderLayer) -> NormAttnParts | None:
     """The pre-norm attention sub-block, on full-attention layers."""
-    if layer.layer_type != "full_attention":
+    if layer.layer_type != "full_attention":  # str-ok: the model's own layer_type
         return None
     attention = layer.self_attn
-    return pre_norm_parts(layer, attention, output_gate=attention.attn_output_gate)
+    return pre_norm_parts(
+        layer,
+        attention,
+        qk_norm=(attention.q_norm, attention.k_norm),
+        output_gate=attention.attn_output_gate,
+        stream=hidden_residual_positions(layer),
+    )

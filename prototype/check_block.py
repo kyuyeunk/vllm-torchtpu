@@ -33,20 +33,25 @@ import dataclasses
 import sys
 from collections.abc import Callable
 
+import torch
 from torch import nn
 from vllm.config import set_current_vllm_config
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
 from prototype import _build, fixtures
 from vllm_torchtpu import blocks
-from vllm_torchtpu.blocks import BlockDeclaration
-from vllm_torchtpu.blocks.attn_moe import apply_block, conform, contract_adapter
+from vllm_torchtpu.blocks import BlockDeclaration, installer
+from vllm_torchtpu.blocks.attn_moe import contract_adapter
 from vllm_torchtpu.blocks.attn_moe import plan as plan_mod
+from vllm_torchtpu.blocks.attn_moe.install import apply_block, conform
 from vllm_torchtpu.blocks.attn_moe.pattern import (
     AttnMoEParts,
     attn_then_moe,
     block_key,
 )
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
+from vllm_torchtpu.blocks.context import InstallContext
+from vllm_torchtpu.blocks.parts import as_kind
 
 _BUCKETS = (16, 256, 1024, 4096, 8192, 16384)
 
@@ -107,12 +112,13 @@ def plan_table() -> list[str]:
     layer = _build.build(_build.SPECS[0])
     parts = _declared(layer).parts(layer)
     assert isinstance(parts, AttnMoEParts)
-    key = block_key(parts, tp=4, dtype="bfloat16")
+    key = block_key(parts, tp=4, dtype=torch.bfloat16)
     key = dataclasses.replace(key, hidden=2048)  # Qwen3.5-35B-A3B
     fused = dataclasses.replace(key, fused_output_reduced=True)
     sp_moe = dataclasses.replace(key, sp_moe=True)
     print(f"    rule floor: {plan_mod.min_tokens(key)} tokens (8 MiB per chip)")
-    overlap, reduce = "collectives=reduce_scatter_all_gather", "collectives=all_reduce"
+    overlap = "collectives=reduce_scatter_all_gather"
+    reduce = "collectives=all_reduce"
     cases = (
         ("rule", key, "", "", False),
         ("fused EP on", fused, "", "", False),
@@ -124,12 +130,19 @@ def plan_table() -> list[str]:
     failures = []
     for label, k, user, model, should_raise in cases:
         try:
-            table, fell_back = plan_mod.resolve_table(k, _BUCKETS, user, model)
+            table, fell_back = plan_mod.resolve_table(
+                k,
+                _BUCKETS,
+                plan_mod.parse_pin(user, "TPU_BLOCK_PLAN"),
+                plan_mod.parse_pin(model, "tpu_block_plan"),
+            )
         except ValueError as err:
             print(f"    {label + ':':17} raises: {err}")
             failures += [] if should_raise else [f"{label} raised"]
             continue
-        cells = " ".join(f"{b}:{p.collectives[:2]}({s})" for b, p, s in table.entries)
+        cells = " ".join(
+            f"{b}:{p.collectives.value[:2]}({s.value})" for b, p, s in table.entries
+        )
         tail = f" [rule fell back: {'; '.join(fell_back)}]" if fell_back else ""
         print(f"    {label + ':':17} {cells}{tail}")
         failures += [f"{label} did not raise"] if should_raise else []
@@ -140,13 +153,11 @@ def outside_write() -> list[str]:
     layer = _build.build(_build.SPECS[0])
     declaration = _declared(layer)
     with set_current_vllm_config(_build.current_config()):
-        roles = conform(layer, declaration)
-    parts = declaration.parts(layer)
-    assert isinstance(parts, AttnMoEParts)
-    table = plan_mod.BlockPlanTable(((8192, plan_mod.OVERLAP, "rule"),))
-    apply_block("layers.0", layer, parts, roles, table, tp=4)
+        parts = conform(layer, declaration)
+    table = plan_mod.BlockPlanTable(((8192, plan_mod.OVERLAP, plan_mod.Source.RULE),))
+    apply_block("layers.0", layer, parts, table, tp=4)
     try:
-        layer.get_submodule(roles.experts).moe_config.skip_final_all_reduce = False
+        as_kind(parts.experts, MoERunner).moe_config.skip_final_all_reduce = False
     except contract_adapter.BlockContractError as e:
         print(f"    raised: {e}")
         return []
@@ -159,16 +170,14 @@ def mismatch_raises() -> list[str]:
     blocks.DECLARATIONS[key] = BlockDeclaration.of(
         fixtures.ReorderedNorms, fixtures.renamed_parts
     )
-    context = blocks.InstallContext(
+    context = InstallContext(
         tp=4,
-        dtype="bfloat16",
+        dtype=torch.bfloat16,
         buckets=_BUCKETS,
-        override="",
-        model_plan="",
     )
     try:
         with set_current_vllm_config(_build.current_config()):
-            blocks.install(nn.ModuleDict({"layer": layer}), context)
+            installer.install(nn.ModuleDict({"layer": layer}), context)
     except BlockConformanceError as e:
         print(f"    raised: {e}")
         return []

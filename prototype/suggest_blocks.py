@@ -22,6 +22,7 @@ that conforms gets the binding function its model owner could add to
 reason.
 """
 
+import inspect
 import itertools
 import json
 import sys
@@ -33,13 +34,16 @@ from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.fused_moe.runner.moe_runner_interface import (
     MoERunnerInterface,
 )
+from vllm.model_executor.layers.linear import RowParallelLinear
 
 from prototype import _build
+from prototype.subblock_reach import guess_stream
 from vllm_torchtpu.blocks import BlockDeclaration
-from vllm_torchtpu.blocks.attn_moe import conform
+from vllm_torchtpu.blocks.attn_moe.install import conform
 from vllm_torchtpu.blocks.attn_moe.pattern import AttnMoEParts
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
 from vllm_torchtpu.blocks.norm_attn.pattern import is_residual_norm
+from vllm_torchtpu.blocks.stream import attend_with_positions, attend_without_positions
 
 
 def _moe_parts(child: nn.Module) -> tuple[str, str] | None:
@@ -54,13 +58,25 @@ def _moe_parts(child: nn.Module) -> tuple[str, str] | None:
 def _binding(names: dict[str, str]):  # noqa: ANN202 - a binding function
     def guessed(layer: nn.Module) -> AttnMoEParts:
         moe = layer.get_submodule(names["moe"])
+        attention = layer.get_submodule(names["attention"])
+        projections = [
+            m for m in attention.modules() if isinstance(m, RowParallelLinear)
+        ]
+        reads_positions = "positions" in inspect.signature(attention.forward).parameters
         return AttnMoEParts(
             input_norm=layer.get_submodule(names["input_norm"]),
-            attention=layer.get_submodule(names["attention"]),
+            attention=attention,
+            out_proj=projections[-1],
             post_norm=layer.get_submodule(names["post_norm"]),
             moe=moe,
             router=moe.get_submodule(names["router"]),
             experts=moe.get_submodule(names["experts"]),
+            stream=guess_stream(layer),
+            attend=(
+                attend_with_positions(attention)  # pyright: ignore[reportArgumentType]
+                if reads_positions
+                else attend_without_positions(attention)  # pyright: ignore[reportArgumentType]
+            ),
         )
 
     return guessed

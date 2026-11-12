@@ -36,21 +36,74 @@ rule picks that cannot run falls back to the default with the reason.
 """
 
 import dataclasses
-from typing import TYPE_CHECKING, Literal, get_args
+import enum
+
+import torch
 
 from vllm_torchtpu.layers.core.plan_marker import plan_of
 from vllm_torchtpu.layers.core.resolution import require_no_default
 
-if TYPE_CHECKING:  # pattern imports the runner, which imports this module
-    from vllm_torchtpu.blocks.attn_moe.pattern import BlockKey
 
-Collectives = Literal["all_reduce", "reduce_scatter_all_gather"]
-Source = Literal["user", "model plan", "rule", "default"]
+class Collectives(enum.Enum):
+    """Which collectives join attention to the MoE."""
+
+    _value_: str
+
+    ALL_REDUCE = "all_reduce"
+    REDUCE_SCATTER_ALL_GATHER = "reduce_scatter_all_gather"
+
+
+class Source(enum.Enum):
+    """Who decided a bucket's plan, in precedence order."""
+
+    _value_: str
+
+    USER = "user"
+    MODEL_PLAN = "model plan"
+    RULE = "rule"
+    DEFAULT = "default"
+
+
+PINNED = frozenset({Source.USER, Source.MODEL_PLAN})
+
+
+class MoEPath(enum.Enum):
+    """How the MoE reduces its output, which the overlap folds into."""
+
+    _value_: str
+
+    LATE_ALL_REDUCE = "late_all_reduce"
+    ALL2ALL = "all2all"
+    SEQUENCE_PARALLEL = "sequence_parallel"
+
+
+class RouterMode(enum.Enum):
+    """Whether the MoE child computes the logits or its runner does."""
+
+    _value_: str
+
+    EXPLICIT = "explicit"
+    FUSED_IN_EXPERTS = "fused_in_experts"
+
 
 # PR #1492's floor: below 8 MiB of activations per chip the extra collective
 # launches cost more than the overlap hides.
 MIN_PER_CHIP_BYTES = 8 * 1024 * 1024
-_ELEMENT_SIZE = {"bfloat16": 2, "float16": 2, "float32": 4}
+
+
+@dataclasses.dataclass(frozen=True)
+class BlockKey:
+    """What the block plan is chosen by (the type names the pattern)."""
+
+    tp: int
+    hidden: int
+    dtype: torch.dtype
+    attention_kind: type
+    router_mode: RouterMode
+    has_shared_experts: bool
+    sp_moe: bool
+    fused_output_reduced: bool
+    moe_path: MoEPath
 
 
 @plan_of("blocks.attn_then_moe")
@@ -76,6 +129,7 @@ class BlockPlanTable:
     entries: tuple[tuple[int, AttnMoEBlockPlan, Source], ...]
 
     def plan_for(self, num_tokens: int) -> AttnMoEBlockPlan:
+        """The plan for ``num_tokens``, by runs of equal plans."""
         runs: list[tuple[int, AttnMoEBlockPlan]] = []
         for bucket, plan, _ in self.entries:
             if not runs or runs[-1][1] != plan:
@@ -85,58 +139,75 @@ class BlockPlanTable:
                 return plan
         return runs[0][1] if runs else DEFAULT
 
-    def uses(self, collectives: Collectives) -> bool:
-        return any(p.collectives == collectives for _, p, _ in self.entries)
+    def uses(self, plan: AttnMoEBlockPlan) -> bool:
+        """Whether any bucket's plan is ``plan``."""
+        return any(p == plan for _, p, _ in self.entries)
+
+    def pinned(self) -> bool:
+        """Whether a user or model-plan pin decided the table."""
+        return any(s in PINNED for _, _, s in self.entries)
 
 
-DEFAULT = AttnMoEBlockPlan("all_reduce")
-OVERLAP = AttnMoEBlockPlan("reduce_scatter_all_gather")
+DEFAULT = AttnMoEBlockPlan(Collectives.ALL_REDUCE)
+OVERLAP = AttnMoEBlockPlan(Collectives.REDUCE_SCATTER_ALL_GATHER)
 
 
-def min_tokens(key: "BlockKey") -> int:
+def min_tokens(key: BlockKey) -> int:
     """Smallest bucket at which the rule picks the overlap."""
-    return MIN_PER_CHIP_BYTES * key.tp // (key.hidden * _ELEMENT_SIZE[key.dtype])
+    return MIN_PER_CHIP_BYTES * key.tp // (key.hidden * key.dtype.itemsize)
 
 
-def declines(plan: AttnMoEBlockPlan, key: "BlockKey") -> list[str]:
+def declines(plan: AttnMoEBlockPlan, key: BlockKey) -> list[str]:
     """Why ``plan`` cannot run for this block; empty when it can."""
-    if plan.collectives == "all_reduce":
+    if plan == DEFAULT:
         return []
-    reasons = []
+    reasons: list[str] = []
     if key.tp <= 1:
         reasons.append("needs TP > 1")
     if key.sp_moe:
         reasons.append("sequence-parallel MoE reduces its own tokens")
     if key.fused_output_reduced:
         reasons.append("the fused EP MoE kernel returns a reduced output")
-    if key.moe_path != "late_all_reduce":
-        reasons.append(f"MoE path {key.moe_path} has no final all-reduce to fold into")
+    if key.moe_path is not MoEPath.LATE_ALL_REDUCE:
+        reasons.append(
+            f"MoE path {key.moe_path.value} has no final all-reduce to fold into"
+        )
     return reasons
 
 
-def _parse(text: str, source: str) -> Collectives | None:
-    pins = dict(item.split("=", 1) for item in text.split(",") if item)
-    if unknown := sorted(set(pins) - {"collectives"}):
-        raise ValueError(f"{source}: unknown keys {unknown}")
-    value = pins.get("collectives")
-    if value is not None and value not in get_args(Collectives):
-        raise ValueError(f"{source}: collectives={value} names no plan value")
-    return value  # type: ignore[return-value]
+def parse_pin(text: str, source: str) -> Collectives | None:
+    """The one parse point: ``"collectives=<value>"`` or "" into a plan value.
+
+    Raises:
+        ValueError: An unknown key or value, listing the valid ones.
+    """
+    if not text:
+        return None
+    key, _, value = text.partition("=")
+    if key != "collectives" or not value:  # str-ok: the TPU_BLOCK_PLAN parse point
+        msg = f"{source}={text!r}: expected collectives=<value>"
+        raise ValueError(msg)
+    try:
+        return Collectives(value)
+    except ValueError:
+        valid = ", ".join(c.value for c in Collectives)
+        msg = f"{source}: collectives={value}; valid: {valid}"
+        raise ValueError(msg) from None
 
 
 def resolve_table(
-    key: "BlockKey",
+    key: BlockKey,
     buckets: tuple[int, ...],
-    override: str = "",
-    model_plan: str = "",
+    user: Collectives | None = None,
+    model: Collectives | None = None,
 ) -> tuple[BlockPlanTable, tuple[str, ...]]:
     """Resolves the plan for every bucket, then cross-checks it.
 
     Args:
         key: The matched block.
         buckets: Compiled token counts.
-        override: The user's ``TPU_BLOCK_PLAN``, "collectives=<value>" or "".
-        model_plan: The model config's ``tpu_block_plan``, same format.
+        user: The user's pin (``TPU_BLOCK_PLAN``, parsed by ``parse_pin``).
+        model: The model plan's pin (``tpu_block_plan``), same.
 
     Returns:
         The table, and the reasons the rule's choice fell back, if it did.
@@ -145,26 +216,25 @@ def resolve_table(
         ValueError: A pinned plan value cannot run for this block.
     """
     buckets = tuple(sorted(buckets))
-    user = _parse(override, "TPU_BLOCK_PLAN")
-    model = _parse(model_plan, "model plan")
-    pinned, source = (user, "user") if user else (model, "model plan")
+    pinned, source = (user, Source.USER) if user else (model, Source.MODEL_PLAN)
     if pinned is not None:
         plan = AttnMoEBlockPlan(pinned)
         if reasons := declines(plan, key):
-            raise ValueError(
-                f"block plan collectives={pinned} ({source}) cannot run on this "
-                f"{key.kind} block: {'; '.join(reasons)}"
+            msg = (
+                f"block plan collectives={pinned.value} ({source.value}) cannot run "
+                f"on this attn_then_moe block: {'; '.join(reasons)}"
             )
+            raise ValueError(msg)
         return BlockPlanTable(tuple((b, plan, source) for b in buckets)), ()
     floor = min_tokens(key)
     reasons = declines(OVERLAP, key)
-    entries = []
+    entries: list[tuple[int, AttnMoEBlockPlan, Source]] = []
     for bucket in buckets:
         if bucket >= floor and not reasons:
-            entries.append((bucket, OVERLAP, "rule"))
+            entries.append((bucket, OVERLAP, Source.RULE))
         elif bucket >= floor:
-            entries.append((bucket, DEFAULT, "default"))
+            entries.append((bucket, DEFAULT, Source.DEFAULT))
         else:
-            entries.append((bucket, DEFAULT, "rule"))
+            entries.append((bucket, DEFAULT, Source.RULE))
     fell_back = tuple(reasons) if any(b >= floor for b in buckets) else ()
-    return BlockPlanTable(tuple(entries)), fell_back  # type: ignore[arg-type]
+    return BlockPlanTable(tuple(entries)), fell_back

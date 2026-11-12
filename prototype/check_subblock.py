@@ -32,6 +32,7 @@ import sys
 
 import torch
 import torch.nn.functional as F
+from jax.experimental.pallas import tpu as pltpu
 from torch import nn
 from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers import rotary_embedding
@@ -41,8 +42,11 @@ from vllm.model_executor.models.llama import LlamaAttention, LlamaDecoderLayer
 
 from prototype import _build, subblock_reach
 from vllm_torchtpu import blocks
-from vllm_torchtpu.blocks import norm_attn
+from vllm_torchtpu.blocks import installer
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
+from vllm_torchtpu.blocks.context import InstallContext
+from vllm_torchtpu.blocks.norm_attn import install as norm_attn
+from vllm_torchtpu.blocks.norm_attn import plan as subblock_plan
 from vllm_torchtpu.blocks.norm_attn import runner as runner_mod
 from vllm_torchtpu.blocks.norm_attn.pattern import (
     NormAttnParts,
@@ -50,6 +54,7 @@ from vllm_torchtpu.blocks.norm_attn.pattern import (
     pre_norm_parts,
 )
 from vllm_torchtpu.blocks.parts import as_kind
+from vllm_torchtpu.blocks.stream import positions_first
 
 # Comment in to see CI fail: the planted layer becomes a declared model.
 PLANT_MISMATCH = False
@@ -180,15 +185,13 @@ def _runnable(spec: _build.Spec) -> nn.Module:
     return layer
 
 
-def _context(plan: str = "", chip: str = "") -> blocks.InstallContext:
-    return blocks.InstallContext(
+def _context(plan: str = "", chip: str = "") -> InstallContext:
+    return InstallContext(
         tp=1,
-        dtype="float32",
+        dtype=torch.float32,
         buckets=(16,),
-        override="",
-        model_plan="",
-        subblock_plan=plan,
-        chip=chip,
+        subblock_pins=subblock_plan.parse_pins(plan),
+        chip=pltpu.ChipVersion(chip) if chip else None,
     )
 
 
@@ -204,7 +207,7 @@ def _install_and_run(
     with set_current_vllm_config(_build.current_config()), torch.no_grad():
         want = layer(**call)
         before = runner_mod.FUSED_CALLS.get("l", 0)
-        impl = blocks.IMPLEMENTATIONS[norm_then_attention]
+        impl = installer.IMPLEMENTATIONS[norm_then_attention]
         item = impl.install("l", layer, declaration, _context(plan))
         got = layer(**call)
     ran = runner_mod.FUSED_CALLS.get("l", 0) - before
@@ -228,11 +231,11 @@ def family(spec: _build.Spec, declines: bool = False) -> list[str]:
         return [f"{spec.name}: not declared"]
     meta = _build.build(spec)
     with set_current_vllm_config(_build.current_config()):
-        roles = norm_attn.conform(meta, declaration)
+        conformed = norm_attn.conform(meta, declaration)
     _, ran_a, diff_a = _install_and_run(spec, declaration, "input_proj=unfused")
     outcome, ran, diff = _install_and_run(spec, declaration, "")
     print(
-        f"    {spec.name:30} declared -> conforms ({_props(roles.config)})\n"
+        f"    {spec.name:30} declared -> conforms ({_props(conformed.config)})\n"
         f"    {'':30}   A runner unfused vs upstream: max diff {diff_a:.1e}\n"
         f"    {'':30}   B {outcome}; fused runs {ran}; max diff {diff:.1e}"
     )
@@ -282,7 +285,11 @@ def planted() -> list[str]:
 def _llama_parts(layer: LlamaDecoderLayer) -> NormAttnParts:
     """The planted layers' binding function (they reuse Llama's children)."""
     return pre_norm_parts(
-        layer, as_kind(layer.self_attn, LlamaAttention), output_gate=False
+        layer,
+        as_kind(layer.self_attn, LlamaAttention),
+        qk_norm=None,
+        output_gate=False,
+        stream=positions_first(layer),
     )
 
 
@@ -296,7 +303,7 @@ def _planted(planted_cls: type, where: str) -> list[str]:
     blocks.DECLARATIONS[key] = declaration
     try:
         with set_current_vllm_config(_build.current_config()):
-            blocks.install(nn.ModuleDict({"l": layer}), _context())
+            installer.install(nn.ModuleDict({"l": layer}), _context())
     except BlockConformanceError as e:
         print(f"    planted in {where}: startup error: {e}")
         if PLANT_MISMATCH:  # CI: the planted layer counts as a declared model.
@@ -334,7 +341,7 @@ def _source_less(spec: _build.Spec) -> list[str]:
         return None
 
     with set_current_vllm_config(_build.current_config()), torch.no_grad():
-        impl = blocks.IMPLEMENTATIONS[norm_then_attention]
+        impl = installer.IMPLEMENTATIONS[norm_then_attention]
         impl.install("l", layer, declaration, _context())
         sys.settrace(tracer)
         try:

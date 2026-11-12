@@ -24,6 +24,7 @@ the capability that guards it are checked here too; a model's layers
 conforming and routing through the runner is ``test_attn_moe_block.py``'s job.
 """
 
+import dataclasses
 import sys
 
 _PRELOADED = frozenset(sys.modules)  # Before this file's imports; see the last test.
@@ -54,9 +55,10 @@ from vllm_torchtpu.blocks.attn_moe.runner import (  # noqa: E402 - ditto
 from vllm_torchtpu.blocks.norm_attn import plan as subblock_plan  # noqa: E402 - ditto
 from vllm_torchtpu.blocks.norm_attn.runner import (  # noqa: E402 - ditto
     AttentionRunner,
+    InputProj,
     reference_fused_qkv,
 )
-from vllm_torchtpu.blocks.stream import StreamParams  # noqa: E402 - ditto
+from vllm_torchtpu.blocks.stream import Stream  # noqa: E402 - ditto
 from vllm_torchtpu.compilation import shape_variants  # noqa: E402 - ditto
 
 _LOADED = frozenset(sys.modules) - _PRELOADED  # What this file's imports loaded.
@@ -66,10 +68,27 @@ ATOL = 1e-5  # float32; the overlap sums the stream in another order.
 # head_dim 128: a configuration fused_qkv's capability accepts, so the
 # unreduced-output condition is the one under test.
 SUBBLOCK = Roles(qk_norm=True, gqa=4, head_dim=128)
-STREAM = StreamParams(
-    ("positions", "hidden_states", "residual"),
-    *("hidden_states", "residual", "positions"),
-)
+ALL_REDUCE = block_plan.Collectives.ALL_REDUCE
+OVERLAP = block_plan.Collectives.REDUCE_SCATTER_ALL_GATHER
+UNFUSED, FUSED = InputProj.UNFUSED, InputProj.FUSED_QKV
+
+
+def _unpack(
+    positions: torch.Tensor, hidden_states: torch.Tensor, residual: torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    return hidden_states, residual, positions
+
+
+def _no_call(
+    h: torch.Tensor, r: torch.Tensor | None, p: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del h, r, p
+    msg = "the runner never calls the layer's own forward"
+    raise AssertionError(msg)
+
+
+# A layer whose forward is (positions, hidden_states, residual), as Llama's.
+STREAM = Stream(call=_no_call, unpack=_unpack)
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -109,12 +128,14 @@ class Experts(nn.Module):
     """A dense top-k mixture taking ``(hidden_states, router_logits)``, as vLLM's."""
 
     def __init__(self) -> None:
+        """Builds the synthetic part."""
         super().__init__()
         self.w = nn.Parameter(torch.randn(NUM_EXPERTS, HIDDEN, HIDDEN) / HIDDEN**0.5)
 
     def forward(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ) -> torch.Tensor:
+        """The part's call contract, in plain torch."""
         weights, ids = router_logits.softmax(-1).topk(TOP_K, dim=-1)
         per_expert = torch.einsum("td,edh->teh", hidden_states, self.w)
         picked = per_expert.gather(1, ids[..., None].expand(-1, -1, HIDDEN))
@@ -128,21 +149,26 @@ def _moe() -> tuple[InputNorm, Linear, Experts]:
     return parts[0].float(), parts[1].float(), parts[2].float()
 
 
-def _attention(input_proj: str) -> tuple[InputNorm, Attention, AttentionRunner]:
+def _attention(input_proj: InputProj) -> tuple[InputNorm, Attention, AttentionRunner]:
     norm, attention = setup_parts(SUBBLOCK)
-    fused = reference_fused_qkv if input_proj == "fused_qkv" else None
+    fused = reference_fused_qkv if input_proj is FUSED else None
     attention_part = build_runner(
         norm, attention, SUBBLOCK.config(), input_proj, fused, output_reduced=False
     )
     return norm, attention, attention_part
 
 
-def _table(collectives: str) -> block_plan.BlockPlanTable:
-    plan = block_plan.AttnMoEBlockPlan(collectives)  # type: ignore[arg-type]
-    return block_plan.BlockPlanTable(((1, plan, "user"),))
+def _table(collectives: block_plan.Collectives) -> block_plan.BlockPlanTable:
+    plan = block_plan.AttnMoEBlockPlan(collectives)
+    return block_plan.BlockPlanTable(((1, plan, block_plan.Source.USER),))
 
 
-def _block(collectives: str, input_proj: str) -> tuple[AttnMoERunner, tuple]:
+Parts = tuple[InputNorm, Attention, InputNorm, Linear, "Experts"]
+
+
+def _block(
+    collectives: block_plan.Collectives, input_proj: InputProj
+) -> tuple[AttnMoERunner, Parts]:
     norm, attention, attention_part = _attention(input_proj)
     post_norm, router, experts = _moe()
     block = AttnMoERunner(
@@ -157,7 +183,10 @@ def _block(collectives: str, input_proj: str) -> tuple[AttnMoERunner, tuple]:
 
 
 def reference_block(
-    parts: tuple, hidden: torch.Tensor, residual: torch.Tensor | None, positions
+    parts: "Parts",
+    hidden: torch.Tensor,
+    residual: torch.Tensor | None,
+    positions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Upstream's layer in straight-line torch: attention, norm, route, experts."""
     norm, attention, post_norm, router, experts = parts
@@ -175,15 +204,18 @@ def reference_block(
 
 GRID = [
     (collectives, input_proj)
-    for collectives in ("all_reduce", "reduce_scatter_all_gather")
-    for input_proj in ("unfused", "fused_qkv")
+    for collectives in (ALL_REDUCE, OVERLAP)
+    for input_proj in (UNFUSED, FUSED)
 ]
 
 
 @pytest.mark.parametrize("first", [True, False], ids=["first_layer", "residual"])
 @pytest.mark.parametrize(("collectives_value", "input_proj"), GRID)
 def test_block_equals_upstream(
-    collectives: list[str], collectives_value: str, input_proj: str, first: bool
+    collectives: list[str],
+    collectives_value: block_plan.Collectives,
+    input_proj: InputProj,
+    first: bool,  # noqa: FBT001 - a pytest parameter, passed by name
 ) -> None:
     """The residual stream (``out + residual``) matches upstream's layer."""
     block, parts = _block(collectives_value, input_proj)
@@ -192,45 +224,41 @@ def test_block_equals_upstream(
         out, res = block(positions, hidden, residual)
         want_out, want_res = reference_block(parts, hidden, residual, positions)
     torch.testing.assert_close(out + res, want_out + want_res, atol=ATOL, rtol=0)
-    if collectives_value == "all_reduce":  # Upstream's split of the stream, too.
+    if collectives_value is ALL_REDUCE:  # Upstream's split of the stream, too.
         torch.testing.assert_close(res, want_res, atol=ATOL, rtol=0)
-    want = (
-        ["ar", "ar"] if collectives_value == "all_reduce" else ["rs", "ag", "ag", "ar"]
-    )
+    want = ["ar", "ar"] if collectives_value is ALL_REDUCE else ["rs", "ag", "ag", "ar"]
     assert collectives == want
 
 
 def test_the_layer_calls_by_name() -> None:
     """The runner stands in for the layer's forward, positional or by keyword."""
-    block, _ = _block("all_reduce", "unfused")
+    block, _ = _block(ALL_REDUCE, UNFUSED)
     hidden, residual, positions = make_inputs(first=False)
-    assert block.stream.bind((positions, hidden, residual), {}) == (
+    assert block.stream.unpack(positions, hidden, residual) == (
         hidden,
         residual,
         positions,
     )
-    got = block.stream.bind((), {"hidden_states": hidden, "positions": positions})
+    got = block.stream.unpack(hidden_states=hidden, positions=positions, residual=None)
     assert got == (hidden, None, positions)
 
 
-@pytest.mark.parametrize(
-    "collectives_value", ["all_reduce", "reduce_scatter_all_gather"]
-)
-def test_select_forward(collectives_value: str) -> None:
+@pytest.mark.parametrize("collectives_value", [ALL_REDUCE, OVERLAP])
+def test_select_forward(collectives_value: block_plan.Collectives) -> None:
     """One value everywhere runs it directly; a table with the overlap looks up."""
-    block, _ = _block(collectives_value, "unfused")
-    entry = block._forward_entry.__name__  # noqa: SLF001 - the selection under test
-    assert entry == (
-        "_all_reduce" if collectives_value == "all_reduce" else "_by_bucket"
-    )
+    block, _ = _block(collectives_value, UNFUSED)
+    entry = block._forward_entry  # noqa: SLF001 - the selection under test
+    want = block._all_reduce if collectives_value is ALL_REDUCE else block._by_bucket  # noqa: SLF001
+    assert entry == want
 
 
 def test_by_bucket(collectives: list[str]) -> None:
     """The table's runs pick the value per token count; eager runs are counted."""
-    norm, attention, attention_part = _attention("unfused")
+    _, _, attention_part = _attention(UNFUSED)
     post_norm, router, experts = _moe()
+    rule = block_plan.Source.RULE
     table = block_plan.BlockPlanTable(
-        ((4, block_plan.DEFAULT, "rule"), (TOKENS, block_plan.OVERLAP, "rule"))
+        ((4, block_plan.DEFAULT, rule), (TOKENS, block_plan.OVERLAP, rule))
     )
     block = AttnMoERunner(
         "bucketed",
@@ -241,13 +269,14 @@ def test_by_bucket(collectives: list[str]) -> None:
         stream=STREAM,
     )
     hidden, residual, positions = make_inputs(first=False)
+    assert residual is not None
     with torch.no_grad():
         block(positions[:4], hidden[:4], residual[:4])
         block(positions, hidden, residual)
     assert collectives == ["ar", "ar", "rs", "ag", "ag", "ar"]
     assert block_runner.CALLS["bucketed"] == {
-        "all_reduce": 1,
-        "reduce_scatter_all_gather": 1,
+        block_plan.DEFAULT: 1,
+        block_plan.OVERLAP: 1,
     }
 
 
@@ -255,7 +284,7 @@ def test_compile_outside_warmup_keeps_all_reduce(
     collectives: list[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """#1492's warmup gate: a compile outside warmup keeps the all-reduce path."""
-    block, _ = _block("reduce_scatter_all_gather", "unfused")
+    block, _ = _block(OVERLAP, UNFUSED)
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     hidden, residual, positions = make_inputs(first=False)
     with torch.no_grad():
@@ -268,7 +297,8 @@ def test_compile_outside_warmup_keeps_all_reduce(
 
 
 def test_runner_owns_no_parameters() -> None:
-    block, parts = _block("reduce_scatter_all_gather", "fused_qkv")
+    """Runner owns no parameters."""
+    block, parts = _block(OVERLAP, FUSED)
     assert not list(block.parameters())
     assert not list(block.children())
     del parts
@@ -277,11 +307,11 @@ def test_runner_owns_no_parameters() -> None:
 # The contract: the block builds attention unreduced; the capability guards it.
 
 
-@pytest.mark.parametrize("input_proj", ["unfused", "fused_qkv"])
-def test_unreduced_attention_equals_reduced_at_tp1(input_proj: str) -> None:
+@pytest.mark.parametrize("input_proj", [UNFUSED, FUSED])
+def test_unreduced_attention_equals_reduced_at_tp1(input_proj: InputProj) -> None:
     """``output_reduced=False`` skips only the reduction; at TP=1 that is nothing."""
     norm, attention = setup_parts(SUBBLOCK)
-    fused = reference_fused_qkv if input_proj == "fused_qkv" else None
+    fused = reference_fused_qkv if input_proj is FUSED else None
     reduced = build_runner(norm, attention, SUBBLOCK.config(), input_proj, fused)
     unreduced = build_runner(
         norm, attention, SUBBLOCK.config(), input_proj, fused, output_reduced=False
@@ -299,63 +329,74 @@ def test_unreduced_never_calls_the_projection_forward() -> None:
     runner = build_runner(norm, attention, SUBBLOCK.config(), output_reduced=False)
 
     def refuse(*args: object, **kwargs: object) -> None:
-        raise AssertionError("o_proj.forward runs its all-reduce")
+        del args, kwargs
+        msg = "o_proj.forward runs its all-reduce"
+        raise AssertionError(msg)
 
-    attention.o_proj.forward = refuse  # type: ignore[method-assign]
+    object.__setattr__(attention.o_proj, "forward", refuse)
     hidden, residual, positions = make_inputs(first=False)
     with torch.no_grad():
         runner(hidden, residual, positions)
 
 
-def _o_proj_bias(attention: Attention) -> Attention:
-    attention.o_proj.bias = nn.Parameter(torch.zeros(HIDDEN))
-    return attention
-
-
-def _o_proj_replicated(attention: Attention) -> Attention:
-    attention.o_proj.input_is_parallel = False
-    return attention
+def _facts(**changes: object) -> subblock_plan.AttentionFacts:
+    """A supported attention's facts, changed."""
+    base = subblock_plan.AttentionFacts(
+        config=SUBBLOCK.config(),
+        sinks=False,
+        kv_sharing=False,
+        q_norm=None,
+        k_norm=None,
+        neox_rope=True,
+        qkv_quant_supported=True,
+        qkv_quant="UnquantizedLinearMethod",
+        fp8_weights=False,
+        o_proj_split_input=True,
+        o_proj_adds_bias=False,
+    )
+    return dataclasses.replace(base, **changes)  # pyright: ignore[reportArgumentType]
 
 
 @pytest.mark.parametrize(
-    ("edit", "input_proj", "fused_unreduced", "why"),
+    ("facts", "input_proj", "fused_unreduced", "why"),
     [
-        (lambda a: a, "unfused", False, None),
-        (lambda a: a, "fused_qkv", True, None),
-        (lambda a: a, "fused_qkv", False, "always all-reduces"),
-        (_o_proj_bias, "unfused", True, "adds a bias"),
-        (_o_proj_replicated, "unfused", True, "TP-split input"),
+        (_facts(), UNFUSED, False, None),
+        (_facts(), FUSED, True, None),
+        (_facts(), FUSED, False, "always all-reduces"),
+        (_facts(o_proj_adds_bias=True), UNFUSED, True, "adds a bias"),
+        (_facts(o_proj_split_input=False), UNFUSED, True, "TP-split input"),
     ],
     ids=["unfused", "fused", "fused_op_reduces", "o_proj_bias", "o_proj_replicated"],
 )
 def test_unreduced_output_supports(
-    edit, input_proj: str, fused_unreduced: bool, why: str | None
-) -> None:  # noqa: ANN001
-    _, attention = setup_parts(SUBBLOCK)
-    plan = subblock_plan.NormAttnPlan(input_proj, "bf16")  # type: ignore[arg-type]
+    facts: subblock_plan.AttentionFacts,
+    input_proj: InputProj,
+    fused_unreduced: bool,  # noqa: FBT001 - a pytest parameter, passed by name
+    why: str | None,
+) -> None:
+    """Unreduced output supports."""
+    plan = subblock_plan.NormAttnPlan(input_proj, subblock_plan.Matmul.BF16)
     got = subblock_plan.unreduced_output_supports(
-        plan, edit(attention), fused_unreduced=fused_unreduced
+        plan, facts, fused_unreduced=fused_unreduced
     )
     assert (got is None) if why is None else (why in (got or ""))
 
 
 def test_rule_falls_back_when_the_fused_op_cannot_skip_the_reduce() -> None:
     """Chosen automatically: fused_qkv declines quietly, unfused serves the block."""
-    _, attention = setup_parts(SUBBLOCK)
-    plan, pinned, declined = subblock_plan.choose(
-        "", attention, output_reduced=False, fused_unreduced=False
+    plan, declined = subblock_plan.choose(
+        subblock_plan.Pins(), _facts(), output_reduced=False, fused_unreduced=False
     )
-    assert (plan.input_proj, pinned) == ("unfused", frozenset())
+    assert plan.input_proj is UNFUSED
     assert any("always all-reduces" in d for d in declined)
 
 
 def test_pin_that_cannot_skip_the_reduce_raises() -> None:
     """Pinned: the same decline stops startup."""
-    _, attention = setup_parts(SUBBLOCK)
     with pytest.raises(ValueError, match="always all-reduces"):
         subblock_plan.choose(
-            "input_proj=fused_qkv",
-            attention,
+            subblock_plan.Pins(input_proj=FUSED),
+            _facts(),
             output_reduced=False,
             fused_unreduced=False,
             where="layer",
@@ -364,11 +405,10 @@ def test_pin_that_cannot_skip_the_reduce_raises() -> None:
 
 def test_reduced_contract_ignores_the_capability() -> None:
     """A layer on its own (reduced output) keeps fused_qkv whatever the op says."""
-    _, attention = setup_parts(SUBBLOCK)
-    plan, _, _ = subblock_plan.choose(
-        "", _o_proj_bias(attention), fused_unreduced=False
+    plan, _ = subblock_plan.choose(
+        subblock_plan.Pins(), _facts(o_proj_adds_bias=True), fused_unreduced=False
     )
-    assert plan.input_proj == "fused_qkv"
+    assert plan.input_proj is FUSED
 
 
 def test_imports_no_model() -> None:

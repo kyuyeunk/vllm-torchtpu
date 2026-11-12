@@ -34,29 +34,25 @@ import sys
 _PRELOADED = frozenset(sys.modules)  # Before this file's imports; see the last test.
 
 import ast  # noqa: E402 - after the snapshot above
+import dataclasses  # noqa: E402 - after the snapshot above
 import pathlib  # noqa: E402 - after the snapshot above
-from collections.abc import Callable  # noqa: E402 - after the snapshot above
 
 import pytest  # noqa: E402 - after the snapshot above
 import torch  # noqa: E402 - after the snapshot above
+from jax.experimental.pallas import tpu as pltpu  # noqa: E402 - after the snapshot
 from synthetic import (  # noqa: E402 - ditto
-    HIDDEN,
-    Attention,
-    AwqLinearMethod,
-    HeadNorm,
-    InputNorm,
     Roles,
-    WholeNorm,
     build_runner,
     make_inputs,
     reference_forward,
     setup_parts,
 )
-from torch import nn  # noqa: E402 - after the snapshot above
 
 from vllm_torchtpu.blocks.norm_attn import plan as plan_mod  # noqa: E402 - ditto
 from vllm_torchtpu.blocks.norm_attn import runner as runner_mod  # noqa: E402 - ditto
 from vllm_torchtpu.blocks.norm_attn.runner import (  # noqa: E402 - ditto
+    AttnConfig,
+    InputProj,
     reference_fused_qkv,
 )
 
@@ -107,7 +103,8 @@ def _id(roles: Roles) -> str:
 
 @pytest.mark.parametrize("first", [True, False], ids=["first_layer", "residual"])
 @pytest.mark.parametrize("roles", ROLE_GRID, ids=_id)
-def test_unfused_equals_reference(roles: Roles, first: bool) -> None:
+def test_unfused_equals_reference(roles: Roles, first: bool) -> None:  # noqa: FBT001 - a pytest parameter, passed by name
+    """Unfused equals reference."""
     norm, attention = setup_parts(roles)
     runner = build_runner(norm, attention, roles.config())
     hidden, residual, positions = make_inputs(first)
@@ -119,10 +116,11 @@ def test_unfused_equals_reference(roles: Roles, first: bool) -> None:
 
 @pytest.mark.parametrize("first", [True, False], ids=["first_layer", "residual"])
 @pytest.mark.parametrize("roles", ROLE_GRID, ids=_id)
-def test_fused_equals_unfused(roles: Roles, first: bool) -> None:
+def test_fused_equals_unfused(roles: Roles, first: bool) -> None:  # noqa: FBT001 - a pytest parameter, passed by name
+    """Fused equals unfused."""
     norm, attention = setup_parts(roles, torch.bfloat16)
     runner = build_runner(
-        norm, attention, roles.config(), "fused_qkv", reference_fused_qkv
+        norm, attention, roles.config(), InputProj.FUSED_QKV, reference_fused_qkv
     )
     hidden, residual, positions = make_inputs(first, torch.bfloat16)
     before = runner_mod.FUSED_CALLS.get("layer", 0)
@@ -137,7 +135,9 @@ def test_fused_op_that_declines_runs_unfused() -> None:
     """A fused op returning None for a call leaves that call to unfused."""
     roles = Roles()
     norm, attention = setup_parts(roles)
-    runner = build_runner(norm, attention, roles.config(), "fused_qkv", lambda *_: None)
+    runner = build_runner(
+        norm, attention, roles.config(), InputProj.FUSED_QKV, lambda *_: None
+    )
     hidden, residual, positions = make_inputs(first=False)
     with torch.no_grad():
         got = runner(hidden, residual, positions)
@@ -155,40 +155,54 @@ def test_runner_owns_no_parameters() -> None:
     assert runner.q_norm is attention.q_norm
 
 
-def _fp8(attention: Attention) -> Attention:
-    weight = attention.qkv_proj.weight
-    attention.qkv_proj.weight = nn.Parameter(
-        weight.data.to(torch.float8_e4m3fn), requires_grad=False
+def _facts(**changes: object) -> plan_mod.AttentionFacts:
+    """A supported attention's facts (8 heads of 128 over 2 KV heads), changed."""
+    base = plan_mod.AttentionFacts(
+        config=Roles().config(),
+        sinks=False,
+        kv_sharing=False,
+        q_norm=None,
+        k_norm=None,
+        neox_rope=True,
+        qkv_quant_supported=True,
+        qkv_quant="UnquantizedLinearMethod",
+        fp8_weights=False,
+        o_proj_split_input=True,
+        o_proj_adds_bias=False,
     )
-    return attention
+    return dataclasses.replace(base, **changes)  # pyright: ignore[reportArgumentType]
 
 
-def _awq(attention: Attention) -> Attention:
-    attention.qkv_proj.quant_method = AwqLinearMethod()
-    return attention
+def _config(**changes: object) -> AttnConfig:
+    return dataclasses.replace(Roles().config(), **changes)  # pyright: ignore[reportArgumentType]
+
+
+_RMS = plan_mod.NormFacts(rms=True, width=128, kind="RMSNorm")
+_FP8 = _facts(fp8_weights=True)
+_V7X, _V6E = pltpu.ChipVersion("7x"), pltpu.ChipVersion("v6e")
 
 
 # (c): the plan, resolved once; rule versus pin.
 
 
 @pytest.mark.parametrize(
-    ("override", "attention_kwargs", "expected"),
+    ("override", "facts", "expected"),
     [
-        ("", {}, "_fused_qkv"),  # The rule's value.
-        ("", {"sinks": True}, "_unfused"),  # The rule falls back, quietly.
-        ("input_proj=unfused", {}, "_unfused"),  # A pin beats the rule.
-        ("input_proj=fused_qkv", {}, "_fused_qkv"),
+        ("", _facts(), "_fused_qkv"),  # The rule's value.
+        ("", _facts(sinks=True), "_unfused"),  # The rule falls back, quietly.
+        ("input_proj=unfused", _facts(), "_unfused"),  # A pin beats the rule.
+        ("input_proj=fused_qkv", _facts(), "_fused_qkv"),
     ],
     ids=["rule", "rule_falls_back", "pin_unfused", "pin_fused"],
 )
-def test_select_forward(override: str, attention_kwargs: dict, expected: str) -> None:
-    torch.manual_seed(0)
+def test_select_forward(
+    override: str, facts: plan_mod.AttentionFacts, expected: str
+) -> None:
+    """Select forward."""
+    plan, declined = plan_mod.choose(plan_mod.parse_pins(override), facts)
+    assert bool(declined) == facts.sinks
     roles = Roles()
-    attention = Attention(roles, **attention_kwargs)
-    plan, pinned, declined = plan_mod.choose(override, attention)
-    assert pinned == frozenset(dict(p.split("=") for p in override.split(",") if p))
-    assert bool(declined) == bool(attention_kwargs)
-    norm = InputNorm(HIDDEN)
+    norm, attention = setup_parts(roles)
     runner = build_runner(
         norm, attention, roles.config(), plan.input_proj, reference_fused_qkv
     )
@@ -196,13 +210,13 @@ def test_select_forward(override: str, attention_kwargs: dict, expected: str) ->
 
 
 @pytest.mark.parametrize(
-    ("override", "attention_kwargs", "chip", "match"),
+    ("override", "facts", "match"),
     [
-        ("input_proj=fused_qkv", {"sinks": True}, "", "sinks"),
-        ("matmul=fp8", {}, "", "needs FP8 weights"),
-        ("input_proj=fused_qkv,matmul=bf16", {"kv_sharing": "l0"}, "", "KV sharing"),
-        ("input_proj=bogus", {}, "", "not one of"),
-        ("tile=8", {}, "", "unknown keys"),
+        ("input_proj=fused_qkv", _facts(sinks=True), "sinks"),
+        ("matmul=fp8", _facts(), "needs FP8 weights"),
+        ("input_proj=fused_qkv,matmul=bf16", _facts(kv_sharing=True), "KV sharing"),
+        ("input_proj=bogus", _facts(), "valid: unfused, fused_qkv"),
+        ("tile=8", _facts(), "unknown key 'tile'"),
     ],
     ids=[
         "pin_on_sinks",
@@ -213,105 +227,106 @@ def test_select_forward(override: str, attention_kwargs: dict, expected: str) ->
     ],
 )
 def test_pin_that_cannot_run_raises(
-    override: str, attention_kwargs: dict, chip: str, match: str
+    override: str, facts: plan_mod.AttentionFacts, match: str
 ) -> None:
-    attention = Attention(Roles(), **attention_kwargs)
+    """Pin that cannot run raises."""
     with pytest.raises(ValueError, match=match):
-        plan_mod.choose(override, attention, chip=chip, where="Synthetic")
+        plan_mod.choose(plan_mod.parse_pins(override), facts, where="Synthetic")
 
 
 def test_fp8_pin_on_v6e_raises() -> None:
-    attention = _fp8(Attention(Roles()))
-    assert plan_mod.choose("", attention, chip="7x")[0].matmul == "fp8"
-    assert plan_mod.choose("", attention, chip="v6e")[0].matmul == "bf16"
+    """Fp8 pin on v6e raises."""
+    none, fp8 = plan_mod.Pins(), plan_mod.Pins(matmul=plan_mod.Matmul.FP8)
+    assert plan_mod.choose(none, _FP8, chip=_V7X)[0].matmul is plan_mod.Matmul.FP8
+    assert plan_mod.choose(none, _FP8, chip=_V6E)[0].matmul is plan_mod.Matmul.BF16
     with pytest.raises(ValueError, match="chip v6e has none"):
-        plan_mod.choose("matmul=fp8", attention, chip="v6e")
+        plan_mod.choose(fp8, _FP8, chip=_V6E)
 
 
 def test_fused_value_without_an_op_raises() -> None:
+    """Fused value without an op raises."""
     roles = Roles()
     norm, attention = setup_parts(roles)
     with pytest.raises(ValueError, match="fused_qkv needs a fused op"):
-        build_runner(norm, attention, roles.config(), "fused_qkv", None)
+        build_runner(norm, attention, roles.config(), InputProj.FUSED_QKV, None)
 
 
 # (d): fused_qkv's capability over the model's, the chip's and the platform's
 # descriptions.
 
 
-def _case(
+def _case(  # noqa: PLR0913 - the parts and options a runner or reference takes
     name: str,
-    make: Callable[[], Attention],
+    facts: plan_mod.AttentionFacts,
     reason: str | None = None,
     *,
-    matmul: str = "bf16",
-    chip: str = "",
+    matmul: plan_mod.Matmul = plan_mod.Matmul.BF16,
+    chip: pltpu.ChipVersion | None = None,
     kv: str = "",
 ) -> object:
-    return pytest.param(make, matmul, chip, kv, reason, id=name)
+    """A capability case; the KV string is parsed as the platform's is."""
+    fp8_kv = plan_mod.is_fp8_e4m3(kv) if kv else None
+    return pytest.param(facts, matmul, chip, fp8_kv, reason, id=name)
 
 
-def _plain() -> Attention:
-    return Attention(Roles())
-
-
+_F8 = plan_mod.Matmul.FP8
 CAPABILITY = [
-    _case("supported", _plain),
-    _case("supported_v6e_fp8_kv", _plain, chip="v6e", kv="fp8"),
-    _case("supported_7x_fp8_e4m3_kv", _plain, chip="7x", kv="fp8_e4m3"),
-    _case("qk_norm_gate", lambda: Attention(Roles(qk_norm=True, output_gate=True))),
-    _case("sinks", lambda: Attention(Roles(), sinks=True), "sinks need RPA v3"),
-    _case("kv_sharing", lambda: Attention(Roles(), kv_sharing="l0"), "KV sharing"),
-    _case("head_dim_64", lambda: Attention(Roles(head_dim=64)), "head_dim 64 runs on"),
-    _case("head_dim_80", lambda: Attention(Roles(head_dim=80)), "not a multiple of 32"),
-    _case("gqa_1", lambda: Attention(Roles(gqa=1)), "1 query heads per KV head"),
+    _case("supported", _facts()),
+    _case("supported_v6e_fp8_kv", _facts(), chip=_V6E, kv="fp8"),
+    _case("supported_7x_fp8_e4m3_kv", _facts(), chip=_V7X, kv="fp8_e4m3"),
+    _case(
+        "qk_norm_gate",
+        _facts(
+            config=_config(qk_norm=True, output_gate=True), q_norm=_RMS, k_norm=_RMS
+        ),
+    ),
+    _case("sinks", _facts(sinks=True), "sinks need RPA v3"),
+    _case("kv_sharing", _facts(kv_sharing=True), "KV sharing"),
+    _case("head_dim_64", _facts(config=_config(head_dim=64)), "head_dim 64 runs on"),
+    _case("head_dim_80", _facts(config=_config(head_dim=80)), "not a multiple of 32"),
+    _case("gqa_1", _facts(config=_config(num_heads=2)), "1 query heads per KV head"),
     _case(
         "gate_head_dim_160",
-        lambda: Attention(Roles(head_dim=160, output_gate=True)),
+        _facts(config=_config(head_dim=160, output_gate=True)),
         "an output gate needs head_dim % 128",
     ),
     _case(
         "qk_norm_not_rms",
-        lambda: Attention(Roles(qk_norm=True), q_norm=WholeNorm(128)),
+        _facts(q_norm=plan_mod.NormFacts(rms=False, width=128, kind="WholeNorm")),
         "q_norm is WholeNorm",
     ),
-    _case(
-        "qk_norm_tp_wide",  # Over all 8 heads: the norm needs the whole projection.
-        lambda: Attention(Roles(qk_norm=True), q_norm=HeadNorm(8 * 128)),
+    _case(  # Over all 8 heads: the norm needs the whole projection.
+        "qk_norm_tp_wide",
+        _facts(q_norm=plan_mod.NormFacts(rms=True, width=8 * 128, kind="RMSNorm")),
         "TP-wide norm",
     ),
-    _case("gptj_rope", lambda: Attention(Roles(), neox=False), "GPT-J-style RoPE"),
-    _case("awq", lambda: _awq(_plain()), "quantized by AwqLinearMethod"),
-    _case("bf16_kv", _plain, "KV cache bfloat16", chip="7x", kv="bfloat16"),
-    _case("auto_kv", _plain, "KV cache auto", kv="auto"),
-    _case("fp8_e5m2_kv", _plain, "KV cache fp8_e5m2", kv="fp8_e5m2"),
-    _case("fp8_matmul_bf16_weights", _plain, "needs FP8 weights", matmul="fp8"),
-    _case("fp8_matmul_7x", lambda: _fp8(_plain()), matmul="fp8", chip="7x", kv="fp8"),
+    _case("gptj_rope", _facts(neox_rope=False), "GPT-J-style RoPE"),
     _case(
-        "fp8_matmul_v6e",
-        lambda: _fp8(_plain()),
-        "chip v6e has none",
-        matmul="fp8",
-        chip="v6e",
-        kv="fp8",
+        "awq",
+        _facts(qkv_quant_supported=False, qkv_quant="AwqLinearMethod"),
+        "quantized by AwqLinearMethod",
     ),
-    _case("fp8_matmul_off_tpu", lambda: _fp8(_plain()), matmul="fp8"),
+    _case("bf16_kv", _facts(), "KV cache is not FP8", chip=_V7X, kv="bfloat16"),
+    _case("auto_kv", _facts(), "KV cache is not FP8", kv="auto"),
+    _case("fp8_e5m2_kv", _facts(), "KV cache is not FP8", kv="fp8_e5m2"),
+    _case("fp8_matmul_bf16_weights", _facts(), "needs FP8 weights", matmul=_F8),
+    _case("fp8_matmul_7x", _FP8, matmul=_F8, chip=_V7X, kv="fp8"),
+    _case("fp8_matmul_v6e", _FP8, "chip v6e has none", matmul=_F8, chip=_V6E, kv="fp8"),
+    _case("fp8_matmul_off_tpu", _FP8, matmul=_F8),
 ]
 
 
-@pytest.mark.parametrize(
-    ("make", "matmul", "chip", "kv_cache_dtype", "reason"), CAPABILITY
-)
+@pytest.mark.parametrize(("facts", "matmul", "chip", "fp8_kv", "reason"), CAPABILITY)
 def test_fused_qkv_supports(
-    make: Callable[[], Attention],
+    facts: plan_mod.AttentionFacts,
     matmul: plan_mod.Matmul,
-    chip: str,
-    kv_cache_dtype: str,
+    chip: pltpu.ChipVersion | None,
+    fp8_kv: bool | None,  # noqa: FBT001 - a pytest parameter, passed by name
     reason: str | None,
 ) -> None:
-    torch.manual_seed(0)
+    """Fused qkv supports."""
     why = plan_mod.fused_qkv_supports(
-        make(), matmul=matmul, chip=chip, kv_cache_dtype=kv_cache_dtype
+        facts, matmul=matmul, chip=chip, fp8_kv_cache=fp8_kv
     )
     if reason is None:
         assert why is None

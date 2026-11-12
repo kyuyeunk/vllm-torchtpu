@@ -26,6 +26,7 @@ targets are marked.
 
 import dataclasses
 import importlib
+import inspect
 import json
 import sys
 
@@ -35,10 +36,18 @@ from torch import nn
 from vllm.config import set_current_vllm_config
 
 from prototype import _build
-from vllm_torchtpu.blocks import BlockDeclaration, norm_attn
+from vllm_torchtpu.blocks import BlockDeclaration
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
+from vllm_torchtpu.blocks.norm_attn import install as norm_attn
 from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnParts
-from vllm_torchtpu.blocks.norm_attn.plan import fused_qkv_supports
+from vllm_torchtpu.blocks.norm_attn.plan import facts_of, fused_qkv_supports
+from vllm_torchtpu.blocks.stream import (
+    Stream,
+    attend_with_positions,
+    hidden_positions_residual,
+    hidden_residual_positions,
+    positions_first,
+)
 
 # #3096 patches these decoder classes (fused_attn_proj_patch.py).
 PR_3096_TARGETS = {
@@ -357,7 +366,19 @@ def guess_parts(layer: nn.Module) -> NormAttnParts:
         post_norm=_child(layer, "post_attention_layernorm"),
         mlp=_child(layer, "mlp", "block_sparse_moe", "feed_forward"),
         output_gate=bool(getattr(attention, "attn_output_gate", False)),
+        stream=guess_stream(layer),
+        attend=attend_with_positions(attention),  # pyright: ignore[reportArgumentType]
     )
+
+
+def guess_stream(layer: nn.Module) -> Stream:
+    """The survey reads the forward's parameter order; a declaration states it."""
+    order = tuple(inspect.signature(type(layer).forward).parameters)[1:4]
+    if order == ("hidden_states", "positions", "residual"):
+        return hidden_positions_residual(layer)  # pyright: ignore[reportArgumentType]
+    if order == ("hidden_states", "residual", "positions"):
+        return hidden_residual_positions(layer)  # pyright: ignore[reportArgumentType]
+    return positions_first(layer)  # pyright: ignore[reportArgumentType]
 
 
 def check(c: Candidate) -> tuple[str, str]:
@@ -373,10 +394,11 @@ def check(c: Candidate) -> tuple[str, str]:
     declaration = BlockDeclaration.of(type(layer), guess_parts)
     try:
         with set_current_vllm_config(_build.current_config()):
-            roles = norm_attn.conform(layer, declaration)
+            config = norm_attn.conform(layer, declaration).config
     except (BlockConformanceError, AttributeError) as e:
         return "declines", str(e).split(", but ", 1)[-1][:110]
-    why = fused_qkv_supports(layer.get_submodule(roles.attention))
+    # Capability on the model's real head sizes, which the layer was built with.
+    why = fused_qkv_supports(facts_of(guess_parts(layer), config))
     return "conforms", f"fused_qkv: {'declines: ' + why if why else 'can serve it'}"
 
 

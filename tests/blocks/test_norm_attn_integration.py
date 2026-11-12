@@ -23,16 +23,21 @@ configuration); here one smoke check runs Llama against upstream.
 
 import pytest
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from torch import nn
 from vllm.config.vllm import set_current_vllm_config
 
 from prototype import _build, check_subblock
 from vllm_torchtpu import blocks
-from vllm_torchtpu.blocks import norm_attn
+from vllm_torchtpu.blocks import installer
+from vllm_torchtpu.blocks.attn_moe.plan import Collectives
 from vllm_torchtpu.blocks.attn_moe.runner import AttnMoERunner
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
-from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnRoles, norm_then_attention
-from vllm_torchtpu.blocks.norm_attn.runner import AttentionRunner
+from vllm_torchtpu.blocks.context import InstallContext
+from vllm_torchtpu.blocks.norm_attn import install as norm_attn
+from vllm_torchtpu.blocks.norm_attn import plan as subblock_plan
+from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnParts, norm_then_attention
+from vllm_torchtpu.blocks.norm_attn.runner import AttentionRunner, InputProj
 from vllm_torchtpu.blocks.stream import routed_runner
 
 SPECS = (
@@ -49,16 +54,16 @@ def _declared(spec: _build.Spec) -> tuple[nn.Module, blocks.BlockDeclaration]:
     return layer, blocks.DECLARATIONS[(type(layer), norm_then_attention)]
 
 
-def _runner_of(layer: nn.Module) -> AttentionRunner:
-    runner = layer.__dict__["_norm_attn_runner"]
-    assert isinstance(runner, AttentionRunner)
-    return runner
+def _routed(layer: nn.Module) -> norm_attn.NormAttnLayer:
+    routed = routed_runner(layer)
+    assert isinstance(routed, norm_attn.NormAttnLayer)
+    return routed
 
 
-def _roles_of(layer: nn.Module) -> NormAttnRoles:
-    roles = layer.__dict__["_norm_attn_roles"]
-    assert isinstance(roles, NormAttnRoles)
-    return roles
+def _parts_of(layer: nn.Module, declaration: blocks.BlockDeclaration) -> NormAttnParts:
+    parts = declaration.parts(layer)
+    assert isinstance(parts, NormAttnParts)
+    return parts
 
 
 def _weight(module: nn.Module) -> torch.Tensor:
@@ -70,21 +75,20 @@ def _weight(module: nn.Module) -> torch.Tensor:
 def _install(
     layer: nn.Module, declaration: blocks.BlockDeclaration, **context: str
 ) -> str:
-    impl = blocks.IMPLEMENTATIONS[norm_then_attention]
+    impl = installer.IMPLEMENTATIONS[norm_then_attention]
     with set_current_vllm_config(_build.current_config()):
         return impl.install("l", layer, declaration, _context(**context)).outcome
 
 
-def _context(plan: str = "", chip: str = "", kv: str = "") -> blocks.InstallContext:
-    return blocks.InstallContext(
+def _context(plan: str = "", chip: str = "", kv: str = "") -> InstallContext:
+    """The test's strings, parsed as the runner parses the platform's."""
+    return InstallContext(
         tp=1,
-        dtype="bfloat16",
+        dtype=torch.bfloat16,
         buckets=(16,),
-        override="",
-        model_plan="",
-        subblock_plan=plan,
-        chip=chip,
-        kv_cache_dtype=kv,
+        subblock_pins=subblock_plan.parse_pins(plan),
+        chip=pltpu.ChipVersion(chip) if chip else None,
+        fp8_kv_cache=subblock_plan.is_fp8_e4m3(kv) if kv else None,
     )
 
 
@@ -93,14 +97,14 @@ def _context(plan: str = "", chip: str = "", kv: str = "") -> blocks.InstallCont
 
 @pytest.mark.parametrize("spec", SPECS, ids=lambda s: s.name)
 def test_declaration_conforms(spec: _build.Spec) -> None:
+    """Declaration conforms."""
     layer, declaration = _declared(spec)
     assert declaration.when(layer)
     with set_current_vllm_config(_build.current_config()):
-        roles = norm_attn.conform(layer, declaration)
-    attention = layer.get_submodule(roles.attention)
-    assert roles.qkv_proj == f"{roles.attention}.qkv_proj"
-    assert roles.config.head_dim == attention.head_dim
-    assert roles.config.qk_norm == (getattr(attention, "q_norm", None) is not None)
+        config = norm_attn.conform(layer, declaration).config
+    parts = _parts_of(layer, declaration)
+    assert config.head_dim == parts.attention.head_dim
+    assert config.qk_norm == (parts.q_norm is not None)
 
 
 @pytest.mark.parametrize(
@@ -163,19 +167,20 @@ def test_part_of_the_wrong_kind_is_named_by_attribute() -> None:
 
 @pytest.mark.parametrize("spec", SPECS, ids=lambda s: s.name)
 def test_runner_holds_the_models_parts(spec: _build.Spec) -> None:
+    """Runner holds the models parts."""
     layer, declaration = _declared(spec)
     state = dict(layer.state_dict(keep_vars=True))
     _install(layer, declaration)
-    runner, roles = _runner_of(layer), _roles_of(layer)
-    attention = layer.get_submodule(roles.attention)
-    parts = dict(roles.parts)
-    assert runner.input_norm is layer.get_submodule(roles.input_norm)
+    runner = _routed(layer).runner
+    parts = _parts_of(layer, declaration)
+    attention = parts.attention
+    assert runner.input_norm is parts.input_norm
     assert runner.qkv_proj is attention.qkv_proj
     assert runner.o_proj is attention.o_proj
     assert runner.rotary is attention.rotary_emb
-    assert runner.attn is attention.get_submodule(parts["attn"])
-    assert runner.q_norm is getattr(attention, "q_norm", None)
-    assert runner.k_norm is getattr(attention, "k_norm", None)
+    assert runner.attn is parts.attn
+    assert runner.q_norm is parts.q_norm
+    assert runner.k_norm is parts.k_norm
     # No copies, no new parameters: the model's state_dict is the same tensors.
     after = layer.state_dict(keep_vars=True)
     assert after.keys() == state.keys()
@@ -189,12 +194,13 @@ def test_decoder_routes_through_the_runner(
 ) -> None:
     """The installed forward is runner, then the layer's post norm and MLP."""
     layer, declaration = _declared(spec)
+    cls = type(layer)
     _install(layer, declaration)
-    assert isinstance(layer, norm_attn.NormAttnDecoder)
-    roles = _roles_of(layer)
+    assert type(layer) is cls  # No mixin: the runner is the instance's forward.
+    parts = _parts_of(layer, declaration)
     calls: list[tuple[torch.Tensor, ...]] = []
     meta = {"device": "meta", "dtype": torch.bfloat16}
-    hidden_size = int(_weight(layer.get_submodule(roles.input_norm)).shape[0])
+    hidden_size = int(_weight(parts.input_norm).shape[0])
     attn_out, summed, normed = (torch.empty(4, hidden_size, **meta) for _ in range(3))
 
     def runner(h: torch.Tensor, r: torch.Tensor, p: torch.Tensor) -> tuple:
@@ -206,20 +212,18 @@ def test_decoder_routes_through_the_runner(
         assert r is summed
         return normed, r
 
-    monkeypatch.setattr(_runner_of(layer), "forward", runner)
-    monkeypatch.setattr(layer.get_submodule(roles.post_norm), "forward", post_norm)
-    monkeypatch.setattr(layer.get_submodule(roles.mlp), "forward", torch.neg)
+    monkeypatch.setattr(_routed(layer).runner, "forward", runner)
+    monkeypatch.setattr(parts.post_norm, "forward", post_norm)
+    monkeypatch.setattr(parts.mlp, "forward", torch.neg)
     hidden, residual = (
         torch.empty(4, hidden_size, **meta),
         torch.empty(4, hidden_size, **meta),
     )
     positions = torch.empty(4, device="meta", dtype=torch.long)
-    call = {
-        roles.hidden_param: hidden,
-        roles.residual_param: residual,
-        roles.positions_param: positions,
-    }
-    out, out_residual = layer(**call)
+    # Every surveyed forward names the stream hidden_states/residual/positions.
+    out, out_residual = layer(
+        hidden_states=hidden, residual=residual, positions=positions
+    )
     assert len(calls) == 1
     assert all(
         a is b for a, b in zip(calls[0], (hidden, residual, positions), strict=True)
@@ -231,15 +235,14 @@ def test_decoder_routes_through_the_runner(
 def test_scopes_nest_on_qwen3_5() -> None:
     """Qwen3.5 declares both scopes; the block builds the attention runner itself."""
     layer = _build.build(check_subblock.FAMILIES[2])  # Qwen3.5-MoE, full attention
-    context = blocks.InstallContext(
+    context = InstallContext(
         tp=4,
-        dtype="bfloat16",
+        dtype=torch.bfloat16,
         buckets=(16, 8192),
-        override="collectives=reduce_scatter_all_gather",
-        model_plan="",
+        block_pin=Collectives.REDUCE_SCATTER_ALL_GATHER,
     )
     with set_current_vllm_config(_build.current_config()):
-        report = blocks.install(torch.nn.ModuleDict({"l": layer}), context)
+        report = installer.install(torch.nn.ModuleDict({"l": layer}), context)
     outcomes = [item.outcome for item in report]
     assert len(outcomes) == 1, outcomes  # The block installed the sub-block.
     assert "nested AttentionRunner" in outcomes[0], outcomes
@@ -248,7 +251,7 @@ def test_scopes_nest_on_qwen3_5() -> None:
     runner = block.attention
     assert isinstance(runner, AttentionRunner)
     assert runner.qkv_proj is layer.get_submodule("self_attn.qkv_proj")
-    assert runner.input_proj == "fused_qkv"
+    assert runner.input_proj is InputProj.FUSED_QKV
     assert runner.output_reduced is False
 
 

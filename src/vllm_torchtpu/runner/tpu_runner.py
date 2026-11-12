@@ -91,7 +91,7 @@ from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
-from vllm_torchtpu import blocks, envs, utils
+from vllm_torchtpu import envs, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -5790,18 +5790,30 @@ class TPUModelRunner(GPUModelRunner):
     def _install_blocks(self, model: torch.nn.Module) -> None:
         from vllm.distributed import get_tensor_model_parallel_world_size
 
+        from vllm_torchtpu.blocks import installer
+        from vllm_torchtpu.blocks.attn_moe import plan as block_plan
+        from vllm_torchtpu.blocks.context import InstallContext
+        from vllm_torchtpu.blocks.norm_attn import plan as subblock_plan
+
         hf_config = self.model_config.hf_text_config
         with set_current_vllm_config(self.vllm_config):
-            self._block_report = blocks.install(
+            self._block_report = installer.install(
                 model,
-                blocks.InstallContext(
+                InstallContext(
                     tp=get_tensor_model_parallel_world_size(),
-                    dtype=str(self.model_config.dtype).removeprefix("torch."),
+                    dtype=self.model_config.dtype,
                     buckets=tuple(self.num_tokens_paddings),
-                    override=envs.TPU_BLOCK_PLAN,
-                    model_plan=getattr(hf_config, "tpu_block_plan", "") or "",
-                    subblock_plan=envs.TPU_SUBBLOCK_PLAN,
-                    chip=get_chip_version().value,
+                    # The strings from the environment and the model config
+                    # are parsed here, once.
+                    block_pin=block_plan.parse_pin(
+                        envs.TPU_BLOCK_PLAN, "TPU_BLOCK_PLAN"
+                    ),
+                    block_model_pin=block_plan.parse_pin(
+                        getattr(hf_config, "tpu_block_plan", "") or "",
+                        "tpu_block_plan",
+                    ),
+                    subblock_pins=subblock_plan.parse_pins(envs.TPU_SUBBLOCK_PLAN),
+                    chip=get_chip_version(),
                 ),
             )
 

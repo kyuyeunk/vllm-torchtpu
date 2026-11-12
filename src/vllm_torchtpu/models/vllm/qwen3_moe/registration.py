@@ -17,9 +17,16 @@ from vllm.model_executor.models.qwen3_moe import Qwen3MoeDecoderLayer
 
 from vllm_torchtpu.blocks import declare_block
 from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnParts, pre_norm_parts
+from vllm_torchtpu.blocks.stream import positions_first
 
 
 @declare_block(Qwen3MoeDecoderLayer)
 def qwen3_moe_attention(layer: Qwen3MoeDecoderLayer) -> NormAttnParts:
     """The pre-norm attention sub-block (norm_then_attention)."""
-    return pre_norm_parts(layer, layer.self_attn, output_gate=False)
+    return pre_norm_parts(
+        layer,
+        layer.self_attn,
+        qk_norm=(layer.self_attn.q_norm, layer.self_attn.k_norm),
+        output_gate=False,
+        stream=positions_first(layer),
+    )

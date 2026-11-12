@@ -18,6 +18,7 @@ from vllm.model_executor.models.glm4_moe import Glm4MoE, Glm4MoeDecoderLayer
 from vllm_torchtpu.blocks import declare_block
 from vllm_torchtpu.blocks.attn_moe.pattern import AttnMoEParts, pre_norm_moe_parts
 from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnParts, pre_norm_parts
+from vllm_torchtpu.blocks.stream import attend_with_positions, positions_first
 
 
 @declare_block(Glm4MoeDecoderLayer)
@@ -26,10 +27,25 @@ def glm4_moe_block(layer: Glm4MoeDecoderLayer) -> AttnMoEParts | None:
     if not isinstance(layer.mlp, Glm4MoE):  # The first_k_dense_replace layers.
         return None
     attention = layer.self_attn
-    return pre_norm_moe_parts(layer, attention, attention.o_proj, layer.mlp)
+    return pre_norm_moe_parts(
+        layer,
+        attention,
+        attention.o_proj,
+        layer.mlp,
+        stream=positions_first(layer),
+        attend=attend_with_positions(attention),
+    )
 
 
 @declare_block(Glm4MoeDecoderLayer)
 def glm4_moe_attention(layer: Glm4MoeDecoderLayer) -> NormAttnParts:
     """The pre-norm attention sub-block (norm_then_attention), nested in the block."""
-    return pre_norm_parts(layer, layer.self_attn, output_gate=False)
+    attention = layer.self_attn
+    qk_norm = (attention.q_norm, attention.k_norm) if attention.use_qk_norm else None
+    return pre_norm_parts(
+        layer,
+        attention,
+        qk_norm=qk_norm,
+        output_gate=False,
+        stream=positions_first(layer),
+    )

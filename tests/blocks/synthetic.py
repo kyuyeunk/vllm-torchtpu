@@ -24,13 +24,14 @@ import dataclasses
 import torch
 import torch.nn.functional as F  # noqa: N812 - torch's alias
 from torch import nn
-from vllm.model_executor.layers import layernorm
+from vllm.model_executor.layers import layernorm, linear
 
 from vllm_torchtpu.blocks.norm_attn import runner as runner_mod
 from vllm_torchtpu.blocks.norm_attn.runner import (
     AttentionParts,
     AttentionRunner,
     AttnConfig,
+    InputProj,
 )
 
 HIDDEN = 64
@@ -49,12 +50,14 @@ class InputNorm(nn.Module):
     """vLLM's RMSNorm contract: ``x -> normed``, ``(x, residual) -> (normed, sum)``."""
 
     def __init__(self, dim: int) -> None:
+        """Builds the synthetic part."""
         super().__init__()
         self.weight = nn.Parameter(1 + 0.1 * torch.randn(dim))
 
     def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """The part's call contract, in plain torch."""
         if residual is None:
             return _rms(x, self.weight)
         summed = (x.float() + residual.float()).to(x.dtype)
@@ -70,10 +73,12 @@ class HeadNorm(layernorm.RMSNorm):
     """
 
     def __init__(self, dim: int) -> None:
+        """Builds the synthetic part."""
         nn.Module.__init__(self)
         self.weight = nn.Parameter(1 + 0.1 * torch.randn(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # pyright: ignore[reportIncompatibleMethodOverride]
+        """The part's call contract, in plain torch."""
         return _rms(x, self.weight)
 
 
@@ -81,18 +86,21 @@ class WholeNorm(nn.Module):
     """A q/k norm that is not an RMSNorm (stands for a TP-wide LayerNorm)."""
 
     def __init__(self, dim: int) -> None:
+        """Builds the synthetic part."""
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
 
 
-class UnquantizedLinearMethod:
-    """Stands for vLLM's; the capability reads the quant method's class name."""
+class UnquantizedLinearMethod(linear.UnquantizedLinearMethod):
+    """vLLM's, by type (the capability checks it); the GEMM is this file's."""
 
-    def apply(
+    def apply(  # pyright: ignore[reportIncompatibleMethodOverride]
         self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
         """The GEMM alone, as vLLM's ``apply``: no reduction over ranks."""
-        return F.linear(x, layer.weight, bias)
+        weight = layer.weight
+        assert isinstance(weight, torch.Tensor)
+        return F.linear(x, weight, bias)
 
 
 class AwqLinearMethod:
@@ -103,6 +111,7 @@ class Linear(nn.Module):
     """vLLM's linear contract: ``x -> (out, output_bias)``, the bias already added."""
 
     def __init__(self, n_in: int, n_out: int, *, bias: bool = False) -> None:
+        """Builds the synthetic part."""
         super().__init__()
         self.weight = nn.Parameter(torch.randn(n_out, n_in) / n_in**0.5)
         self.bias = nn.Parameter(0.1 * torch.randn(n_out)) if bias else None
@@ -113,6 +122,7 @@ class Linear(nn.Module):
         self.skip_bias_add = False
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """The part's call contract, in plain torch."""
         return F.linear(x, self.weight, self.bias), None
 
 
@@ -120,6 +130,7 @@ class NeoxRotary(nn.Module):
     """NeoX RoPE on the first ``rotary_dim`` values of each head, on flat q and k."""
 
     def __init__(self, head_dim: int, rotary_dim: int, *, neox: bool = True) -> None:
+        """Builds the synthetic part."""
         super().__init__()
         self.head_dim, self.rotary_dim = head_dim, rotary_dim
         self.is_neox_style = neox
@@ -140,6 +151,7 @@ class NeoxRotary(nn.Module):
     def forward(
         self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The part's call contract, in plain torch."""
         return self._rotate(q, positions), self._rotate(k, positions)
 
 
@@ -155,6 +167,7 @@ class CausalGqa(nn.Module):
         sinks: bool = False,
         kv_sharing: str | None = None,
     ) -> None:
+        """Builds the synthetic part."""
         super().__init__()
         self.num_heads, self.num_kv_heads, self.head_dim = (
             num_heads,
@@ -167,6 +180,7 @@ class CausalGqa(nn.Module):
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> torch.Tensor:
+        """The part's call contract, in plain torch."""
         t, h, d = q.shape[0], self.num_heads, self.head_dim
         q = q.view(t, h, d).transpose(0, 1)
         k = k.view(t, self.num_kv_heads, d).transpose(0, 1)
@@ -187,6 +201,7 @@ class Roles:
     rotary: str = "full"  # or "partial": the first half of each head.
 
     def config(self) -> AttnConfig:
+        """Config."""
         return AttnConfig(
             num_heads=NUM_KV_HEADS * self.gqa,
             num_kv_heads=NUM_KV_HEADS,
@@ -211,6 +226,7 @@ class Attention(nn.Module):
         q_norm: nn.Module | None = None,
         neox: bool = True,
     ) -> None:
+        """Builds the synthetic part."""
         super().__init__()
         c = roles.config()
         self.num_heads, self.num_kv_heads, self.head_dim = (
@@ -236,19 +252,21 @@ class Attention(nn.Module):
 def setup_parts(
     roles: Roles, dtype: torch.dtype = torch.float32
 ) -> tuple[InputNorm, Attention]:
+    """Setup parts."""
     torch.manual_seed(0)
     return InputNorm(HIDDEN).to(dtype), Attention(roles).to(dtype)
 
 
-def build_runner(
+def build_runner(  # noqa: PLR0913 - the parts and options a runner or reference takes
     norm: nn.Module,
     attention: Attention,
     config: AttnConfig,
-    input_proj: str = "unfused",
+    input_proj: InputProj = InputProj.UNFUSED,
     fused_op: runner_mod.FusedOp | None = None,
     *,
     output_reduced: bool = True,
 ) -> AttentionRunner:
+    """Build runner."""
     parts = AttentionParts(
         input_norm=norm,
         qkv_proj=attention.qkv_proj,
@@ -269,15 +287,17 @@ def build_runner(
 
 
 def make_inputs(
-    first: bool, dtype: torch.dtype = torch.float32
+    first: bool,  # noqa: FBT001 - the test grids pass it positionally
+    dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Make inputs."""
     torch.manual_seed(1)
     hidden = torch.randn(TOKENS, HIDDEN, dtype=dtype)
     residual = None if first else torch.randn(TOKENS, HIDDEN, dtype=dtype)
     return hidden, residual, torch.arange(TOKENS) * 3
 
 
-def reference_forward(
+def reference_forward(  # noqa: PLR0913 - the parts and options a runner or reference takes
     roles: Roles,
     norm: InputNorm,
     attention: Attention,

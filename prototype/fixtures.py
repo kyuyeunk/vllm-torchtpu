@@ -30,6 +30,7 @@ from vllm.model_executor.layers.linear import RowParallelLinear
 
 from vllm_torchtpu.blocks.attn_moe.pattern import AttnMoEParts
 from vllm_torchtpu.blocks.parts import as_kind
+from vllm_torchtpu.blocks.stream import attend_with_positions, hidden_residual_positions
 
 
 class _Children(nn.Module):
@@ -96,4 +97,6 @@ def renamed_parts(layer: _Children) -> AttnMoEParts:
         moe=layer.ffn,
         router=layer.ffn.get_submodule("gate"),
         experts=layer.ffn.get_submodule("experts"),
+        stream=hidden_residual_positions(layer),  # pyright: ignore[reportArgumentType]
+        attend=attend_with_positions(layer.mixer),  # pyright: ignore[reportArgumentType]
     )
