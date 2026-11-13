@@ -49,10 +49,10 @@ def _main_chunk_counter(
 @pytest.mark.parametrize(
     ("tokens", "most_model_len", "max_cap", "most_cap"),
     [
-        ([1, 1, 3, 3, 16], None, 2, None),
-        ([1, 1, 1, 1, 100, 2], 32, 2, 3),
-        ([1, 1, 1, 1, 2, 2, 2], 32, 2, 3),
-        ([5], 4, 1, 4),
+        pytest.param([1, 1, 3, 3, 16], None, 2, None, id="no_most_model_len"),
+        pytest.param([1, 1, 1, 1, 100, 2], 32, 2, 3, id="long_request_in_tail"),
+        pytest.param([1, 1, 1, 1, 2, 2, 2], 32, 2, 3, id="all_within_most_model_len"),
+        pytest.param([5], 4, 1, 4, id="one_long_request"),
     ],
 )
 def test_split_chunks_matches_main(
