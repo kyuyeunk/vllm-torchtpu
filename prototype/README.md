@@ -17,6 +17,19 @@ needed. torch-tpu prints start-up lines on stderr, left out below. To see a
 step as it was, check out its commit (`git checkout <commit>`); every
 command below also runs at the branch head.
 
+## Layout
+
+At the branch head (earlier step commits predate this layout):
+
+| Path | What it holds |
+|---|---|
+| `src/vllm_torchtpu/layers/core/moe_plan.py` | The planner: `Combine`, `VARIANTS`, `pick_combine` |
+| `tests/layers/core/test_moe_plan.py` | Which variants can run a call and which one runs |
+| `tests/layers/core/moe_combine_moves.py` | The 48-call grid, and what each call runs under a setting |
+| `tests/layers/core/moe_parallel_changes.py` | The two parallel changes: touched files, conflict hunks, the plan at each commit |
+| `tests/layers/core/test_moe_combine_moves.py` | Asserts the tables of steps 2, 3 and 4 below |
+| `prototype/*.py` | Demos that print those tables from the `tests/` helpers above |
+
 This branch is for reading, not merging. Tests in
 `tests/layers/core/test_fused_moe_gmm.py` that patch the internals the
 first step removes (`_select_ragged_gather_reduce`, the inline combine
@@ -58,7 +71,7 @@ The history, from origin/main 101260f1f:
 | 2 | The kernel declares its limits | [`ragged_gather_reduce_supports`](https://github.com/kyuyeunk/vllm-torchtpu/blob/28cf85a1b183efca687994b731b245934b1d2b08/src/vllm_torchtpu/kernels/sparse_core/ragged_gather_reduce_v4.py#L42-L57) (v4) |
 | 3 | Both changes meet in one table | [`Combine`](https://github.com/kyuyeunk/vllm-torchtpu/blob/6e81518d82fd946729ddd8f1118b9160a1693404/src/vllm_torchtpu/layers/core/moe_plan.py#L48-L68), [`VARIANTS`](https://github.com/kyuyeunk/vllm-torchtpu/blob/6e81518d82fd946729ddd8f1118b9160a1693404/src/vllm_torchtpu/layers/core/moe_plan.py#L293-L318) |
 | 3 | B's variant merges cleanly | [`_segment_sum`, `_segment_sum_supports`](https://github.com/kyuyeunk/vllm-torchtpu/blob/6e81518d82fd946729ddd8f1118b9160a1693404/src/vllm_torchtpu/layers/core/moe_plan.py#L218-L238) |
-| 3 | The conflict hunks; the plan at each commit; the overlap report | [`_conflicts`](https://github.com/kyuyeunk/vllm-torchtpu/blob/732d902c24b9948738feda7afb13ddcb2eb746db/prototype/parallel_changes.py#L132-L146), [`_plan_at`](https://github.com/kyuyeunk/vllm-torchtpu/blob/732d902c24b9948738feda7afb13ddcb2eb746db/prototype/parallel_changes.py#L111-L129), [`main`](https://github.com/kyuyeunk/vllm-torchtpu/blob/732d902c24b9948738feda7afb13ddcb2eb746db/prototype/parallel_changes.py#L165-L222) |
+| 3 | The conflict hunks; the plan at each commit; the overlap report | At the script's commit: [`_conflicts`](https://github.com/kyuyeunk/vllm-torchtpu/blob/732d902c24b9948738feda7afb13ddcb2eb746db/prototype/parallel_changes.py#L132-L146), [`_plan_at`](https://github.com/kyuyeunk/vllm-torchtpu/blob/732d902c24b9948738feda7afb13ddcb2eb746db/prototype/parallel_changes.py#L111-L129), [`main`](https://github.com/kyuyeunk/vllm-torchtpu/blob/732d902c24b9948738feda7afb13ddcb2eb746db/prototype/parallel_changes.py#L165-L222). At the branch head: `_conflicts` and `_plan_at` in `tests/layers/core/moe_parallel_changes.py` (L153-L167, L124-L150), the report in `prototype/parallel_changes.py` (`main`, L56-L94) |
 | 4 | The new input is a defaulted field | [`GmmOut`](https://github.com/kyuyeunk/vllm-torchtpu/blob/66b2f99b02e013f9cb8c08a8cd30fa041094ead6/src/vllm_torchtpu/layers/core/moe_plan.py#L145-L163) |
 | 4 | Only the variant that reads it receives it | [`Variant`](https://github.com/kyuyeunk/vllm-torchtpu/blob/66b2f99b02e013f9cb8c08a8cd30fa041094ead6/src/vllm_torchtpu/layers/core/moe_plan.py#L321-L336), [`VARIANTS[Combine.SKIP_EMPTY]`](https://github.com/kyuyeunk/vllm-torchtpu/blob/66b2f99b02e013f9cb8c08a8cd30fa041094ead6/src/vllm_torchtpu/layers/core/moe_plan.py#L364-L369), [`_optional_inputs`](https://github.com/kyuyeunk/vllm-torchtpu/blob/66b2f99b02e013f9cb8c08a8cd30fa041094ead6/src/vllm_torchtpu/layers/core/moe_plan.py#L389-L395) |
 | 4 | The variant's adapters | [`_skip_empty`, `_skip_empty_supports`](https://github.com/kyuyeunk/vllm-torchtpu/blob/66b2f99b02e013f9cb8c08a8cd30fa041094ead6/src/vllm_torchtpu/layers/core/moe_plan.py#L286-L318) |
@@ -201,3 +214,10 @@ stub.
 
 10 cases at step 1, 11 at step 2, 12 after the merge, 14 at step 4; all
 pass at each step.
+
+    JAX_PLATFORMS=cpu PYTHONPATH=src python -m pytest tests/layers/core/test_moe_combine_moves.py
+
+At the branch head only: 8 cases asserting the tables of steps 2, 3 and 4
+above, so a change that moves a call fails a test, not just a demo. The
+step 3 cases read git history and need the merge as the last merge in
+HEAD's history. All of these run on CPU.
