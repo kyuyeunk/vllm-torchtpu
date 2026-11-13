@@ -24,7 +24,7 @@ from torch import nn
 from vllm.config import set_current_vllm_config
 from vllm.model_executor.models.qwen3_5 import Qwen3_5RMSNorm
 
-from prototype import _build, fixtures
+from tests.blocks import _build, fixtures
 from vllm_torchtpu import blocks
 from vllm_torchtpu.blocks.attn_moe import conform, forward
 from vllm_torchtpu.blocks.attn_moe import pattern as pattern_mod
@@ -39,6 +39,7 @@ from vllm_torchtpu.compilation import shape_variants
 
 @pytest.mark.parametrize("spec", _build.SPECS, ids=lambda s: s.name)
 def test_every_declaration_conforms(spec: _build.Spec) -> None:
+    """Every declared surveyed layer conforms; out_proj is inside attention."""
     layer = _build.build(spec)
     blocks.load_declarations()
     declaration = blocks.DECLARATIONS.get(type(layer))
@@ -69,7 +70,10 @@ def test_mismatch_raises_at_install(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class _CpuRMSNorm(Qwen3_5RMSNorm):
-    def dispatch_forward(self, compile_native: bool = False):  # noqa: ANN201, ARG002
+    def dispatch_forward(  # noqa: ANN202 - vLLM's untyped forward_native
+        self,
+        compile_native: bool = False,  # noqa: ARG002, FBT001, FBT002 - vLLM's signature
+    ):
         return self.forward_native
 
 
@@ -78,7 +82,7 @@ class _Fn(nn.Module):
         super().__init__()
         self.fn = fn
 
-    def forward(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
+    def forward(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN202 - any stub
         return self.fn(*args, **kwargs)
 
 
@@ -88,12 +92,12 @@ def _layer(
     layer = forward.AttentionMoEBlock()
     layer.input_layernorm = _CpuRMSNorm(d)
     layer.post_attention_layernorm = _CpuRMSNorm(d)
-    layer.self_attn = _Fn(lambda hidden_states, positions: hidden_states)
+    layer.self_attn = _Fn(lambda hidden_states, positions: hidden_states)  # noqa: ARG005 - the role's keywords
     layer.mlp = nn.Module()
     layer.mlp.gate = _Fn(
         lambda h: (gate_rows.append(h.shape[0]), torch.zeros(h.shape[0], 4), None)[1:]
     )
-    layer.mlp.experts = _Fn(lambda hidden_states, router_logits: hidden_states)
+    layer.mlp.experts = _Fn(lambda hidden_states, router_logits: hidden_states)  # noqa: ARG005 - the role's keywords
     parts = pattern_mod.ForwardParts(
         input_norm=layer.input_layernorm,
         post_norm=layer.post_attention_layernorm,
@@ -110,12 +114,12 @@ def _record(monkeypatch: pytest.MonkeyPatch, calls: list[str], tp: int) -> None:
     monkeypatch.setattr(
         forward,
         "tensor_model_parallel_reduce_scatter",
-        lambda x, dim=0: (calls.append("rs"), x[: x.shape[0] // tp])[1],
+        lambda x, dim=0: (calls.append("rs"), x[: x.shape[0] // tp])[1],  # noqa: ARG005 - the collective's signature
     )
     monkeypatch.setattr(
         forward,
         "tensor_model_parallel_all_gather",
-        lambda x, dim=0: (calls.append("ag"), torch.cat([x] * tp, dim=0))[1],
+        lambda x, dim=0: (calls.append("ag"), torch.cat([x] * tp, dim=0))[1],  # noqa: ARG005 - the collective's signature
     )
     monkeypatch.setattr(
         forward,

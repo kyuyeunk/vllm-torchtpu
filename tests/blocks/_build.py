@@ -14,10 +14,11 @@
 """Builds one decoder layer of each surveyed vLLM MoE model on the meta device.
 
 Every layer is built from a tiny config through the model's own constructor in
-a single-rank gloo world, with vLLM's platform pinned to CPU by the package
-``__init__``. Nothing loads libtpu. Each spec calls its class's constructor
-with the arguments that class takes (``make``), since each model takes a
-different subset of (vllm_config, config, cache_config, quant_config, ...).
+a single-rank gloo world, with vLLM's platform pinned to CPU by
+``tests/blocks/_platform.py``. Nothing loads libtpu. Each spec calls its
+class's constructor with the arguments that class takes (``make``), since
+each model takes a different subset of (vllm_config, config, cache_config,
+quant_config, ...).
 """
 
 import contextlib
@@ -56,7 +57,10 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 
 def _tiny[C](
-    cls: Callable[..., C], *, intermediate_size: int = 128, **overrides: Any
+    cls: Callable[..., C],
+    *,
+    intermediate_size: int = 128,
+    **overrides: Any,  # noqa: ANN401 - config fields of any type
 ) -> Callable[[], C]:
     """The config ``cls`` at the shared tiny sizes, with ``overrides``.
 
@@ -118,8 +122,8 @@ def _gated_experts_on_cpu() -> Iterator[None]:
         *,
         ckpt_names: tuple[str, str, str | None],
         activation: str,
-        **kwargs: Any,  # noqa: ANN401
-    ) -> Any:  # noqa: ANN401
+        **kwargs: Any,  # noqa: ANN401 - FusedMoEFactory's own arguments
+    ) -> Any:  # noqa: ANN401 - whatever FusedMoEFactory builds
         del activation
         gate, down, _ = ckpt_names
         return real(**kwargs, activation="silu", ckpt_names=(gate, down, "w3"))
@@ -424,7 +428,8 @@ def _world() -> None:
 
 @contextlib.contextmanager
 def _config_for(
-    hf: Any,  # noqa: ANN401
+    hf: Any,  # noqa: ANN401 - a transformers config class
+    *,
     use_mla: bool,
     dtype: torch.dtype,
 ) -> Iterator[VllmConfig]:
@@ -462,7 +467,7 @@ def build(
     default = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
     with (
-        _config_for(hf, spec.use_mla, dtype) as config,
+        _config_for(hf, use_mla=spec.use_mla, dtype=dtype) as config,
         torch.device(device),
         spec.stub(),
         contextlib.ExitStack() as restore,

@@ -17,8 +17,8 @@ environment flag, and writing three children's decisions after they are built.
 | The model owner declares, with a typed binding function | [`qwen3_5_block`](../src/vllm_torchtpu/models/vllm/qwen3_5/registration.py#L34-L62) in `qwen3_5/registration.py` (L34-L62); ten more models declare the same way, e.g. [`mixtral/registration.py`](../src/vllm_torchtpu/models/vllm/mixtral/registration.py) |
 | The declaration API and the installer | [`declare_block`](../src/vllm_torchtpu/blocks/__init__.py#L109-L125) in `__init__.py` (L109-L125) |
 |  | [`install`](../src/vllm_torchtpu/blocks/__init__.py#L193-L222) in `__init__.py` (L193-L222) |
-| A declared mismatch raises at startup, naming the edge and line | the `raise BlockConformanceError` in [`install`](../src/vllm_torchtpu/blocks/__init__.py#L215-L217) (L215-L217); shown by [`mismatch_raises`](../prototype/check_block.py#L159-L177) in `check_block.py` (L159-L177) |
-| CI fails on the same mismatch | [`conformance`](../prototype/check_block.py#L91-L103) in `check_block.py` (L91-L103), with `PLANT_MISMATCH` (L51-L52) declaring the misordered fixture; `test_mismatch_raises_at_install` in `tests/blocks/` |
+| A declared mismatch raises at startup, naming the edge and line | the `raise BlockConformanceError` in [`install`](../src/vllm_torchtpu/blocks/__init__.py#L215-L217) (L215-L217); shown by [`mismatch_raises`](../tests/blocks/block_check.py#L162-L181) in `tests/blocks/block_check.py` (L162-L181) |
+| CI fails on the same mismatch | [`conformance`](../tests/blocks/block_check.py#L91-L104) in `tests/blocks/block_check.py` (L91-L104), with `PLANT_MISMATCH` (L51-L52) declaring the misordered fixture; `test_mismatch_raises_at_install` and `test_block_check.py` in `tests/blocks/` |
 | The pattern | [`attn_then_moe`](../src/vllm_torchtpu/blocks/attn_moe/pattern.py#L54-L67) in `pattern.py` (L54-L67) |
 | The parts a binding function returns, kinds checked when built | [`AttnMoEParts`](../src/vllm_torchtpu/blocks/attn_moe/pattern.py#L136-L197) in `pattern.py` (L136-L197) |
 | How the layer's forward and its attention are called, with no parameter name read | [`Stream`](../src/vllm_torchtpu/blocks/stream.py#L36-L52) in `stream.py` (L36-L52) |
@@ -29,10 +29,10 @@ environment flag, and writing three children's decisions after they are built.
 | Children's contracts set once, then read-only | [`bind_child_contracts`](../src/vllm_torchtpu/blocks/attn_moe/contract_adapter.py#L103-L156) in `contract_adapter.py` (L103-L156) |
 | #1492's forward, on the declared parts | [`AttentionMoEBlock`](../src/vllm_torchtpu/blocks/attn_moe/forward.py#L37-L96) in `forward.py` (L37-L96) |
 | The runner hook | [`_install_blocks`](../src/vllm_torchtpu/runner/tpu_runner.py#L5786-L5806) in `tpu_runner.py` (L5786-L5806) |
-| The suggester proposes, never applies | [`propose`](../prototype/suggest_blocks.py#L84-L139) in `suggest_blocks.py` (L84-L139) |
-| Every declared layer's forward equals upstream on a CPU (TP 1) | [`check`](../prototype/forward_equivalence.py#L160-L189) and the stand-ins [`_stand_ins`](../prototype/forward_equivalence.py#L93-L144) in `forward_equivalence.py` |
-| Nemotron-H's layer is built on a CPU to be checked | [`_gated_experts_on_cpu`](../prototype/_build.py#L105-L131) in `_build.py` (L105-L131) |
-| An outside write raises | [`outside_write`](../prototype/check_block.py#L145-L156) in `check_block.py` (L145-L156) |
+| The suggester proposes, never applies | [`propose`](../tests/blocks/suggest_blocks.py#L89-L144) in `tests/blocks/suggest_blocks.py` (L89-L144) |
+| Every declared layer's forward equals upstream on a CPU (TP 1) | [`check`](../tests/blocks/forward_equivalence.py#L176-L205) and the stand-ins [`_stand_ins`](../tests/blocks/forward_equivalence.py#L99-L150) in `tests/blocks/forward_equivalence.py` |
+| Nemotron-H's layer is built on a CPU to be checked | [`_gated_experts_on_cpu`](../tests/blocks/_build.py#L109-L135) in `tests/blocks/_build.py` (L109-L135) |
+| An outside write raises | [`outside_write`](../tests/blocks/block_check.py#L147-L159) in `tests/blocks/block_check.py` (L147-L159) |
 
 Here the model owner **declares** that its layer conforms to a pattern; the
 framework **checks** the declaration and **owns** what runs under it.
@@ -137,10 +137,16 @@ python -m prototype.forward_equivalence
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 JAX_PLATFORMS=cpu python -m pytest tests/blocks
 ```
 
+The scripts in `prototype/` only print. The checks they print live in
+`tests/blocks/` (`block_check.py`, `suggest_blocks.py`,
+`forward_equivalence.py`, with `_build.py` and `fixtures.py`), and pytest
+asserts the same checks (`test_block_check.py`, `test_suggest_blocks.py`,
+`test_forward_equivalence.py`).
+
 ### `prototype.check_block`
 
 Conformance on the declared layers and planted fixtures
-(`prototype/fixtures.py`), the plan per bucket at Qwen3.5-35B-A3B's size, and
+(`tests/blocks/fixtures.py`), the plan per bucket at Qwen3.5-35B-A3B's size, and
 the read-only guard. Output (warnings omitted):
 
 ```
@@ -181,8 +187,9 @@ the read-only guard. Output (warnings omitted):
 **A declared mismatch fails CI and raises at startup.** A silent decline would
 hide the bug (a TPU device bug once made every layer decline silently), so a
 declared layer that does not conform stops startup with the edge and line.
-CI catches it first: with `PLANT_MISMATCH = True` commented in, check 1 treats
-the misordered fixture as a declared model and the command exits 1:
+CI catches it first: with `PLANT_MISMATCH = True` commented in
+(`tests/blocks/block_check.py`), check 1 treats the misordered fixture as a
+declared model, the command exits 1 and `test_block_check.py` fails:
 
 ```text
 1 conformance: declared layers and planted fixtures
@@ -196,7 +203,7 @@ the misordered fixture as a declared model and the command exits 1:
 
 A suggestion tool; it applies nothing. For one decoder layer per surveyed
 vLLM MoE model, built on the meta device from a tiny config through the
-model's own constructor (`prototype/_build.py`), it finds children of the role
+model's own constructor (`tests/blocks/_build.py`), it finds children of the role
 kinds, tries every binding of them under every forward convention
 (`blocks/stream.py`) and runs the same conformance check. A layer that
 conforms gets the binding function its model owner could add (the first in
@@ -378,11 +385,13 @@ mechanism behind #1492's drift on a TPU, so the wiring check runs in float32.
 ### `tests/blocks`
 
 The merge gate (every declaration conforms, one case per surveyed layer;
-undeclared layers skip) and #1492's call-order and warmup-gate tests, ported
-to the parts-based forward:
+undeclared layers skip), #1492's call-order and warmup-gate tests, ported
+to the parts-based forward, and the checks the three scripts above print
+(each check passes; each layer's suggestion and forward comparison is the
+recorded one):
 
 ```
-14 passed, 5 skipped
+50 passed, 5 skipped
 ```
 
 ## TPU results

@@ -11,21 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Prototype: a block-scope matcher for the attention-then-MoE overlap.
+"""Prototype demos: each prints a table of the README.
 
-Everything here runs on a CPU. Importing the package keeps torch from
-autoloading the TPU backend and pins vLLM's platform to CPU before any model
-code loads.
+Run from the repository root, ``python -m prototype.<name>``. The checks and
+fixtures they call live in ``tests/blocks/``; importing this package first
+pins vLLM's platform to CPU (``tests/blocks/_platform.py``).
 """
 
-import os
-
-# The environment is the process boundary these switches cross.
-os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")  # str-ok: env var
-os.environ.setdefault("JAX_PLATFORMS", "cpu")  # str-ok: env var
-os.environ.setdefault("VLLM_LOGGING_LEVEL", "ERROR")  # str-ok: env var
-
-import vllm.platforms  # noqa: E402 - after the environment above
-from vllm.platforms.cpu import CpuPlatform  # noqa: E402
-
-vllm.platforms._current_platform = CpuPlatform()  # noqa: SLF001 - pin before use
+import tests.blocks._platform  # noqa: F401  # pyright: ignore[reportUnusedImport] - pins the platform

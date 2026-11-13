@@ -13,4 +13,4 @@
 # limitations under the License.
 """Pins vLLM's platform to CPU before any test module imports model code."""
 
-import prototype  # noqa: F401 - pins the platform on import
+import tests.blocks._platform  # noqa: F401  # pyright: ignore[reportUnusedImport] - pins the platform
