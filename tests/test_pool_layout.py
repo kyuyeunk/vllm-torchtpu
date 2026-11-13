@@ -50,17 +50,27 @@ def test_runner_block_size_reads_the_record() -> None:
     assert runner.block_size == 2048
 
 
-def test_kv_transfer_reads_the_layout_vllm_resolved() -> None:
-    """KV transfer asks vLLM's resolved layout, not the env var."""
+def test_kv_transfer_raises_before_vllm_resolves_the_layout() -> None:
+    """KV transfer asks vLLM's resolved layout; unresolved, it raises."""
     from vllm_torchtpu.distributed.kv_transfer import tpu_connector as tc
 
-    cc = _cache_config()
     with pytest.raises(ValueError, match="not been resolved"):
-        tc._raiden_seq_on_lane_layout(cc)  # noqa: SLF001 (the helper under test)
-    for layout in KVCacheLayout:
-        cc.kv_cache_layout = layout.name
-        seq_on_lane = tc._raiden_seq_on_lane_layout(cc)  # noqa: SLF001
-        assert seq_on_lane is (layout is KVCacheLayout.LBHNC)
+        _ = tc._raiden_seq_on_lane_layout(_cache_config())  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - the helper under test
+
+
+@pytest.mark.parametrize(
+    "layout", list(KVCacheLayout), ids=[layout.name for layout in KVCacheLayout]
+)
+def test_kv_transfer_reads_the_layout_vllm_resolved(layout: KVCacheLayout) -> None:
+    """KV transfer reads vLLM's resolved layout, not the env var."""
+    from vllm_torchtpu.distributed.kv_transfer import (  # noqa: PLC0415 - only the KV transfer tests load the connector
+        tpu_connector as tc,
+    )
+
+    cc = _cache_config()
+    cc.kv_cache_layout = layout.name
+    seq_on_lane = tc._raiden_seq_on_lane_layout(cc)  # noqa: SLF001  # pyright: ignore[reportPrivateUsage] - the helper under test
+    assert seq_on_lane is (layout is KVCacheLayout.LBHNC)
 
 
 # Ratchet: direct reads of pool-layout facts outside the record. Each entry is
