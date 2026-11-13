@@ -59,7 +59,7 @@ def pytest_collection_modifyitems(items):
     )
 
 
-def pytest_addoption(parser):
+def pytest_addoption(parser: pytest.Parser) -> None:
     """Add --use-tpu command line option."""
     parser.addoption(
         "--use-tpu",
@@ -67,6 +67,31 @@ def pytest_addoption(parser):
         default=True,
         help="Run tests on TPU device instead of CPU",
     )
+    parser.addoption(
+        "--run-compile-tier",
+        action="store_true",
+        default=False,
+        help="Run compile_tier tests (need libtpu, no device)",
+    )
+    parser.addoption(
+        "--run-tpu",
+        action="store_true",
+        default=False,
+        help="Run tpu tests (need a real TPU device)",
+    )
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Skips compile_tier and tpu tests unless their option is passed.
+
+    A default run is CPU only: these tiers load libtpu, and the real device
+    tier also holds the chip.
+    """
+    run_compile_tier = item.config.getoption("--run-compile-tier")
+    if item.get_closest_marker("compile_tier") and not run_compile_tier:
+        pytest.skip("compile_tier: pass --run-compile-tier to run")
+    if item.get_closest_marker("tpu") and not item.config.getoption("--run-tpu"):
+        pytest.skip("tpu: pass --run-tpu to run")
 
 
 @pytest.fixture(autouse=True)

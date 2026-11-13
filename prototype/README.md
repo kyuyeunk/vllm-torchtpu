@@ -10,8 +10,8 @@ a lower level from reaching up or re-deciding what it was handed:
 | What a lower level must not do | Check |
 |---|---|
 | Reach up: import a higher scope | import-linter `layers` contracts in `.importlinter` |
-| Re-decide: accept a decision nobody made | resolved types (`resolution.require_no_default`) and `prototype/check_handoff.py` |
-| Ignore: drop a decision it was handed | `prototype/check_dead_fields.py` |
+| Re-decide: accept a decision nobody made | resolved types (`resolution.require_no_default`) and `tests/layers/core/test_handoff.py` |
+| Ignore: drop a decision it was handed | `tests/layers/core/test_dead_fields.py` (compile tier) |
 
 ## Where to look
 
@@ -23,8 +23,8 @@ a lower level from reaching up or re-deciding what it was handed:
 | The resolved plan | [`MoeCombinePlan`](../src/vllm_torchtpu/layers/core/moe_plan.py#L71-L88) in `moe_plan.py` (L71-L88) |
 | It decides once | [`plan_combine`](../src/vllm_torchtpu/layers/core/moe_plan.py#L91-L170) in `moe_plan.py` (L91-L170) |
 | The executor runs the plan only | [`moe_combine`](../src/vllm_torchtpu/layers/core/fused_moe_gmm.py#L573-L665) in `fused_moe_gmm.py` (L573-L665) |
-| No X | None reaches a child | [`main`](../prototype/check_handoff.py#L40-L55) in `check_handoff.py` (L40-L55) |
-| Dead-field report | [`traced, main`](../prototype/check_dead_fields.py#L64-L108) in `check_dead_fields.py` (L64-L108) |
+| No X | None reaches a child | [`_module_receivers, receivers`](../tests/layers/core/handoff_check.py#L75-L97) in `handoff_check.py` (L75-L97) |
+| Dead-field report | [`traced` to `fields_never_read`](../tests/layers/core/dead_fields_check.py#L78-L139) in `dead_fields_check.py` (L78-L139) |
 
 The branch applies them to the MoE combine. It moves the combine decision out
 of `moe_gmm` into `layers/core/moe_plan.py`: `plan_combine` decides once and
@@ -35,7 +35,10 @@ kernel version instead of leaving it to the import-time setting.
 This branch is for reading, not merging. Tests in
 `tests/layers/core/test_fused_moe_gmm.py` that patch the internals it moves
 are left as they are; tests that stand in a chip patch `support.current_tpu_info`,
-the one runtime read of the chip. Run from the repository root with the project's
+the one runtime read of the chip. Each check is a pytest test under
+`tests/layers/core/`, with its shared code beside it (`handoff_check.py`,
+`dead_fields_check.py`); `prototype/check_*.py` only print the tables below.
+Run from the repository root with the project's
 virtualenv and `pip install import-linter==2.16`. torch-tpu prints start-up
 lines on stderr, left out below. Each planted violation is one line to
 comment in; comment it out again afterwards.
@@ -95,6 +98,7 @@ The check covers the receiving side: every parameter in `moe_plan` and
 `fused_moe_gmm` annotated with a resolved type takes exactly that type, with
 no default.
 
+    JAX_PLATFORMS=cpu PYTHONPATH=src pytest tests/layers/core/test_handoff.py
     JAX_PLATFORMS=cpu PYTHONPATH=src python -m prototype.check_handoff
 
 ```
@@ -116,10 +120,13 @@ It reads annotations, not what each caller passes.
 ## 3. A child does not ignore what it was handed
 
     flock /tmp/vt-tpu.lock env JAX_PLATFORMS=cpu PYTHONPATH=src \
+        pytest --run-compile-tier tests/layers/core/test_dead_fields.py
+    flock /tmp/vt-tpu.lock env JAX_PLATFORMS=cpu PYTHONPATH=src \
         python -m prototype.check_dead_fields
 
 It loads libtpu, so do not run it beside a TPU job; the lock serializes it
-with them. It traces `moe_combine` under every `MoeCombinePlan` value for a v6e
+with them. The test carries the `compile_tier` marker, so a default CPU run
+skips it. It traces `moe_combine` under every `MoeCombinePlan` value for a v6e
 chip that JAX describes without a device, and reports each field whose flips,
 with the other field held, never change the traced program. About 9 seconds:
 
