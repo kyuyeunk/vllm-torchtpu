@@ -18,7 +18,7 @@ chips, then the six places that still decide the combine, with their current
 line ranges. The chips are `pltpu.get_tpu_info_for_chip` records; JAX runs on
 its CPU backend:
 
-    .venv/bin/python -I prototype/moe_decision_module.py
+    .venv/bin/python -m prototype.moe_decision_module
 """
 
 import os
@@ -116,15 +116,16 @@ _SITES = (
 def _out(op: moe_plan.MoeOpIn, hidden: int = 2048) -> moe_plan.GmmOutSpec:
     """The combine's input facts for a bf16 MoE layer of this call."""
     routes = op.routed_rows
+    # jnp's scalar types are Any.
     return moe_plan.GmmOutSpec(
         routes=routes,
         rows=routes,
         hidden=hidden,
-        dtype=jnp.dtype(jnp.bfloat16),
+        dtype=jnp.dtype(jnp.bfloat16),  # pyright: ignore[reportAny]
         token_indices_shape=(routes,),
-        token_indices_dtype=jnp.dtype(jnp.int32),
+        token_indices_dtype=jnp.dtype(jnp.int32),  # pyright: ignore[reportAny]
         topk_weights_shape=(routes,),
-        topk_weights_dtype=jnp.dtype(jnp.float32),
+        topk_weights_dtype=jnp.dtype(jnp.float32),  # pyright: ignore[reportAny]
     )
 
 
@@ -172,7 +173,9 @@ def main() -> None:
             dense_expert_admitted=False,
             owner_output=False,
         )
-        assert plan.routing is not None and plan.combine is not None
+        if plan.routing is None or plan.combine is None:
+            msg = "plan_bucket left the routing or the combine unplanned"
+            raise ValueError(msg)
         mode = "EP" if use_ep else "TP"
         version = plan.combine.ep_gather_reduce_version
         print(

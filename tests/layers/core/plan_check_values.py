@@ -19,7 +19,7 @@ output under the value it picks, within a tolerance the caller supplies.
 """
 
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 import jax
 import numpy as np
@@ -27,19 +27,19 @@ import numpy as np
 from vllm_torchtpu.layers.core import plan_marker
 
 
-class Case(NamedTuple):
+class Case[M](NamedTuple):
     """One contract-satisfying input of the module."""
 
     name: str
     args: tuple[jax.Array, ...]
-    meta: Any  # Whatever the entry needs besides the arrays.
+    meta: M  # Whatever the entry needs besides the arrays.
 
 
-class Finding(NamedTuple):
+class Finding[P](NamedTuple):
     """A capable plan value whose output differs from the picked value's."""
 
     case: str
-    plan: Any
+    plan: P
     error: float  # The largest absolute difference.
 
     def columns(self) -> tuple[str, ...]:
@@ -52,16 +52,16 @@ class Finding(NamedTuple):
         )
 
 
-def check_values(
-    entry: Callable[..., jax.Array],
-    cases: Sequence[Case],
-    plan_type: type,
-    tolerance: Callable[[Case], tuple[float, float]],
+def check_values[P, M](
+    entry: Callable[[Case[M], P, *tuple[jax.Array, ...]], jax.Array],
+    cases: Sequence[Case[M]],
+    plan_type: type[P],
+    tolerance: Callable[[Case[M]], tuple[float, float]],
     *,
-    resolve: Callable[[Case], Any],
-    declared: Callable[[Case, Any], bool],
-    domains: Mapping[type, Sequence[Any]] | None = None,
-) -> set[Finding]:
+    resolve: Callable[[Case[M]], P],
+    declared: Callable[[Case[M], P], bool],
+    domains: Mapping[type, Sequence[object]] | None = None,
+) -> set[Finding[P]]:
     """Runs every capable plan value and returns the ones whose values differ.
 
     Args:
@@ -77,16 +77,18 @@ def check_values(
         A finding for every capable value whose output differs from the
         picked value's beyond the tolerance.
     """
-    findings: set[Finding] = set()
+    findings: set[Finding[P]] = set()
     for case in cases:
         picked = resolve(case)
         ref = np.asarray(entry(case, picked, *case.args), np.float32)
         rtol, atol = tolerance(case)
-        for plan in plan_marker.plan_values(plan_type, domains):
+        values: list[P] = plan_marker.plan_values(plan_type, domains)
+        for plan in values:
             if plan == picked or not declared(case, plan):
                 continue
             got = np.asarray(entry(case, plan, *case.args), np.float32)
             if not np.allclose(got, ref, rtol=rtol, atol=atol, equal_nan=True):
-                error = float(np.nanmax(np.abs(got - ref)))
+                # numpy types nanmax's result as Any.
+                error = float(np.nanmax(np.abs(got - ref)))  # pyright: ignore[reportAny]
                 findings.add(Finding(case.name, plan, error))
     return findings

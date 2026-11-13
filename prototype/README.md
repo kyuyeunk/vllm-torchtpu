@@ -26,10 +26,13 @@ and nothing else:
 | Capability apart from preference | [`moe_plan.py`](../src/vllm_torchtpu/layers/core/moe_plan.py#L764-L809) | `combine_capable` | 764-809 |
 | The layer's combine, split so a checker can force any plan | [`fused_moe_gmm.py`](../src/vllm_torchtpu/layers/core/fused_moe_gmm.py#L524-L742) | `combine_facts`, `resolve_combine_plan`, `moe_combine` | 524-742 |
 | The fix: the EP kernel follows the plan's version | [`fused_moe_gmm.py`](../src/vllm_torchtpu/layers/core/fused_moe_gmm.py#L622-L636) | `_ep_gather_reduce` | 622-636 |
-| Structural tier: compile every value for fake chips; capable must compile, declined should not, outputs must agree, unread fields reported | [`prototype/plan_check.py`](plan_check.py#L138-L182) | `check_structure`, `_check_capability`, `_check_output`, `_fields_read`, `_check_unread` | 138-182, 277-339 |
-| Structural driver: shapes (one padded), the findings ratchet, the replay switch | [`prototype/check_plans.py`](check_plans.py#L67-L132) | `SHAPES`, `REPLAY_IMPORT_TIME_KERNEL`, `KNOWN`, `REPLAYED`, `main` | 67-132, 152-154, 157-184, 192-195, 265-288 |
-| Numerics tier: every capable value against the picked one, within a tolerance | [`prototype/plan_check_values.py`](plan_check_values.py#L55-L92) | `check_values` | 55-92 |
-| Numerics driver: the tolerance, two input families, the findings ratchet | [`prototype/check_plan_values.py`](check_plan_values.py#L54-L57) | `TOLERANCE`, `KNOWN`, `main` | 54-57, 63-77, 210-229 |
+| Structural tier: compile every value for fake chips; capable must compile, declined should not, outputs must agree, unread fields reported | [`tests/layers/core/plan_check.py`](../tests/layers/core/plan_check.py#L138-L182) | `check_structure`, `_check_capability`, `_check_output`, `_fields_read`, `_check_unread` | 138-182, 279-343 |
+| Structural driver: shapes (one padded), the findings ratchet, the replay | [`tests/layers/core/moe_combine_plan_check.py`](../tests/layers/core/moe_combine_plan_check.py#L77-L142) | `SHAPES`, `KNOWN`, `REPLAYED`, `known`, `import_time_kernel`, `structure_findings` | 77-142, 166-193, 203-206, 282-329 |
+| Structural ratchet: the findings equal the known set, with the plan's EP kernel and replayed (`compile_tier`) | [`tests/layers/core/test_moe_combine_plan_check.py`](../tests/layers/core/test_moe_combine_plan_check.py#L35-L54) | `test_structure_findings_are_known` | 35-54 |
+| Structural demo: the replay switch, the printed findings | [`prototype/check_plans.py`](check_plans.py#L30-L46) | `REPLAY_IMPORT_TIME_KERNEL`, `main` | 30-32, 35-46 |
+| Numerics tier: every capable value against the picked one, within a tolerance | [`tests/layers/core/plan_check_values.py`](../tests/layers/core/plan_check_values.py#L55-L94) | `check_values` | 55-94 |
+| Numerics driver: the tolerance, two input families, the findings ratchet | [`tests/layers/core/moe_combine_plan_values_check.py`](../tests/layers/core/moe_combine_plan_values_check.py#L54-L57) | `TOLERANCE`, `KNOWN`, `value_findings` | 54-57, 66-80, 211-225 |
+| Numerics ratchet: the findings equal the known set (`tpu`) | [`tests/layers/core/test_moe_combine_plan_check.py`](../tests/layers/core/test_moe_combine_plan_check.py#L57-L68) | `test_value_findings_are_known` | 57-68 |
 
 ## The structural tier (CPU, fake chips)
 
@@ -38,8 +41,14 @@ and nothing else:
 
 It loads libtpu to compile, so do not run it beside a TPU job; the lock serializes it with
 them. It compiles `moe_combine` under all 12 `MoeCombinePlan` values on seven shapes, ahead of
-time, for v6e and TPU7x topologies, which JAX describes without a device. Output at the head
-(each line is one finding; all are kept in `KNOWN`, and the run fails if any appears or goes):
+time, for v6e and TPU7x topologies, which JAX describes without a device. The ratchet is a
+`compile_tier` test, which a default CPU run skips:
+
+    flock /tmp/vt-tpu.lock env JAX_PLATFORMS=cpu PYTHONPATH=src \
+        python -m pytest --run-compile-tier tests/layers/core/test_moe_combine_plan_check.py
+
+Output at the head (each line is one finding; all are kept in `KNOWN`, and the test fails if
+any appears or goes):
 
 ```text
 compiles tpu7x tp_t64_k10_h4096_f32 combine='ep_ragged_sc', ep_gather_reduce_version='v3', local_v3_token_alignment=None
@@ -71,12 +80,18 @@ unread tpu7x ep_gather_reduce_version
 unread v6e ep_gather_reduce_version
 ```
 
-`REPLAY_IMPORT_TIME_KERNEL = True` (comment it in) brings the import-time kernel back at the
-head and reproduces exactly that set (`findings: 16`).
+`REPLAY_IMPORT_TIME_KERNEL = True` (comment it in, in `prototype/check_plans.py`) brings the
+import-time kernel back at the head and reproduces exactly that set (`findings: 16`); the
+test's `ep_kernel_at_import_time` case asserts it.
 
 ## The numerics tier (TPU)
 
     flock /tmp/vt-tpu.lock env PYTHONPATH=src python -m prototype.check_plan_values
+
+The ratchet is a `tpu` test, which a default CPU run skips:
+
+    flock /tmp/vt-tpu.lock env PYTHONPATH=src \
+        python -m pytest --run-tpu tests/layers/core/test_moe_combine_plan_check.py
 
 Runs every capable value on the host's chip, on inputs laid out as routing lays them (garbage
 and NaN in the unwritten rows) and on inputs masked at random, and compares each output with

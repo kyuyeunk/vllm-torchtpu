@@ -31,7 +31,7 @@ test, which reads the chip itself through `pltpu.get_tpu_info()`; that call
 answers from the abstract mesh in context, so every callback runs inside
 `_on_chip`, which sets the fake chip's mesh as that context.
 
-Worked example, from `prototype/check_plans.py`: `entry` runs `moe_combine`
+Worked example, from `moe_combine_plan_check.py`: `entry` runs `moe_combine`
 under one `MoeCombinePlan`; `cases` gives abstract arrays for seven combine
 shapes; `resolve` is `resolve_combine_plan`; `declared` is `combine_capable`.
 On TPU7x, for the FP32 shape, `combine_capable` declines the EP v3 plan (v3
@@ -56,7 +56,7 @@ import functools
 import itertools
 import re
 from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 import jax
 import numpy as np
@@ -69,12 +69,12 @@ from vllm_torchtpu.layers.core import plan_marker
 _AXIS = "devices"
 
 
-class Case(NamedTuple):
+class Case[M](NamedTuple):
     """One contract-satisfying input of the module."""
 
     name: str
     args: tuple[jax.ShapeDtypeStruct, ...]  # The arrays on one device.
-    meta: Any  # Whatever the entry needs besides the arrays.
+    meta: M  # Whatever the entry needs besides the arrays.
 
 
 class Chip(NamedTuple):
@@ -93,7 +93,7 @@ class Kind(enum.Enum):
     UNREAD = "unread"  # A field whose flips never change the program.
 
 
-class Finding(NamedTuple):
+class Finding[P](NamedTuple):
     """One finding of the structural tier.
 
     `case` and `plan` are None for `Kind.UNREAD`, which names `field`
@@ -103,7 +103,7 @@ class Finding(NamedTuple):
     kind: Kind
     chip: Chip
     case: str | None = None
-    plan: Any = None
+    plan: P | None = None
     field: str | None = None
 
     def columns(self) -> tuple[str, ...]:
@@ -122,7 +122,7 @@ class _Compiled(NamedTuple):
     """What one compile of the module produced."""
 
     program: str  # The optimized program, without source locations.
-    output: tuple[Any, Any, str]  # Output shape, dtype and sharding.
+    output: tuple[object, object, str]  # Output shape, dtype and sharding.
 
 
 class _Trial(NamedTuple):
@@ -132,19 +132,19 @@ class _Trial(NamedTuple):
     compiled: _Compiled | None  # None: the compile raised.
 
 
-type Entry[P] = Callable[[Case, P, *tuple[jax.Array, ...]], jax.Array]
+type Entry[P, M] = Callable[[Case[M], P, *tuple[jax.Array, ...]], jax.Array]
 
 
-def check_structure[P](  # noqa: PLR0913 - one argument per input the docstring names
-    entry: Entry[P],
-    cases: Callable[[pltpu.TpuInfo], Sequence[Case]],
+def check_structure[P, M](
+    entry: Entry[P, M],
+    cases: Callable[[pltpu.TpuInfo], Sequence[Case[M]]],
     plan_type: type[P],
     chips: Sequence[Chip],
     *,
-    resolve: Callable[[Case], P],
-    declared: Callable[[Case, P, pltpu.TpuInfo], bool],
-    domains: Mapping[type, Sequence[Any]] | None = None,
-) -> set[Finding]:
+    resolve: Callable[[Case[M]], P],
+    declared: Callable[[Case[M], P, pltpu.TpuInfo], bool],
+    domains: Mapping[type, Sequence[object]] | None = None,
+) -> set[Finding[P]]:
     """Compiles every plan value on every case and chip; returns the findings.
 
     Args:
@@ -161,10 +161,10 @@ def check_structure[P](  # noqa: PLR0913 - one argument per input the docstring 
         The findings.
     """
     values: list[P] = plan_marker.plan_values(plan_type, domains)
-    findings: set[Finding] = set()
+    findings: set[Finding[P]] = set()
     for chip in chips:
         mesh = _mesh(chip)
-        reads: list[dict[dataclasses.Field[Any], bool]] = []
+        reads: list[dict[dataclasses.Field[object], bool]] = []
         with _on_chip(mesh) as info:
             for case in cases(info):
                 picked = resolve(case)
@@ -184,8 +184,9 @@ def check_structure[P](  # noqa: PLR0913 - one argument per input the docstring 
 
 def _mesh(chip: Chip) -> Mesh:
     """Returns a one-axis mesh over every device of the chip's topology."""
-    devices = topologies.get_topology_desc(chip.topology, "tpu").devices
-    return Mesh(np.array(devices), (_AXIS,))
+    # jax.experimental.topologies is untyped.
+    devices = topologies.get_topology_desc(chip.topology, "tpu").devices  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+    return Mesh(np.array(devices), (_AXIS,))  # pyright: ignore[reportUnknownArgumentType]
 
 
 @contextlib.contextmanager
@@ -206,7 +207,9 @@ def _on_chip(mesh: Mesh) -> Generator[pltpu.TpuInfo]:
         yield pltpu.get_tpu_info()
 
 
-def _compile[P](entry: Entry[P], case: Case, plan: P, mesh: Mesh) -> _Compiled | None:
+def _compile[P, M](
+    entry: Entry[P, M], case: Case[M], plan: P, mesh: Mesh
+) -> _Compiled | None:
     """Returns `_program`'s result, or None if compiling raised anything."""
     try:
         return _program(entry, case, plan, mesh)
@@ -214,7 +217,7 @@ def _compile[P](entry: Entry[P], case: Case, plan: P, mesh: Mesh) -> _Compiled |
         return None
 
 
-def _program[P](entry: Entry[P], case: Case, plan: P, mesh: Mesh) -> _Compiled:
+def _program[P, M](entry: Entry[P, M], case: Case[M], plan: P, mesh: Mesh) -> _Compiled:
     """Compiles `entry` on the case under `plan`, once per device of the mesh.
 
     Mosaic kernels cannot be partitioned automatically, so each device runs
@@ -232,20 +235,19 @@ def _program[P](entry: Entry[P], case: Case, plan: P, mesh: Mesh) -> _Compiled:
         out_specs=spec,
         check_vma=False,
     )
+    # ShapeDtypeStruct's shape and dtype, and the compiled output's info, are
+    # untyped in JAX.
     args = [
         jax.ShapeDtypeStruct(
-            (mesh.size * a.shape[0], *a.shape[1:]),
-            a.dtype,
+            (mesh.size * a.shape[0], *a.shape[1:]),  # pyright: ignore[reportAny]
+            a.dtype,  # pyright: ignore[reportAny]
             sharding=NamedSharding(mesh, spec),
         )
         for a in case.args
     ]
-    compiled = jax.jit(fn).trace(*args).lower().compile()
-    output = (
-        compiled.out_info.shape,
-        compiled.out_info.dtype,
-        str(compiled.output_shardings),
-    )
+    compiled = jax.jit(fn).trace(*args).lower().compile()  # pyright: ignore[reportUnknownMemberType]
+    out = compiled.out_info  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+    output = (out.shape, out.dtype, str(compiled.output_shardings))  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType, reportAny]
     text = compiled.as_text()
     if text is None:
         msg = "the compiled module has no text"
@@ -274,11 +276,11 @@ def _without_locations(text: str) -> str:
     return "\n".join(kept)
 
 
-def _check_capability[P](
-    chip: Chip, case: Case, trials: Mapping[P, _Trial]
-) -> set[Finding]:
+def _check_capability[P, M](
+    chip: Chip, case: Case[M], trials: Mapping[P, _Trial]
+) -> set[Finding[P]]:
     """Returns FAILS and COMPILES: the declared capability against the compile."""
-    findings: set[Finding] = set()
+    findings: set[Finding[P]] = set()
     for plan, trial in trials.items():
         if trial.capable and trial.compiled is None:
             findings.add(Finding(Kind.FAILS, chip, case.name, plan))
@@ -287,9 +289,9 @@ def _check_capability[P](
     return findings
 
 
-def _check_output[P](
-    chip: Chip, case: Case, trials: Mapping[P, _Trial], picked: P
-) -> set[Finding]:
+def _check_output[P, M](
+    chip: Chip, case: Case[M], trials: Mapping[P, _Trial], picked: P
+) -> set[Finding[P]]:
     """Returns MISMATCH: compiled outputs that differ from the picked plan's.
 
     Nothing to compare against when the picked plan did not compile.
@@ -304,7 +306,9 @@ def _check_output[P](
     }
 
 
-def _fields_read[P](trials: Mapping[P, _Trial]) -> dict[dataclasses.Field[Any], bool]:
+def _fields_read[P](
+    trials: Mapping[P, _Trial],
+) -> dict[dataclasses.Field[object], bool]:
     """Returns, per field, whether a single-field flip changed the program.
 
     Covers only fields that some pair of compiled values differs in alone.
@@ -314,7 +318,7 @@ def _fields_read[P](trials: Mapping[P, _Trial]) -> dict[dataclasses.Field[Any], 
         for plan, trial in trials.items()
         if trial.compiled is not None
     }
-    read: dict[dataclasses.Field[Any], bool] = {}
+    read: dict[dataclasses.Field[object], bool] = {}
     for a, b in itertools.combinations(compiled, 2):
         changed = plan_marker.changed_fields(a, b)
         if len(changed) == 1:
@@ -324,11 +328,11 @@ def _fields_read[P](trials: Mapping[P, _Trial]) -> dict[dataclasses.Field[Any], 
     return read
 
 
-def _check_unread(
-    chip: Chip, reads: Iterable[Mapping[dataclasses.Field[Any], bool]]
-) -> set[Finding]:
+def _check_unread[P](
+    chip: Chip, reads: Iterable[Mapping[dataclasses.Field[object], bool]]
+) -> set[Finding[P]]:
     """Returns UNREAD: fields no flip changed the program of, on any case."""
-    read: dict[dataclasses.Field[Any], bool] = {}
+    read: dict[dataclasses.Field[object], bool] = {}
     for case_read in reads:
         for field, flipped in case_read.items():
             read[field] = read.get(field, False) or flipped
