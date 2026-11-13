@@ -26,7 +26,7 @@ and nothing else:
 | Capability apart from preference | [`moe_plan.py`](../src/vllm_torchtpu/layers/core/moe_plan.py#L764-L809) | `combine_capable` | 764-809 |
 | The layer's combine, split so a checker can force any plan | [`fused_moe_gmm.py`](../src/vllm_torchtpu/layers/core/fused_moe_gmm.py#L524-L742) | `combine_facts`, `resolve_combine_plan`, `moe_combine` | 524-742 |
 | The fix: the EP kernel follows the plan's version | [`fused_moe_gmm.py`](../src/vllm_torchtpu/layers/core/fused_moe_gmm.py#L622-L636) | `_ep_gather_reduce` | 622-636 |
-| Structural tier: compile every value for fake chips; capable must compile, declined should not, outputs must agree, unread fields reported | [`prototype/plan_check.py`](plan_check.py#L140-L204) | `check_structure` | 140-204 |
+| Structural tier: compile every value for fake chips; capable must compile, declined should not, outputs must agree, unread fields reported | [`prototype/plan_check.py`](plan_check.py#L138-L182) | `check_structure`, `_check_capability`, `_check_output`, `_fields_read`, `_check_unread` | 138-182, 277-339 |
 | Structural driver: shapes (one padded), the findings ratchet, the replay switch | [`prototype/check_plans.py`](check_plans.py#L67-L132) | `SHAPES`, `REPLAY_IMPORT_TIME_KERNEL`, `KNOWN`, `REPLAYED`, `main` | 67-132, 152-154, 157-184, 192-195, 265-288 |
 | Numerics tier: every capable value against the picked one, within a tolerance | [`prototype/plan_check_values.py`](plan_check_values.py#L55-L92) | `check_values` | 55-92 |
 | Numerics driver: the tolerance, two input families, the findings ratchet | [`prototype/check_plan_values.py`](check_plan_values.py#L54-L57) | `TOLERANCE`, `KNOWN`, `main` | 54-57, 63-77, 210-229 |

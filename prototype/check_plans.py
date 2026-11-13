@@ -18,10 +18,10 @@
 
 Loads libtpu to compile, so run it under the TPU lock, never beside a TPU job.
 Compiles `moe_combine` under every `MoeCombinePlan` value, ahead of time, for
-v6e and TPU7x topologies, which JAX describes without a device;
-`pltpu.get_tpu_info()` answers from the abstract mesh, so the planner and the
-kernels see the fake chip. Prints every finding and checks them against the
-known set.
+v6e and TPU7x topologies, which JAX describes without a device; `cases` and
+`declared` take the fake chip as an argument, and `pltpu.get_tpu_info()`
+answers from the abstract mesh, so the planner and the kernels see it too.
+Prints every finding and checks them against the known set.
 """
 
 import dataclasses
@@ -195,9 +195,9 @@ REPLAYED = {
 }
 
 
-def cases() -> list[Case]:
-    """One case per shape, at the mesh chip's one-hot threshold."""
-    auto = moe_plan.auto_onehot_permute_threshold(pltpu.get_tpu_info())
+def cases(chip: pltpu.TpuInfo) -> list[Case]:
+    """One case per shape, at the chip's one-hot threshold."""
+    auto = moe_plan.auto_onehot_permute_threshold(chip)
     out = []
     for s in SHAPES:
         routes = s.num_tokens * s.topk
@@ -241,8 +241,8 @@ def resolve(case: Case) -> moe_plan.MoeCombinePlan:
     )
 
 
-def declared(case: Case, plan: moe_plan.MoeCombinePlan) -> bool:
-    """Whether the module declares `plan` able to run the case on the mesh's chip."""
+def declared(case: Case, plan: moe_plan.MoeCombinePlan, chip: pltpu.TpuInfo) -> bool:
+    """Whether the module declares `plan` able to run the case on `chip`."""
     gmm2, _, revert, weights, _, token_indices = case.args
     s = case.meta
     op, out = fused_moe_gmm.combine_facts(
@@ -255,7 +255,7 @@ def declared(case: Case, plan: moe_plan.MoeCombinePlan) -> bool:
         local_num_experts=s.local_experts,
         use_ep=s.use_ep,
     )
-    return moe_plan.combine_capable(plan, op, out, pltpu.get_tpu_info())
+    return moe_plan.combine_capable(plan, op, out, chip)
 
 
 def _lines(findings: set[Finding]) -> list[str]:
