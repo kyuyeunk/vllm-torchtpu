@@ -19,12 +19,14 @@ The `_reference_*` functions are the d3991ebf9 expressions from
 the per-layer predicates are parameters.
 """
 
+import dataclasses
 import enum
 import itertools
 import math
-import unittest
 
 import _pure_import
+import pytest
+from _grid import GridFamily
 
 from vllm_torchtpu.layers.core import moe_collective_plan as mcp
 from vllm_torchtpu.layers.core.moe_collective_plan import CollectiveRule
@@ -145,160 +147,205 @@ def _outcome(fn, *args, **kwargs):
         return (ValueError, str(e))
 
 
-class CollectivePlanOracleTest(unittest.TestCase):
-    """The collective formulas and chunking against d3991ebf9."""
+_FLAGS = (False, True)
+_ALL2ALL_GRID = tuple(
+    itertools.product(_FLAGS, (1, 2, 4), (1, 2), _FLAGS, (-1, 0, 1, 4096))
+)
+_SEQ_LENS = (0, 1, 2, 3, 7, 8, 16, 31, 64, 96, 128, 255, 256, 1000, 1024, 4096)
+_PARALLELS = (1, 2, 3, 4, 8, 16)
+_CHUNK_SIZES = (-1, 0, 1, 7, 16, 100, 512, 4096, 16384)
+_BUCKET_SETS = (
+    None,
+    (),
+    (8,),
+    (8, 16, 32),
+    (16, 48),
+    (12, 18, 30),
+    (64, 128, 256, 512),
+    (7, 11),
+)
 
-    def test_no_tpu_runtime(self):
-        self.assertEqual(_pure_import.loaded_tpu_runtime(), [])
 
-    def test_ownership_formulas(self):
-        cases = 0
-        for pipelined, fused, adaptive, fp8_ag, skip in itertools.product(
-            (False, True), repeat=5
-        ):
-            overrides = mcp.CollectiveOverrides(
-                chunk_pipelining=pipelined,
-                fp8_all_gather=fp8_ag,
-                skip_padded_tokens=skip,
-            )
-            fp8 = mcp.collective_plan(
-                mcp.MoeLayerInfo(
-                    rule=CollectiveRule.FP8_ALL_GATHER,
-                    ep_fused_supported=fused,
-                    adaptive_supported=adaptive,
-                ),
-                overrides,
-            )
-            self.assertEqual(
-                _new(fp8), _reference_fp8(pipelined, fused, adaptive, fp8_ag, skip)
-            )
-            unq = mcp.collective_plan(
-                mcp.MoeLayerInfo(
-                    rule=CollectiveRule.PIPELINING_ONLY,
-                    ep_fused_supported=fused,
-                    adaptive_supported=adaptive,
-                ),
-                overrides,
-            )
-            self.assertEqual(_new(unq), _reference_unquantized(pipelined, fp8_ag, skip))
-            for uses_mxfp4 in (False, True):
-                # tpu_runner.py:5588.
-                self.assertEqual(
-                    mcp.needs_token_padding_state(
-                        skip_padded_tokens=skip, uses_mxfp4_moe=uses_mxfp4
-                    ),
-                    skip or uses_mxfp4,
-                )
-            per_path: tuple[tuple[CollectiveRule, object], ...] = (
-                (
-                    CollectiveRule.FUSED_KERNEL,
-                    _reference_nvfp4(pipelined, fused, adaptive, fp8_ag, skip),
-                ),
-                (
-                    CollectiveRule.PIPELINING_ONLY,
-                    _reference_pipelined_only(pipelined, fp8_ag, skip),
-                ),
-                (
-                    CollectiveRule.PIPELINING_ONLY,
-                    _reference_pipelined_only(pipelined, fp8_ag, skip),
-                ),
-                (
-                    CollectiveRule.FUSED_EP_KERNEL,
-                    _reference_mxfp4_dsv4(pipelined, fused, fp8_ag, skip),
-                ),
-                (
-                    CollectiveRule.ALWAYS_SKIP_PADDED,
-                    _reference_w4an_mxfp4(pipelined, fp8_ag),
-                ),
-            )
-            for rule, expected in per_path:
-                plan = mcp.collective_plan(
-                    mcp.MoeLayerInfo(
-                        rule=rule,
-                        ep_fused_supported=fused,
-                        adaptive_supported=adaptive,
-                    ),
-                    overrides,
-                )
-                self.assertEqual(_new(plan), expected, rule)
-                cases += 1
-            # moe_tp_decode.py:203 mirrors the fp8 dispatch formula.
-            self.assertEqual(fp8.stages_collectives, pipelined or fp8_ag)
-            # moe_runner.py:124-125 and :136-138.
-            self.assertEqual(
-                mcp.fused_kernel_armed(
-                    ep_fused_supported=fused, adaptive_supported=adaptive
-                ),
-                fused or adaptive,
-            )
-            cases += 2
-        print(f"\n[ownership] {cases} cases")
+def _flag_id(name: str, *, on: bool) -> str:
+    """`name` for a set flag, `no_<name>` for a clear one."""
+    return name if on else f"no_{name}"
 
-    def test_all2all_patch(self):
-        # __init__.py:280-289, with the chunk size read from the env.
-        saved = mcp.chunk_size_from_envs
-        cases = 0
-        try:
-            for use_ep, pcp, dp, sp, chunk in itertools.product(
-                (False, True), (1, 2, 4), (1, 2), (False, True), (-1, 0, 1, 4096)
-            ):
-                mcp.chunk_size_from_envs = lambda chunk=chunk: chunk
-                expected = use_ep and pcp > 1 and dp == 1 and not sp and chunk <= 0
-                self.assertEqual(
-                    mcp.disables_all2all_for_explicit_pcp(
-                        use_ep=use_ep, pcp_size=pcp, dp_size=dp, is_sequence_parallel=sp
-                    ),
-                    expected,
-                )
-                cases += 1
-        finally:
-            mcp.chunk_size_from_envs = saved
-        print(f"\n[all2all patch] {cases} cases")
 
-    def test_chunking(self):
-        seq_lens = (0, 1, 2, 3, 7, 8, 16, 31, 64, 96, 128, 255, 256, 1000, 1024, 4096)
-        parallels = (1, 2, 3, 4, 8, 16)
-        chunk_sizes = (-1, 0, 1, 7, 16, 100, 512, 4096, 16384)
-        bucket_sets = (
-            None,
-            (),
-            (8,),
-            (8, 16, 32),
-            (16, 48),
-            (12, 18, 30),
-            (64, 128, 256, 512),
-            (7, 11),
+@dataclasses.dataclass(frozen=True)
+class _Ownership:
+    """One setting of the flags the collective formulas read."""
+
+    pipelined: bool
+    fused: bool
+    adaptive: bool
+    fp8_ag: bool
+    skip: bool
+
+    @property
+    def label(self) -> str:
+        """The setting's test id: each flag's name, `no_` when clear."""
+        return "-".join(
+            (
+                _flag_id("pipelined", on=self.pipelined),
+                _flag_id("fused", on=self.fused),
+                _flag_id("adaptive", on=self.adaptive),
+                _flag_id("fp8_ag", on=self.fp8_ag),
+                _flag_id("skip", on=self.skip),
+            )
         )
-        cases = 0
-        for seq_len, parallel, chunk, buckets in itertools.product(
-            seq_lens, parallels, chunk_sizes, bucket_sets
-        ):
-            self.assertEqual(
-                _outcome(
-                    mcp.collection_chunks,
-                    seq_len,
-                    parallel,
-                    chunk_size=chunk,
-                    fixed_buckets=buckets,
-                ),
-                _outcome(
-                    _reference_collection_chunks, seq_len, parallel, buckets, chunk
-                ),
-                (seq_len, parallel, chunk, buckets),
+
+
+_OWNERSHIPS = tuple(_Ownership(*f) for f in itertools.product(_FLAGS, repeat=5))
+
+
+def _all2all_id(case: tuple[bool, int, int, bool, int]) -> str:
+    use_ep, pcp, dp, sp, chunk = case
+    return (
+        f"{_flag_id('ep', on=use_ep)}-pcp{pcp}-dp{dp}-"
+        f"{_flag_id('sp', on=sp)}-chunk{chunk}"
+    )
+
+
+def _buckets_id(buckets: tuple[int, ...] | None) -> str:
+    if buckets is None:
+        return "no_buckets"
+    return "buckets_" + ("_".join(map(str, buckets)) or "empty")
+
+
+def test_no_tpu_runtime() -> None:
+    """The module imported with no TPU runtime."""
+    assert _pure_import.loaded_tpu_runtime() == []
+
+
+@pytest.mark.parametrize("flags", _OWNERSHIPS, ids=[f.label for f in _OWNERSHIPS])
+def test_ownership_formulas(flags: _Ownership) -> None:
+    """Every rule's plan against its d3991ebf9 formula, for one flag set.
+
+    Seven cases per flag set: the five per-rule plans and the two formulas
+    checked after them.
+    """
+    pipelined, fused, adaptive, fp8_ag, skip = (
+        flags.pipelined,
+        flags.fused,
+        flags.adaptive,
+        flags.fp8_ag,
+        flags.skip,
+    )
+    overrides = mcp.CollectiveOverrides(
+        chunk_pipelining=pipelined,
+        fp8_all_gather=fp8_ag,
+        skip_padded_tokens=skip,
+    )
+    fp8 = mcp.collective_plan(
+        mcp.MoeLayerInfo(
+            rule=CollectiveRule.FP8_ALL_GATHER,
+            ep_fused_supported=fused,
+            adaptive_supported=adaptive,
+        ),
+        overrides,
+    )
+    assert _new(fp8) == _reference_fp8(pipelined, fused, adaptive, fp8_ag, skip)
+    unq = mcp.collective_plan(
+        mcp.MoeLayerInfo(
+            rule=CollectiveRule.PIPELINING_ONLY,
+            ep_fused_supported=fused,
+            adaptive_supported=adaptive,
+        ),
+        overrides,
+    )
+    assert _new(unq) == _reference_unquantized(pipelined, fp8_ag, skip)
+    for uses_mxfp4 in _FLAGS:
+        # As tpu_runner.py:5588 computes it.
+        assert mcp.needs_token_padding_state(
+            skip_padded_tokens=skip, uses_mxfp4_moe=uses_mxfp4
+        ) == (skip or uses_mxfp4)
+    per_path: tuple[tuple[CollectiveRule, object], ...] = (
+        (
+            CollectiveRule.FUSED_KERNEL,
+            _reference_nvfp4(pipelined, fused, adaptive, fp8_ag, skip),
+        ),
+        (
+            CollectiveRule.PIPELINING_ONLY,
+            _reference_pipelined_only(pipelined, fp8_ag, skip),
+        ),
+        (
+            CollectiveRule.PIPELINING_ONLY,
+            _reference_pipelined_only(pipelined, fp8_ag, skip),
+        ),
+        (
+            CollectiveRule.FUSED_EP_KERNEL,
+            _reference_mxfp4_dsv4(pipelined, fused, fp8_ag, skip),
+        ),
+        (
+            CollectiveRule.ALWAYS_SKIP_PADDED,
+            _reference_w4an_mxfp4(pipelined, fp8_ag),
+        ),
+    )
+    for rule, expected in per_path:
+        plan = mcp.collective_plan(
+            mcp.MoeLayerInfo(
+                rule=rule,
+                ep_fused_supported=fused,
+                adaptive_supported=adaptive,
+            ),
+            overrides,
+        )
+        assert _new(plan) == expected, rule
+    # moe_tp_decode.py:203 mirrors the fp8 dispatch formula.
+    assert fp8.stages_collectives == (pipelined or fp8_ag)
+    # moe_runner.py:124-125 and :136-138.
+    assert mcp.fused_kernel_armed(
+        ep_fused_supported=fused, adaptive_supported=adaptive
+    ) == (fused or adaptive)
+
+
+@pytest.mark.parametrize("case", _ALL2ALL_GRID, ids=map(_all2all_id, _ALL2ALL_GRID))
+def test_all2all_patch(case: tuple[bool, int, int, bool, int]) -> None:
+    """__init__.py:280-289, with the chunk size read from the env."""
+    use_ep, pcp, dp, sp, chunk = case
+    saved = mcp.chunk_size_from_envs
+    try:
+        mcp.chunk_size_from_envs = lambda: chunk
+        expected = use_ep and pcp > 1 and dp == 1 and not sp and chunk <= 0
+        assert (
+            mcp.disables_all2all_for_explicit_pcp(
+                use_ep=use_ep, pcp_size=pcp, dp_size=dp, is_sequence_parallel=sp
             )
-            cases += 1
-        print(f"\n[chunking] {cases} cases")
-
-    def test_stages_implies_claims(self):
-        with self.assertRaises(ValueError):
-            mcp.CollectivePlan(
-                claims_collectives=False,
-                stages_collectives=True,
-                quantize_all_gather=False,
-                zero_padded_routing_weights=False,
-                kernel_skip_padded_tokens=False,
-            )
+            == expected
+        )
+    finally:
+        mcp.chunk_size_from_envs = saved
 
 
-if __name__ == "__main__":  # str-ok: the module entry-point idiom
-    unittest.main()
+@pytest.mark.parametrize("buckets", _BUCKET_SETS, ids=map(_buckets_id, _BUCKET_SETS))
+def test_chunking(buckets: tuple[int, ...] | None) -> None:
+    """Every (sequence length, parallel size, chunk size) for one bucket set."""
+    family = GridFamily(f"chunking {_buckets_id(buckets)}")
+    for seq_len, parallel, chunk in itertools.product(
+        _SEQ_LENS, _PARALLELS, _CHUNK_SIZES
+    ):
+        family.expect_equal(
+            _outcome(
+                mcp.collection_chunks,
+                seq_len,
+                parallel,
+                chunk_size=chunk,
+                fixed_buckets=buckets,
+            ),
+            _outcome(_reference_collection_chunks, seq_len, parallel, buckets, chunk),
+            (seq_len, parallel, chunk),
+        )
+        family.cases += 1
+    family.assert_no_mismatches()
+
+
+def test_stages_implies_claims() -> None:
+    """A plan that stages the collectives without claiming them is refused."""
+    with pytest.raises(ValueError):  # noqa: PT011 - any message; the check is the raise
+        _ = mcp.CollectivePlan(
+            claims_collectives=False,
+            stages_collectives=True,
+            quantize_all_gather=False,
+            zero_padded_routing_weights=False,
+            kernel_skip_padded_tokens=False,
+        )

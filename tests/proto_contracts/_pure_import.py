@@ -21,10 +21,10 @@ any host, only to locate that library, so the check looks at the library.)
 `vllm_torchtpu/__init__.py` and `vllm_torchtpu/layers/__init__.py` import
 `torch_tpu`, so the tests register empty stand-ins for those two packages and
 let the normal file finder load only the modules under test. Run them with
-the project's Python, e.g.
+the project's pytest, with torch's device-backend autoload off so that
+`tests/conftest.py`, which imports torch first, does not load torch_tpu:
 
-    .venv/bin/python -I -m unittest discover \
-        -s tests/proto_contracts -t tests/proto_contracts
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0 .venv/bin/python -m pytest tests/proto_contracts
 """
 
 import os

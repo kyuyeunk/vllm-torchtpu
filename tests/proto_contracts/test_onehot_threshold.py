@@ -13,10 +13,12 @@
 # limitations under the License.
 """CPU tests for the auto one-hot threshold, over every chip JAX describes."""
 
-import unittest
+from collections.abc import Callable
 
 import _pure_import
-from _chips import CHIPS
+import pytest
+from _chips import CHIPS, NAMED_CHIPS
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.layers.core import moe_plan
 
@@ -55,30 +57,37 @@ def _new_resolve(explicit, get_tpu_info):
     return moe_plan.auto_onehot_permute_threshold(target)
 
 
-class OnehotThresholdTest(unittest.TestCase):
-    """The threshold oracle."""
-
-    def test_no_tpu_runtime(self):
-        self.assertEqual(_pure_import.loaded_tpu_runtime(), [])
-        self.assertEqual(_pure_import.jax_backend(), "cpu")
-
-    def test_onehot_threshold_oracle(self):
-        def raising():
-            raise ValueError("Unsupported TPU device kind: cpu")
-
-        sources = [raising] + [lambda info=info: info for info in CHIPS]
-        explicits = [None, -5, -1, 0, 1, 2, 255, 256, 511, 512, 513, 4096]
-        cases = 0
-        for explicit in explicits:
-            for source in sources:
-                self.assertEqual(
-                    _new_resolve(explicit, source),
-                    _reference_resolve(explicit, source),
-                    (explicit, source),
-                )
-                cases += 1
-        self.assertEqual(cases, len(explicits) * len(sources))
+_EXPLICITS = (None, -5, -1, 0, 1, 2, 255, 256, 511, 512, 513, 4096)
 
 
-if __name__ == "__main__":  # str-ok: the module entry-point idiom
-    unittest.main()
+def _raising() -> pltpu.TpuInfo:
+    raise ValueError("Unsupported TPU device kind: cpu")
+
+
+def _source(chip: pltpu.TpuInfo | None) -> Callable[[], pltpu.TpuInfo]:
+    """A `get_tpu_info` stand-in: returns `chip`, or raises for no chip."""
+    if chip is None:
+        return _raising
+    return lambda: chip
+
+
+def test_no_tpu_runtime() -> None:
+    """The module imported with no TPU runtime and runs JAX on the CPU."""
+    assert _pure_import.loaded_tpu_runtime() == []
+    assert _pure_import.jax_backend() == "cpu"  # str-ok: the backend name JAX reports
+
+
+@pytest.mark.parametrize(
+    "explicit", _EXPLICITS, ids=[f"explicit={explicit}" for explicit in _EXPLICITS]
+)
+@pytest.mark.parametrize(
+    "chip",
+    [None, *CHIPS],
+    ids=["no_chip", *(name for name, _ in NAMED_CHIPS)],
+)
+def test_onehot_threshold_oracle(
+    chip: pltpu.TpuInfo | None, explicit: int | None
+) -> None:
+    """The plan's threshold equals main's, for one chip and one env value."""
+    source = _source(chip)
+    assert _new_resolve(explicit, source) == _reference_resolve(explicit, source)
