@@ -41,7 +41,7 @@ are today's, not a structure-keyed table. Unifying them changes programs, so it 
 | Collective ownership in one place | `src/vllm_torchtpu/layers/core/moe_collective_plan.py` | module docstring, `CollectiveRule`, `collective_plan` | 14-32, 42-62, 142-206 |
 | An adapter reads it | `src/vllm_torchtpu/layers/adapter/pipelined_fused_moe.py` | `collective_plan_for` | 76-108 |
 | Oracle: today's combine chain, transcribed, against the plan `plan_combine` returns | `tests/proto_contracts/test_moe_plan_oracle.py` | `_reference_combine`, `MoeCombineOracleTest` | 337-415, 721-877 |
-| The run below | `prototype/moe_decision_module.py` | `main` | 159-188 |
+| The run below | `prototype/moe_decision_module.py` | `main` | 160-191 |
 
 ## Run it
 
@@ -49,7 +49,7 @@ CPU only: JAX on its CPU backend, chips from `pltpu.get_tpu_info_for_chip`, and 
 two package `__init__`s that import `torch_tpu` are stubbed).
 
 ```
-$ .venv/bin/python -I prototype/moe_decision_module.py
+$ .venv/bin/python -m prototype.moe_decision_module
 Plans from moe_plan.plan_bucket (bf16, hidden 2048):
   v6e                  TP     8 tokens x top-8:
     sort=single_sort permute=gather combine=tensorcore

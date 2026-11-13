@@ -34,7 +34,9 @@ import pytest
 import torch
 
 
-def pytest_collection_modifyitems(items):
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
     """Run whole-slice worker-spawning tests before in-process TPU tests.
 
     Once the pytest process itself initializes the TPU runtime (any test that
@@ -50,6 +52,9 @@ def pytest_collection_modifyitems(items):
     tests/kernels and tests/layers, and a sharded run receives its files in
     the planner's order. The sort is stable, so tests within a file keep
     their order.
+
+    Then skips the `compile_tier` and `tpu` tests unless their opt-in option
+    (`--run-compile-tier`, `--run-tpu`) is set, so a default CPU run skips them.
     """
     items.sort(
         key=lambda item: (
@@ -57,15 +62,58 @@ def pytest_collection_modifyitems(items):
             item.nodeid.split("::")[0],
         )
     )
+    _skip_unless(
+        items,
+        "compile_tier",
+        enabled=bool(config.getoption("--run-compile-tier")),
+        reason="compile_tier: needs libtpu; pass --run-compile-tier",
+    )
+    _skip_unless(
+        items,
+        "tpu",
+        enabled=bool(config.getoption("--run-tpu")),
+        reason="tpu: needs the host's TPU; pass --run-tpu",
+    )
 
 
-def pytest_addoption(parser):
-    """Add --use-tpu command line option."""
+def _skip_unless(
+    items: list[pytest.Item], marker: str, *, enabled: bool, reason: str
+) -> None:
+    """Skips the tests carrying `marker` unless its opt-in option is set.
+
+    Args:
+        items: The collected tests.
+        marker: The marker's name.
+        enabled: Whether the marker's opt-in option is set.
+        reason: The skip reason to report.
+    """
+    if enabled:
+        return
+    skip = pytest.mark.skip(reason=reason)
+    for item in items:
+        if item.get_closest_marker(marker):
+            item.add_marker(skip)
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Add --use-tpu, --run-compile-tier and --run-tpu command line options."""
     parser.addoption(
         "--use-tpu",
         action="store_true",
         default=True,
         help="Run tests on TPU device instead of CPU",
+    )
+    parser.addoption(
+        "--run-compile-tier",
+        action="store_true",
+        default=False,
+        help="Run compile_tier tests: compile for TPU topologies with libtpu",
+    )
+    parser.addoption(
+        "--run-tpu",
+        action="store_true",
+        default=False,
+        help="Run tpu tests: run on the host's TPU device",
     )
 
 
