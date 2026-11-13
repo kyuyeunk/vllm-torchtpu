@@ -35,7 +35,11 @@ Python 3.12, from the repository root:
 python tools/check_reach_ins.py                    # check both ratchets
 python tools/check_reach_ins.py --update           # rewrite both baselines
 python tools/check_reach_ins.py --report PATH...   # list hits in any files
+PYTHONPATH=src pytest tests/tools/test_check_reach_ins.py  # the same, as tests
 ```
+
+`tests/tools/test_check_reach_ins.py` runs the ratchet on the tree and plants
+the examples below in a temporary file for `--report`.
 
 ### The tree passes against its baselines
 
