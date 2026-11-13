@@ -20,30 +20,50 @@ Prototype. For each config this shows:
 - every plan value, with its capability or each decline reason, including
   the whole layer as one fused kernel.
 
-Run: JAX_PLATFORMS=cpu PYTHONPATH=src python -m prototype.attention_plan
+Run: PYTHONPATH=.:src:<vllm-v0.33.0> python -m prototype.attention_plan
 """
 
+# isort: off
+from tests.layers.attention_layer_plan import cpu_layer  # noqa: F401  # pyright: ignore[reportUnusedImport]  # first: no TPU runtime
+
+# isort: on
 import dataclasses
 
 from vllm.platforms.interface import PlatformEnum
 
-from prototype import _layer
+from tests.layers.attention_layer_plan import layer_builder
 from vllm_torchtpu.layers import attention_layer_plan as alp
 from vllm_torchtpu.models.vllm import qwen3_next_attention as layer_mod
 
-# (title, config overrides, chip, o_proj capability override or None).
+
+@dataclasses.dataclass(frozen=True)
+class Shown:
+    """One config to print.
+
+    Attributes:
+        title: The printed title.
+        chip: The chip the plan is resolved for.
+        attn_output_gate: Whether the layer gates its output.
+        o_proj_inputs: The o_proj capability override, or None.
+    """
+
+    title: str
+    chip: PlatformEnum
+    attn_output_gate: bool = True
+    o_proj_inputs: frozenset[alp.Quant] | None = None
+
+
 TPU, CUDA = PlatformEnum.TPU, PlatformEnum.CUDA
-CONFIGS = [
-    ("gated output, TPU", {}, TPU, None),
-    ("gated output, CUDA description", {}, CUDA, None),
-    ("no output gate, TPU", {"attn_output_gate": False}, TPU, None),
-    (
+SHOWN = (
+    Shown("gated output, TPU", TPU),
+    Shown("gated output, CUDA description", CUDA),
+    Shown("no output gate, TPU", TPU, attn_output_gate=False),
+    Shown(
         "gated output, CUDA, o_proj declares FP8 static input (newer vLLM)",
-        {},
         CUDA,
-        frozenset({alp.Quant.NONE, alp.Quant.FP8_STATIC_TENSOR_SYM}),
+        o_proj_inputs=frozenset({alp.Quant.NONE, alp.Quant.FP8_STATIC_TENSOR_SYM}),
     ),
-]
+)
 
 
 def _spec(spec: alp.TensorSpec) -> str:
@@ -66,14 +86,21 @@ def _children(plan: alp.AttentionLayerPlan) -> str:
     )
 
 
-def show(title, overrides, chip, o_proj_inputs) -> None:
-    layer = _layer.build(_layer.tiny_config(**overrides), chip=chip)
+def show(shown: Shown) -> None:
+    """Prints one config's contract, resolved plan and plan values.
+
+    Args:
+        shown: The config.
+    """
+    chip = shown.chip
+    config = layer_builder.tiny_config(attn_output_gate=shown.attn_output_gate)
+    layer = layer_builder.build(config, chip=chip)
     caps = layer_mod.describe_children(layer)
-    if o_proj_inputs is not None:
-        caps = dataclasses.replace(caps, o_proj_inputs=o_proj_inputs)
+    if shown.o_proj_inputs is not None:
+        caps = dataclasses.replace(caps, o_proj_inputs=shown.o_proj_inputs)
     plan, _ = alp.resolve_plan(layer.desc, caps, alp.ChipDesc(chip))
     c = layer.contract
-    print(f"=== {title}")
+    print(f"=== {shown.title}")
     print("contract")
     print(f"  positions      {_spec(c.positions)}")
     print(f"  hidden_states  {_spec(c.hidden_states)}")
@@ -104,11 +131,12 @@ OVERRIDES = [
 
 
 def show_overrides() -> None:
+    """Prints how each (user override, model plan) pair resolves."""
     print("=== overrides, gated output, TPU")
     for user, model in OVERRIDES:
-        config = _layer.tiny_config(tpu_attention_layer_plan=model)
+        config = layer_builder.tiny_config(model_plan=model)
         try:
-            layer = _layer.build(config, override=user)
+            layer = layer_builder.build(config, override=user)
         except ValueError as e:
             result = f"raises ValueError: {e}"
         else:
@@ -122,9 +150,10 @@ def show_overrides() -> None:
 
 
 def main() -> None:
-    with _layer.runtime():
-        for config in CONFIGS:
-            show(*config)
+    """Prints every config, then the overrides."""
+    with layer_builder.runtime():
+        for shown in SHOWN:
+            show(shown)
         show_overrides()
 
 

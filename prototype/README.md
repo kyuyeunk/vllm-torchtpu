@@ -25,11 +25,12 @@ as an expansion point, only its boundary is a contract:
 | Guards (section 5.10) | [`_guard_signatures, check_parameter_names`](../src/vllm_torchtpu/layers/expansion.py#L61-L80) in `expansion.py` (L61-L80) |
 |  | [`expansion_point`](../src/vllm_torchtpu/layers/expansion.py#L123-L134) in `expansion.py` (L123-L134) |
 | The owner registry | [`ExpansionPoint, ExpansionKey, EXPANSION_POINTS`](../src/vllm_torchtpu/patch_registry.py#L177-L210) in `patch_registry.py` (L177-L210) |
-| Planted checks | [`PLANTED, check_outside_write`](../prototype/check_attention.py#L44-L151) in `check_attention.py` (L44-L151) |
+| Planted checks | [`Planted ... check_outside_write`](../tests/layers/attention_layer_plan/contract_check.py#L49-L192) in `contract_check.py` (L49-L192) |
+|  | [`PLANTED`](../prototype/check_attention.py#L33-L39) in `check_attention.py` (L33-L39) |
 | Plan types marked with their owner | [`UnfusedLayerPlan, FusedLayerPlan`](../src/vllm_torchtpu/layers/attention_layer_plan.py#L217-L232) in `attention_layer_plan.py` (L217-L232) |
-| Plan invariance, structural tier and numerics on a CPU | [`check_config`](../prototype/check_attention_plans.py#L96-L184) in `check_attention_plans.py` (L96-L184) |
-| The layer with seeded weights, no TPU runtime, attention as a reference child | [`RefAttention, build_real`](../prototype/_cpu.py#L55-L101) in `_cpu.py` (L55-L101) |
-| Numerics tier for a TPU (prepared) | [`main`](../prototype/check_attention_values.py#L42-L76) in `check_attention_values.py` (L42-L76) |
+| Plan invariance, structural tier and numerics on a CPU | [`_check_declarations ... check_case`](../tests/layers/attention_layer_plan/plan_check.py#L125-L267) in `plan_check.py` (L125-L267) |
+| The layer with seeded weights, no TPU runtime, attention as a reference child | [`RefAttention, build_real`](../tests/layers/attention_layer_plan/cpu_layer.py#L41-L131) in `cpu_layer.py` (L41-L131) |
+| Numerics tier for a TPU (prepared) | [`test_capable_values_match_cpu_reference`](../tests/layers/attention_layer_plan/test_attention_layer_plan_values.py#L38-L72) in `test_attention_layer_plan_values.py` (L38-L72) |
 
 It writes no new kernel. The whole layer as one fused kernel is a plan value
 (`layer=fused`) whose `supports()` declines with "no fused attention-layer
@@ -122,16 +123,20 @@ contract's tolerance.
   compile of PyTorch needs the device, so the structural tier here is the
   graph `torch.export` produces, which is the same for every backend.
 - **The attention kernel stays out of scope.** The layer's plan hands the
-  attention child only its output format, so `_cpu` replaces the kernel with
+  attention child only its output format, so `cpu_layer` replaces the kernel with
   a plain causal grouped-query attention. The check covers the layer's own
   decisions.
-- **No TPU runtime.** `_cpu` keeps vLLM from detecting the TPU and maps the
-  plugin's packages without running their `__init__` files, so this command
-  needs no lock.
+- **No TPU runtime.** `cpu_layer` (through `no_tpu_runtime`) keeps vLLM from
+  detecting the TPU and maps the plugin's packages without running their
+  `__init__` files, so this command needs no lock.
 
 ```bash
 PYTHONPATH=.:src:<vllm-v0.33.0> python -m prototype.check_attention_plans
 ```
+
+The check is `tests/layers/attention_layer_plan/plan_check.py`;
+`test_attention_layer_plan_invariance.py` asserts that each configuration's
+findings equal its recorded known set (empty).
 
 Output on a CPU host (about 10 s; vLLM's warnings on standard error omitted):
 
@@ -191,13 +196,14 @@ findings: 0 (0 new)
   without an output gate, which `plan_declines` rejects and whose forced run
   fails on a split. Enumeration could leave it out.
 
-**Numerics tier on a TPU (prepared, not run).** `check_attention_values`
-moves each value declared capable on a TPU to the device and compares it with
+**Numerics tier on a TPU (prepared, not run).**
+`tests/layers/attention_layer_plan/test_attention_layer_plan_values.py`
+(marked `tpu`, so a default CPU run skips it) moves each value declared capable on a TPU to the device and compares it with
 the float32 CPU reference within the contract's tolerance:
 
 ```bash
 flock /tmp/vt-tpu.lock env PYTHONPATH=.:src:<vllm-v0.33.0> \
-    python -m prototype.check_attention_values
+    python -m pytest --run-tpu tests/layers/attention_layer_plan/test_attention_layer_plan_values.py
 ```
 
 **Where PR #3096 would enter.** vllm-project/vllm-torchtpu#3096 (open) adds
@@ -214,14 +220,22 @@ declared block's plan (section 5.3), not to this layer.
 ## Commands
 
 Both commands run on a CPU against the plugin's pinned vLLM v0.33.0 and build
-the layer on the meta device. Importing the plugin loads libtpu, so on a TPU
-VM run them under the TPU lock. They assume vLLM v0.33.0; with a newer vLLM
-the layer fails at `VllmConfig` setup, so put a v0.33.0 checkout on the path
-with `PYTHONPATH=src:<vllm-v0.33.0>`:
+the layer on the meta device. They import
+`tests/layers/attention_layer_plan/cpu_layer.py` first, which selects vLLM's
+CPU platform and keeps the TPU runtime out, so they need no TPU lock. They
+assume vLLM v0.33.0; with a newer vLLM the layer fails at `VllmConfig` setup,
+so put a v0.33.0 checkout on the path with `PYTHONPATH=.:src:<vllm-v0.33.0>`:
 
 ```bash
-JAX_PLATFORMS=cpu PYTHONPATH=src python -m prototype.attention_plan
-JAX_PLATFORMS=cpu PYTHONPATH=src python -m prototype.check_attention
+PYTHONPATH=.:src:<vllm-v0.33.0> python -m prototype.attention_plan
+PYTHONPATH=.:src:<vllm-v0.33.0> python -m prototype.check_attention
+```
+
+The checks themselves live in `tests/layers/attention_layer_plan/`, and pytest
+asserts them, including each planted violation (the `tpu` test is skipped):
+
+```bash
+PYTHONPATH=.:src:<vllm-v0.33.0> python -m pytest tests/layers/attention_layer_plan
 ```
 
 ### `prototype.attention_plan`
@@ -409,7 +423,7 @@ planted: none
   -> PASS
 ```
 
-Planted violations: comment in one `PLANTED = {...}` line at the top of
+Planted violations: comment in one `PLANTED = frozenset({...})` line in
 `prototype/check_attention.py` and rerun. Output is trimmed to the
 failures:
 
