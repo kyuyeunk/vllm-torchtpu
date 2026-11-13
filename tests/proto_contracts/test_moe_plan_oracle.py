@@ -29,12 +29,17 @@ dtype and setting that changes a decision.
 """
 
 import collections
+import dataclasses
 import enum
+import functools
 import itertools
-import unittest
 
 import _pure_import
-from _chips import BF16, CHIPS, F32, I32
+import jax.numpy as jnp
+import pytest
+from _chips import BF16, CHIPS, F32, I32, chip_name
+from _grid import GridFamily
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.layers.core import moe_plan
 from vllm_torchtpu.layers.core.moe_plan import (
@@ -479,9 +484,17 @@ def _plan_routing(process, op, *, refuse):
         moe_plan.counting_sort_accepts = saved
 
 
-def _routing_case(test, process, op, *, single, counting, refuse):
-    """Checks one routing case; returns main's choice."""
-    events = _reference_prepare(
+def _routing_case(
+    family: GridFamily,
+    process: moe_plan.MoeProcessPlan,
+    op: moe_plan.MoeOpIn,
+    *,
+    single: bool,
+    counting: bool,
+    refuse: bool,
+) -> tuple[SortForm, Permute]:
+    """Checks one routing case into `family`; returns main's choice."""
+    events: list[_Ev | tuple[_Ev, int]] = _reference_prepare(
         num_tokens_local=op.num_tokens,
         topk=op.topk,
         local_num_experts=op.local_num_experts,
@@ -492,17 +505,21 @@ def _routing_case(test, process, op, *, single, counting, refuse):
         _COUNTING_SORT=counting,
         inject_refusal=refuse,
     )
-    sort, permute, single_bits, packed_bits = _expected_routing(events)
+    routing: tuple[SortForm, Permute, int | None, int | None] = _expected_routing(
+        events
+    )
+    sort, permute, single_bits, packed_bits = routing
     plan = _plan_routing(process, op, refuse=refuse)
     ctx = (op, process, events)
-    test.assertIs(plan.sort, sort, ctx)
-    test.assertIs(plan.permute, permute, ctx)
-    test.assertEqual(plan.uses_counting_sort, _Ev.COUNTING_SORT in events, ctx)
-    test.assertEqual(plan.argsorts_keys, _Ev.ARGSORT_KEYS in events, ctx)
+    family.expect(plan.sort is sort, (plan.sort, sort, ctx))
+    family.expect(plan.permute is permute, (plan.permute, permute, ctx))
+    family.expect_equal(plan.uses_counting_sort, _Ev.COUNTING_SORT in events, ctx)
+    family.expect_equal(plan.argsorts_keys, _Ev.ARGSORT_KEYS in events, ctx)
     if single_bits is not None:
-        test.assertEqual(plan.flat_bits, single_bits, ctx)
+        family.expect_equal(plan.flat_bits, single_bits, ctx)
     if packed_bits is not None:
-        test.assertEqual(plan.token_bits, packed_bits, ctx)
+        family.expect_equal(plan.token_bits, packed_bits, ctx)
+    family.cases += 1
     return sort, permute
 
 
@@ -544,129 +561,239 @@ def _process(*, use_sc, thr, single=True, counting=True, dense_thr=0, **caps):
     )
 
 
-class MoeRoutingOracleTest(unittest.TestCase):
-    """`plan_routing` against `prepare_routed_gmm_inputs` at d3991ebf9."""
+@dataclasses.dataclass(frozen=True)
+class _RoutingFamily:
+    """One process setting of the routing grid; the threshold acts on EP only.
 
-    def test_routing_matches_reference(self):
-        """Boundaries: rows vs the one-hot threshold, the 512-row counting
-        block and scatter cap, the 2048-row sort cap; experts + 1 vs the
-        counting block; packed-key width vs 31 bits; the two sort toggles;
-        the counting sort's refusal."""
-        cases, outcomes = 0, set()
-        for (tokens, topk), experts, (use_ep, use_sc), thr in itertools.product(
-            _routing_shapes(), _LOCAL_EXPERTS, _EP_SC, _THRESHOLDS
-        ):
-            if not (use_ep and use_sc) and thr:
-                continue  # The threshold only acts on the EP SparseCore path.
-            op = moe_plan.MoeOpIn(
-                num_tokens=tokens, topk=topk, local_num_experts=experts, use_ep=use_ep
+    Attributes:
+        use_ep: Expert parallelism.
+        use_sc: The SparseCore; routing reads only its conjunction with EP.
+        threshold: The one-hot threshold.
+    """
+
+    use_ep: bool
+    use_sc: bool
+    threshold: int
+
+    @property
+    def label(self) -> str:
+        """The family's test id."""
+        path = "ep_sc" if self.use_ep and self.use_sc else "tc"
+        return f"{path}-thr{self.threshold}"
+
+
+# The threshold only acts on the EP SparseCore path.
+_ROUTING_FAMILIES = (
+    _RoutingFamily(use_ep=False, use_sc=False, threshold=0),
+    *(_RoutingFamily(use_ep=True, use_sc=True, threshold=t) for t in _THRESHOLDS),
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class _RoutingResult:
+    """One routing family's checks and the (sort, permute) choices it reached."""
+
+    family: GridFamily
+    outcomes: frozenset[tuple[SortForm, Permute]]
+
+
+@functools.cache
+def _routing_family(family: _RoutingFamily) -> _RoutingResult:
+    """Checks every (shape, experts, sort toggles, refusal) of one family."""
+    check = GridFamily(f"routing {family.label}")
+    outcomes: set[tuple[SortForm, Permute]] = set()
+    for (tokens, topk), experts in itertools.product(_routing_shapes(), _LOCAL_EXPERTS):
+        op = moe_plan.MoeOpIn(
+            num_tokens=tokens,
+            topk=topk,
+            local_num_experts=experts,
+            use_ep=family.use_ep,
+        )
+        for single, counting, refuse in itertools.product((False, True), repeat=3):
+            process = _process(
+                use_sc=family.use_sc,
+                thr=family.threshold,
+                single=single,
+                counting=counting,
             )
-            for single, counting, refuse in itertools.product((False, True), repeat=3):
-                process = _process(
-                    use_sc=use_sc, thr=thr, single=single, counting=counting
+            outcomes.add(
+                _routing_case(
+                    check, process, op, single=single, counting=counting, refuse=refuse
                 )
-                outcomes.add(
-                    _routing_case(
-                        self,
-                        process,
-                        op,
-                        single=single,
-                        counting=counting,
-                        refuse=refuse,
-                    )
-                )
-                cases += 1
-        print(f"\n[routing] {cases} cases, {len(outcomes)} distinct (sort, permute)")
-        self.assertEqual({s for s, _ in outcomes}, set(SortForm))
-        self.assertEqual({p for _, p in outcomes}, set(Permute))
+            )
+    return _RoutingResult(check, frozenset(outcomes))
 
-    def test_patched_row_caps_match_reference(self):
-        """Boundaries: rows on both sides of each patched cap (the existing
-        TPU tests patch these module caps; they are plan inputs now)."""
-        global _SINGLE_SORT_MAX_ROWS, _COUNTING_SORT_SCATTER_MAX_ROWS  # noqa: PLW0603
-        saved = (_SINGLE_SORT_MAX_ROWS, _COUNTING_SORT_SCATTER_MAX_ROWS)
-        cases, outcomes = 0, set()
-        caps = ((2048, 0), (1024, 512), (4096, 2048), (0, 0))
-        rows = sorted({c + d for pair in caps for c in pair for d in (-1, 0, 1)} - {-1})
-        try:
-            for (single_cap, scatter_cap), tokens, experts, (
-                use_ep,
-                use_sc,
-            ), refuse in itertools.product(
-                caps, [r for r in rows if r > 0], (7, 255), _EP_SC, (False, True)
-            ):
-                _SINGLE_SORT_MAX_ROWS = single_cap
-                _COUNTING_SORT_SCATTER_MAX_ROWS = scatter_cap
-                process = _process(
-                    use_sc=use_sc,
-                    thr=0,
-                    single_sort_max_rows=single_cap,
-                    counting_scatter_max_rows=scatter_cap,
-                )
-                op = moe_plan.MoeOpIn(
-                    num_tokens=tokens, topk=1, local_num_experts=experts, use_ep=use_ep
-                )
-                outcomes.add(
-                    _routing_case(
-                        self, process, op, single=True, counting=True, refuse=refuse
-                    )
-                )
-                cases += 1
-        finally:
-            _SINGLE_SORT_MAX_ROWS, _COUNTING_SORT_SCATTER_MAX_ROWS = saved
-        print(
-            f"\n[routing caps] {cases} cases, {len(outcomes)} distinct (sort, permute)"
+
+def test_no_tpu_runtime() -> None:
+    """The module imported with no TPU runtime and runs JAX on the CPU."""
+    assert _pure_import.loaded_tpu_runtime() == []
+    assert _pure_import.jax_backend() == "cpu"  # str-ok: the backend name JAX reports
+
+
+@pytest.mark.parametrize(
+    "family", _ROUTING_FAMILIES, ids=[f.label for f in _ROUTING_FAMILIES]
+)
+def test_routing_matches_reference(family: _RoutingFamily) -> None:
+    """`plan_routing` against `prepare_routed_gmm_inputs` at d3991ebf9.
+
+    Boundaries: rows vs the one-hot threshold, the 512-row counting block and
+    scatter cap, the 2048-row sort cap; experts + 1 vs the counting block;
+    packed-key width vs 31 bits; the two sort toggles; the counting sort's
+    refusal.
+    """
+    _routing_family(family).family.assert_no_mismatches()
+
+
+def test_routing_reaches_every_sort_and_permute() -> None:
+    """Across the routing families, main picks every sort form and permute."""
+    outcomes = {
+        outcome
+        for family in _ROUTING_FAMILIES
+        for outcome in _routing_family(family).outcomes
+    }
+    print(f"\n[routing] {len(outcomes)} distinct (sort, permute)")
+    assert {s for s, _ in outcomes} == set(SortForm)
+    assert {p for _, p in outcomes} == set(Permute)
+
+
+@dataclasses.dataclass(frozen=True)
+class _RowCaps:
+    """A patched (single-sort cap, counting-scatter cap) pair.
+
+    The existing TPU tests patch these module caps; they are plan inputs now.
+    """
+
+    single_sort_max_rows: int
+    counting_scatter_max_rows: int
+
+    @property
+    def label(self) -> str:
+        """The pair's test id."""
+        return (
+            f"single{self.single_sort_max_rows}-scatter{self.counting_scatter_max_rows}"
         )
 
-    def test_entry_matches_reference(self):
-        """Boundaries: tokens on both sides of 0 and of the dense-expert
-        threshold, routed rows on both sides of the one-hot threshold; the
-        kernel's own admission; EP and SparseCore each alone."""
-        cases, outcomes = 0, set()
-        tokens_set = (0, 1, 15, 16, 17, 31, 32, 63, 64, 255, 256, 511, 512, 1024, 1025)
-        for tokens, topk, (use_ep, use_sc), thr, dense_thr, admits in itertools.product(
-            tokens_set,
-            _TOPKS,
-            ((False, False), (True, False), (False, True), (True, True)),
-            _THRESHOLDS,
-            (0, 16, 1024),
-            (False, True),
+
+_ROW_CAPS = (
+    _RowCaps(2048, 0),
+    _RowCaps(1024, 512),
+    _RowCaps(4096, 2048),
+    _RowCaps(0, 0),
+)
+
+
+def _cap_rows() -> list[int]:
+    """Rows on both sides of every cap of `_ROW_CAPS`, positive only."""
+    caps = {
+        cap
+        for pair in _ROW_CAPS
+        for cap in (pair.single_sort_max_rows, pair.counting_scatter_max_rows)
+    }
+    rows = sorted({c + d for c in caps for d in (-1, 0, 1)} - {-1})
+    return [r for r in rows if r > 0]
+
+
+@pytest.mark.parametrize("caps", _ROW_CAPS, ids=[c.label for c in _ROW_CAPS])
+def test_patched_row_caps_match_reference(caps: _RowCaps) -> None:
+    """Rows on both sides of each patched cap, for one cap pair."""
+    global _SINGLE_SORT_MAX_ROWS, _COUNTING_SORT_SCATTER_MAX_ROWS  # noqa: PLW0603 - the reference reads the module caps
+    saved = (_SINGLE_SORT_MAX_ROWS, _COUNTING_SORT_SCATTER_MAX_ROWS)
+    check = GridFamily(f"routing caps {caps.label}")
+    outcomes: set[tuple[SortForm, Permute]] = set()
+    try:
+        _SINGLE_SORT_MAX_ROWS = caps.single_sort_max_rows  # pyright: ignore[reportConstantRedefinition] - the reference reads the module caps
+        _COUNTING_SORT_SCATTER_MAX_ROWS = caps.counting_scatter_max_rows  # pyright: ignore[reportConstantRedefinition] - the reference reads the module caps
+        for tokens, experts, (use_ep, use_sc), refuse in itertools.product(
+            _cap_rows(), (7, 255), _EP_SC, (False, True)
         ):
-            asked = []
-
-            def can_use_dense_expert(admits=admits, asked=asked):
-                asked.append(1)
-                return admits
-
-            events = _reference_entry(
-                num_tokens=tokens,
-                topk=topk,
-                use_ep=use_ep,
-                use_sparse_core=use_sc,
-                onehot_moe_permute_threshold=thr,
-                _DENSE_EXPERT_THRESHOLD=dense_thr,
-                can_use_dense_expert=can_use_dense_expert,
-            )
-            process = _process(use_sc=use_sc, thr=thr, dense_thr=dense_thr)
             op = moe_plan.MoeOpIn(
-                num_tokens=tokens, topk=topk, local_num_experts=64, use_ep=use_ep
+                num_tokens=tokens, topk=1, local_num_experts=experts, use_ep=use_ep
             )
-            candidate = moe_plan.dense_expert_candidate(process, op)
-            # The kernel's admission is asked exactly where main asked it.
-            self.assertEqual(candidate, bool(asked), (op, process))
-            entry = moe_plan.plan_entry(
-                process, op, dense_expert_admitted=candidate and admits
+            outcomes.add(
+                _routing_case(
+                    check,
+                    _process(
+                        use_sc=use_sc,
+                        thr=0,
+                        single_sort_max_rows=caps.single_sort_max_rows,
+                        counting_scatter_max_rows=caps.counting_scatter_max_rows,
+                    ),
+                    op,
+                    single=True,
+                    counting=True,
+                    refuse=refuse,
+                )
             )
-            expected_path = (
-                MoePath.DENSE_EXPERT if _Ev.DENSE_EXPERT in events else MoePath.ROUTED
-            )
-            self.assertIs(entry.path, expected_path, (op, process))
-            self.assertEqual(
-                entry.scrub_nonfinite, _Ev.SCRUB_NONFINITE in events, (op, process)
-            )
-            outcomes.add((entry.path, entry.scrub_nonfinite))
-            cases += 1
-        print(f"\n[entry] {cases} cases, {len(outcomes)} distinct (path, scrub)")
+    finally:
+        _SINGLE_SORT_MAX_ROWS, _COUNTING_SORT_SCATTER_MAX_ROWS = saved  # pyright: ignore[reportConstantRedefinition] - the reference reads the module caps
+    print(f"\n[routing caps {caps.label}] {len(outcomes)} distinct (sort, permute)")
+    check.assert_no_mismatches()
+
+
+# (use_ep, use_sparse_core): the entry reads each alone.
+_ENTRY_EP_SC = ((False, False), (True, False), (False, True), (True, True))
+_ENTRY_TOKENS = (0, 1, 15, 16, 17, 31, 32, 63, 64, 255, 256, 511, 512, 1024, 1025)
+
+
+def _ep_sc_id(ep_sc: tuple[bool, bool]) -> str:
+    use_ep, use_sc = ep_sc
+    return f"{'ep' if use_ep else 'no_ep'}-{'sc' if use_sc else 'no_sc'}"
+
+
+@pytest.mark.parametrize("ep_sc", _ENTRY_EP_SC, ids=map(_ep_sc_id, _ENTRY_EP_SC))
+def test_entry_matches_reference(ep_sc: tuple[bool, bool]) -> None:
+    """The entry plan against `fused_moe_func` at d3991ebf9, for one EP/SC pair.
+
+    Boundaries: tokens on both sides of 0 and of the dense-expert threshold,
+    routed rows on both sides of the one-hot threshold; the kernel's own
+    admission.
+    """
+    use_ep, use_sc = ep_sc
+    check = GridFamily(f"entry {_ep_sc_id(ep_sc)}")
+    outcomes: set[tuple[MoePath, bool]] = set()
+    for tokens, topk, thr, dense_thr, admits in itertools.product(
+        _ENTRY_TOKENS, _TOPKS, _THRESHOLDS, (0, 16, 1024), (False, True)
+    ):
+        asked: list[int] = []
+
+        def can_use_dense_expert(
+            *, admits: bool = admits, asked: list[int] = asked
+        ) -> bool:
+            asked.append(1)
+            return admits
+
+        events: list[_Ev] = _reference_entry(
+            num_tokens=tokens,
+            topk=topk,
+            use_ep=use_ep,
+            use_sparse_core=use_sc,
+            onehot_moe_permute_threshold=thr,
+            _DENSE_EXPERT_THRESHOLD=dense_thr,
+            can_use_dense_expert=can_use_dense_expert,
+        )
+        process = _process(use_sc=use_sc, thr=thr, dense_thr=dense_thr)
+        op = moe_plan.MoeOpIn(
+            num_tokens=tokens, topk=topk, local_num_experts=64, use_ep=use_ep
+        )
+        candidate = moe_plan.dense_expert_candidate(process, op)
+        # The kernel's admission is asked exactly where main asked it.
+        check.expect_equal(candidate, bool(asked), (op, process))
+        entry = moe_plan.plan_entry(
+            process, op, dense_expert_admitted=candidate and admits
+        )
+        expected_path = (
+            MoePath.DENSE_EXPERT if _Ev.DENSE_EXPERT in events else MoePath.ROUTED
+        )
+        check.expect(
+            entry.path is expected_path, (entry.path, expected_path, op, process)
+        )
+        check.expect_equal(
+            entry.scrub_nonfinite, _Ev.SCRUB_NONFINITE in events, (op, process)
+        )
+        outcomes.add((entry.path, entry.scrub_nonfinite))
+        check.cases += 1
+    print(f"\n[entry {_ep_sc_id(ep_sc)}] {len(outcomes)} distinct (path, scrub)")
+    check.assert_no_mismatches()
 
 
 class _Mode(str):
@@ -718,185 +845,227 @@ def _combine_settings(routes):
             yield True, True, 511, version, False, 0
 
 
-class MoeCombineOracleTest(unittest.TestCase):
-    """`plan_combine` and what it reads against `moe_gmm`'s combine at d3991ebf9."""
+_CombineHead = Combine | _Ref
+# (use_ep, use_sc, threshold, version, owner_on, extra_rows).
+_CombineSetting = tuple[bool, bool, int, GatherReduceVersion, bool, int]
 
-    def test_combine_matches_reference(self):
-        """Boundaries: local v3's topk >= 2 and != 8, routes vs the
-        threshold, BF16, 2**20 source rows, a 16-lane SparseCore, lane
-        alignment, the 0.6 x VMEM cutoffs, the token-alignment and padding
-        rule; the EP one-hot threshold and owner admission (rows % 128,
-        width % MXU, tokens % sublane tiling, VMEM); each EP kernel version;
-        16 chips and no chip; BF16 and FP32."""
-        by_path: collections.Counter[str] = collections.Counter()
-        outcomes = set()
-        for chip, dtype, hidden, topk, tokens in itertools.product(
-            (None, *CHIPS),
-            (BF16, F32),
-            _COMBINE_HIDDENS,
-            _COMBINE_TOPKS,
-            _COMBINE_TOKENS,
-        ):
-            routes = tokens * topk
-            for use_ep, use_sc, thr, version, owner_on, extra in _combine_settings(
-                routes
-            ):
-                head, outcome = self._case(
-                    chip,
-                    dtype,
-                    hidden,
-                    topk,
-                    tokens,
-                    use_ep,
-                    use_sc,
-                    thr,
-                    version,
-                    owner_on,
-                    extra,
-                )
-                by_path[head.value] += 1
-                outcomes.add(outcome)
-        print(
-            f"\n[combine] {by_path.total()} cases, {len(outcomes)} distinct outcomes; "
-            f"by path: {dict(sorted(by_path.items()))}"
-        )
-        self.assertEqual(set(by_path) - {_Ref.RAISE.value}, {c.value for c in Combine})
 
-    def _case(  # noqa: PLR0913 - one combine call's inputs
-        self,
-        chip,
-        dtype,
-        hidden,
-        topk,
-        tokens,
-        use_ep,
-        use_sc,
-        thr,
-        version,
-        owner_on,
-        extra,
+@dataclasses.dataclass(frozen=True)
+class _CombineResult:
+    """One chip's combine checks, its cases per head, and its outcomes."""
+
+    family: GridFamily
+    by_head: collections.Counter[_CombineHead]
+    outcomes: frozenset[tuple[object, ...]]
+
+
+def _combine_chip_id(chip: pltpu.TpuInfo | None) -> str:
+    return "no_chip" if chip is None else chip_name(chip)
+
+
+_COMBINE_CHIPS = (None, *CHIPS)
+
+
+@functools.cache
+def _combine_family(chip: pltpu.TpuInfo | None) -> _CombineResult:
+    """Checks every (dtype, width, top-k, tokens, setting) on one chip."""
+    check = GridFamily(f"combine {_combine_chip_id(chip)}")
+    by_head: collections.Counter[_CombineHead] = collections.Counter()
+    outcomes: set[tuple[object, ...]] = set()
+    for dtype, hidden, topk, tokens in itertools.product(
+        (BF16, F32), _COMBINE_HIDDENS, _COMBINE_TOPKS, _COMBINE_TOKENS
     ):
-        routes = tokens * topk
-        out = moe_plan.GmmOutSpec(
-            routes=routes,
-            rows=routes + extra,
-            hidden=hidden,
-            dtype=dtype,
-            token_indices_shape=(routes,),
-            token_indices_dtype=I32,
-            topk_weights_shape=(routes,),
-            topk_weights_dtype=dtype,
-        )
-        op = moe_plan.MoeOpIn(
-            num_tokens=tokens, topk=topk, local_num_experts=64, use_ep=use_ep
-        )
-        process = moe_plan.MoeProcessPlan(
-            use_sparse_core=use_sc,
-            onehot_threshold=thr,
-            single_sort=True,
-            counting_sort=True,
-            dense_expert_threshold=0,
-            ep_gather_reduce_version=version,
-        )
-        chip_reads = []
-
-        def get_tpu_info():
-            chip_reads.append(1)
-            if chip is None:
-                raise ValueError("Unsupported TPU device kind: cpu")
-            return chip
-
-        mode = _mode(owner_on)
-        try:
-            expected = _reference_combine(
-                out=out,
-                dtype=dtype,
-                num_tokens=tokens,
-                topk=topk,
-                use_ep=use_ep,
-                use_sparse_core=use_sc,
-                onehot_moe_permute_threshold=thr,
-                owner_output_mode=mode,
-                configured_version=version,
-                get_tpu_info=get_tpu_info,
+        for setting in _combine_settings(tokens * topk):
+            head, outcome = _combine_case(
+                check, chip, dtype, hidden, topk, tokens, setting
             )
-        except (ValueError, NotImplementedError) as e:
-            expected = (_Ref.RAISE, type(e))
-        ctx = f"{op} {process} {out} chip={chip and chip.chip_version} -> {expected}"
-        # What the plan reads: the owner mode exactly where main read it, and
-        # the chip wherever main (or the kernel it called) read it.
-        self.assertEqual(
-            moe_plan.combine_reads_owner_mode(process, op, out), bool(mode.reads), ctx
+            by_head[head] += 1
+            outcomes.add(outcome)
+    return _CombineResult(check, by_head, frozenset(outcomes))
+
+
+@pytest.mark.parametrize(
+    "chip", _COMBINE_CHIPS, ids=[_combine_chip_id(c) for c in _COMBINE_CHIPS]
+)
+def test_combine_matches_reference(chip: pltpu.TpuInfo | None) -> None:
+    """`plan_combine` and what it reads against `moe_gmm`'s combine at d3991ebf9.
+
+    One chip (or none) per test. Boundaries: local v3's topk >= 2 and != 8,
+    routes vs the threshold, BF16, 2**20 source rows, a 16-lane SparseCore,
+    lane alignment, the 0.6 x VMEM cutoffs, the token-alignment and padding
+    rule; the EP one-hot threshold and owner admission (rows % 128, width %
+    MXU, tokens % sublane tiling, VMEM); each EP kernel version; BF16 and
+    FP32.
+    """
+    result = _combine_family(chip)
+    by_head = {head.name: n for head, n in result.by_head.items()}
+    print(
+        f"\n[combine {_combine_chip_id(chip)}] by path: {dict(sorted(by_head.items()))}"
+    )
+    result.family.assert_no_mismatches()
+
+
+def test_combine_reaches_every_path() -> None:
+    """Across the chips, the plan picks every combine."""
+    by_head: collections.Counter[_CombineHead] = collections.Counter()
+    outcomes: set[tuple[object, ...]] = set()
+    for chip in _COMBINE_CHIPS:
+        result = _combine_family(chip)
+        by_head.update(result.by_head)
+        outcomes |= result.outcomes
+    names = {head.name: n for head, n in by_head.items()}
+    print(
+        f"\n[combine] {by_head.total()} cases, {len(outcomes)} distinct outcomes; "
+        f"by path: {dict(sorted(names.items()))}"
+    )
+    assert set(by_head) - {_Ref.RAISE} == set(Combine)
+
+
+def _combine_case(
+    check: GridFamily,
+    chip: pltpu.TpuInfo | None,
+    dtype: jnp.dtype,
+    hidden: int,
+    topk: int,
+    tokens: int,
+    setting: _CombineSetting,
+) -> tuple[_CombineHead, tuple[object, ...]]:
+    """Checks one combine case into `check`; returns its head and outcome."""
+    use_ep, use_sc, thr, version, owner_on, extra = setting
+    routes = tokens * topk
+    out = moe_plan.GmmOutSpec(
+        routes=routes,
+        rows=routes + extra,
+        hidden=hidden,
+        dtype=dtype,
+        token_indices_shape=(routes,),
+        token_indices_dtype=I32,
+        topk_weights_shape=(routes,),
+        topk_weights_dtype=dtype,
+    )
+    op = moe_plan.MoeOpIn(
+        num_tokens=tokens, topk=topk, local_num_experts=64, use_ep=use_ep
+    )
+    process = moe_plan.MoeProcessPlan(
+        use_sparse_core=use_sc,
+        onehot_threshold=thr,
+        single_sort=True,
+        counting_sort=True,
+        dense_expert_threshold=0,
+        ep_gather_reduce_version=version,
+    )
+    chip_reads: list[int] = []
+
+    def get_tpu_info() -> pltpu.TpuInfo:
+        chip_reads.append(1)
+        if chip is None:
+            raise ValueError("Unsupported TPU device kind: cpu")
+        return chip
+
+    mode = _mode(owner_on)
+    expected: tuple[object, ...]
+    try:
+        expected = _reference_combine(
+            out=out,
+            dtype=dtype,
+            num_tokens=tokens,
+            topk=topk,
+            use_ep=use_ep,
+            use_sparse_core=use_sc,
+            onehot_moe_permute_threshold=thr,
+            owner_output_mode=mode,
+            configured_version=version,
+            get_tpu_info=get_tpu_info,
         )
-        need = moe_plan.combine_target_need(process, op, out, owner_output=owner_on)
-        if chip_reads:
-            self.assertIsNot(need, TargetNeed.NONE, ctx)
-        try:
-            plan = moe_plan.plan_combine(process, op, out, chip, owner_output=owner_on)
-            actual = (plan.combine, plan.ep_gather_reduce_version)
-        except (ValueError, NotImplementedError, AssertionError) as e:
-            plan, actual = None, (_Ref.RAISE, type(e))
-        self._check(expected, actual, plan, need, chip, ctx)
-        alignment = plan.local_v3_token_alignment if plan is not None else None
-        return actual[0], (*actual, alignment)
-
-    def _check(self, expected, actual, plan, need, chip, ctx):  # noqa: PLR0913
-        match expected:
-            case (Combine.LOCAL_V3, kernel_path, alignment):
-                # The plan claims the kernel never falls back on this path.
-                self.assertIs(kernel_path, KernelPath.SC, ctx)
-                self.assertEqual(actual, (Combine.LOCAL_V3, None), ctx)
-                self.assertEqual(plan.local_v3_token_alignment, alignment, ctx)
-            case (Combine.EP_OWNER_ONEHOT | Combine.EP_ONEHOT | Combine.TENSORCORE,):
-                self.assertEqual(actual, (expected[0], None), ctx)
-            case (_Ref.EP_RAGGED, ref_version, kernel_path):
-                # KernelPath.RAISE: v3 past 2**20 source rows raises after its
-                # fallback checks pass; the plan names the SparseCore path it
-                # attempts.
-                combine = (
-                    Combine.EP_RAGGED_TC_FALLBACK
-                    if kernel_path is KernelPath.TC_FALLBACK
-                    else Combine.EP_RAGGED_SC
-                )
-                self.assertEqual(actual, (combine, ref_version), ctx)
-            case (_Ref.RAISE, exc):
-                # Main raises from get_tpu_info (no chip) inside the EP kernel
-                # or the owner admission, or from get_sublane_tiling on an
-                # unknown generation. The plan raises the same, or it needs
-                # the chip, which the runtime read then fails to give.
-                self.assertTrue(
-                    actual == (_Ref.RAISE, exc)
-                    or (
-                        exc is ValueError
-                        and chip is None
-                        and need is TargetNeed.REQUIRED
-                    ),
-                    ctx,
-                )
-            case _:
-                self.fail(ctx)
+    except (ValueError, NotImplementedError) as e:
+        expected = (_Ref.RAISE, type(e))
+    ctx = f"{op} {process} {out} chip={chip and chip.chip_version} -> {expected}"
+    # What the plan reads: the owner mode exactly where main read it, and
+    # the chip wherever main (or the kernel it called) read it.
+    check.expect_equal(
+        moe_plan.combine_reads_owner_mode(process, op, out), bool(mode.reads), ctx
+    )
+    need = moe_plan.combine_target_need(process, op, out, owner_output=owner_on)
+    if chip_reads:
+        check.expect(need is not TargetNeed.NONE, ("needs no chip", ctx))
+    plan: moe_plan.MoeCombinePlan | None
+    try:
+        plan = moe_plan.plan_combine(process, op, out, chip, owner_output=owner_on)
+        actual = (plan.combine, plan.ep_gather_reduce_version)
+    except (ValueError, NotImplementedError, AssertionError) as e:
+        plan, actual = None, (_Ref.RAISE, type(e))
+    check.expect(_combine_agrees(expected, actual, plan, need, chip), (actual, ctx))
+    check.cases += 1
+    alignment = plan.local_v3_token_alignment if plan is not None else None
+    return actual[0], (*actual, alignment)
 
 
-class EnvParseTest(unittest.TestCase):
-    """Each env value is parsed once, at its read, into a plan value."""
+def _combine_agrees(
+    expected: tuple[object, ...],
+    actual: tuple[object, ...],
+    plan: moe_plan.MoeCombinePlan | None,
+    need: TargetNeed,
+    chip: pltpu.TpuInfo | None,
+) -> bool:
+    """Whether the plan's combine is the one main's reference reached."""
+    match expected:
+        case (Combine.LOCAL_V3, kernel_path, alignment):
+            # The plan claims the kernel never falls back on this path.
+            return (
+                kernel_path is KernelPath.SC
+                and actual == (Combine.LOCAL_V3, None)
+                and plan is not None
+                and plan.local_v3_token_alignment == alignment
+            )
+        case (Combine.EP_OWNER_ONEHOT | Combine.EP_ONEHOT | Combine.TENSORCORE,):
+            return actual == (expected[0], None)
+        case (_Ref.EP_RAGGED, ref_version, kernel_path):
+            # KernelPath.RAISE: v3 past 2**20 source rows raises after its
+            # fallback checks pass; the plan names the SparseCore path it
+            # attempts.
+            combine = (
+                Combine.EP_RAGGED_TC_FALLBACK
+                if kernel_path is KernelPath.TC_FALLBACK
+                else Combine.EP_RAGGED_SC
+            )
+            return actual == (combine, ref_version)
+        case (_Ref.RAISE, exc):
+            # Main raises from get_tpu_info (no chip) inside the EP kernel
+            # or the owner admission, or from get_sublane_tiling on an
+            # unknown generation. The plan raises the same, or it needs
+            # the chip, which the runtime read then fails to give.
+            return actual == (_Ref.RAISE, exc) or (
+                exc is ValueError and chip is None and need is TargetNeed.REQUIRED
+            )
+        case _:
+            return False
 
-    def test_no_tpu_runtime(self):
-        self.assertEqual(_pure_import.loaded_tpu_runtime(), [])
-        self.assertEqual(_pure_import.jax_backend(), "cpu")
 
-    def test_gather_reduce_version(self):
-        for version in GatherReduceVersion:
-            self.assertIs(moe_plan.gather_reduce_version(version.value), version)
-        with self.assertRaisesRegex(ValueError, "valid: v1, v2, v3"):
-            moe_plan.gather_reduce_version("v4")
-
-    def test_owner_output_mode(self):
-        # Case-insensitive, like the env getter.
-        self.assertIs(moe_plan.owner_output_mode("ON"), OwnerOutputMode.ON)
-        self.assertIs(moe_plan.owner_output_mode("off"), OwnerOutputMode.OFF)
-        with self.assertRaisesRegex(ValueError, "valid: off, on"):
-            moe_plan.owner_output_mode("auto")
+@pytest.mark.parametrize(
+    "version", list(GatherReduceVersion), ids=[v.name for v in GatherReduceVersion]
+)
+def test_gather_reduce_version_parses(version: GatherReduceVersion) -> None:
+    """Each version's env value parses to that version."""
+    assert moe_plan.gather_reduce_version(version.value) is version
 
 
-if __name__ == "__main__":  # str-ok: the module entry-point idiom
-    unittest.main()
+def test_gather_reduce_version_rejects_unknown() -> None:
+    """An unknown version names the valid ones."""
+    with pytest.raises(ValueError, match="valid: v1, v2, v3"):
+        _ = moe_plan.gather_reduce_version("v4")
+
+
+@pytest.mark.parametrize(
+    ("value", "mode"),
+    [("ON", OwnerOutputMode.ON), ("off", OwnerOutputMode.OFF)],
+    ids=["upper_on", "lower_off"],
+)
+def test_owner_output_mode_parses(value: str, mode: OwnerOutputMode) -> None:
+    """Case-insensitive, like the env getter."""
+    assert moe_plan.owner_output_mode(value) is mode
+
+
+def test_owner_output_mode_rejects_unknown() -> None:
+    """An unknown mode names the valid ones."""
+    with pytest.raises(ValueError, match="valid: off, on"):
+        _ = moe_plan.owner_output_mode("auto")
