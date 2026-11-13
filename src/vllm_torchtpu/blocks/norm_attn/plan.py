@@ -18,11 +18,20 @@ tolerance:
 
 - ``unfused``: the input RMSNorm adds the residual and normalizes, then
   attention's QKV projection reads the normed tokens (upstream).
-- ``fused_qkv``: one function adds, normalizes and projects (PR #3096's
-  fused_qkv kernel; here a plain-torch reference written against the roles).
+- ``fused_qkv``: one function normalizes and projects (PR #3096's fused_qkv
+  kernel; here a plain-torch reference written against the roles).
 
-The rule picks ``fused_qkv`` for every layer that conforms. The user's
-override (``TPU_SUBBLOCK_PLAN``) comes first, as for every plan.
+``fused_qkv`` has two fields besides its precision (``matmul``):
+``residual_add`` says where the residual is added. ``folded``: the kernel
+takes the residual and returns the new residual, written once. ``outside``:
+the runner adds before the kernel, which only normalizes. Both keep the
+output within the contract; on TPU, ``outside`` leaves a sum XLA recomputes
+in every later fusion that reads it (Llama-3.1-70B prefill, 8192 tokens:
+gate_up +150 us, down +89 us per layer).
+
+The rule picks ``fused_qkv`` for every layer that conforms, ``folded`` where
+the fused op implements it. The user's override (``TPU_SUBBLOCK_PLAN``)
+comes first, as for every plan.
 """
 
 import dataclasses
@@ -47,6 +56,7 @@ from vllm_torchtpu.blocks.norm_attn.runner import (
     AttentionBinding,
     AttnConfig,
     InputProj,
+    ResidualAdd,
 )
 from vllm_torchtpu.layers.core.plan_marker import plan_of
 from vllm_torchtpu.layers.core.resolution import require_no_default
@@ -73,21 +83,32 @@ class Pins:
 
     input_proj: InputProj | None = None
     matmul: Matmul | None = None
+    residual_add: ResidualAdd | None = None
 
     def allow(self, plan: "NormAttnPlan") -> bool:
         """Whether ``plan`` keeps every pinned field."""
-        return (self.input_proj is None or plan.input_proj is self.input_proj) and (
-            self.matmul is None or plan.matmul is self.matmul
+        return (
+            (self.input_proj is None or plan.input_proj is self.input_proj)
+            and (self.matmul is None or plan.matmul is self.matmul)
+            and (self.residual_add is None or plan.residual_add is self.residual_add)
         )
 
     def __bool__(self) -> bool:
-        """The part's ``__bool__``."""
-        return self.input_proj is not None or self.matmul is not None
+        """Whether any field is pinned."""
+        return any(
+            v is not None for v in (self.input_proj, self.matmul, self.residual_add)
+        )
 
     @override
     def __str__(self) -> str:
-        fields = (("input_proj", self.input_proj), ("matmul", self.matmul))
-        return ",".join(f"{k}={v.value}" for k, v in fields if v) or "(rule)"
+        fields: tuple[tuple[str, enum.Enum | None], ...] = (
+            ("input_proj", self.input_proj),
+            ("matmul", self.matmul),
+            ("residual_add", self.residual_add),
+        )
+        return (
+            ",".join(f"{k}={v.value}" for k, v in fields if v is not None) or "(rule)"
+        )
 
 
 def is_fp8_e4m3(cache_dtype: str) -> bool:
@@ -103,16 +124,22 @@ def parse_pins(text: str) -> Pins:
     """
     input_proj: InputProj | None = None
     matmul: Matmul | None = None
+    residual_add: ResidualAdd | None = None
     for item in filter(None, text.split(",")):
         key, _, value = item.partition("=")
         if key == "input_proj":  # str-ok: the TPU_SUBBLOCK_PLAN parse point
             input_proj = _parse_value(InputProj, key, value)
         elif key == "matmul":  # str-ok: the TPU_SUBBLOCK_PLAN parse point
             matmul = _parse_value(Matmul, key, value)
+        elif key == "residual_add":  # str-ok: the TPU_SUBBLOCK_PLAN parse point
+            residual_add = _parse_value(ResidualAdd, key, value)
         else:
-            msg = f"TPU_SUBBLOCK_PLAN: unknown key {key!r}; valid: input_proj, matmul"
+            msg = (
+                f"TPU_SUBBLOCK_PLAN: unknown key {key!r}; "
+                "valid: input_proj, matmul, residual_add"
+            )
             raise ValueError(msg)
-    return Pins(input_proj, matmul)
+    return Pins(input_proj, matmul, residual_add)
 
 
 def _parse_value[E: enum.Enum](kind: type[E], key: str, value: str) -> E:
@@ -128,14 +155,19 @@ def _parse_value[E: enum.Enum](kind: type[E], key: str, value: str) -> E:
 @require_no_default
 @dataclasses.dataclass(frozen=True)
 class NormAttnPlan:
-    """How one conforming sub-block reaches attention's projection."""
+    """How one conforming sub-block reaches attention's projection.
+
+    ``matmul`` and ``residual_add`` are fields of the fused value; unfused
+    ignores them.
+    """
 
     input_proj: InputProj
     matmul: Matmul
+    residual_add: ResidualAdd
 
 
-FUSED_BF16 = NormAttnPlan(InputProj.FUSED_QKV, Matmul.BF16)
-UNFUSED = NormAttnPlan(InputProj.UNFUSED, Matmul.BF16)
+FUSED_BF16 = NormAttnPlan(InputProj.FUSED_QKV, Matmul.BF16, ResidualAdd.FOLDED)
+UNFUSED = NormAttnPlan(InputProj.UNFUSED, Matmul.BF16, ResidualAdd.FOLDED)
 
 
 RPA_V3_HEAD_DIM = 64
@@ -210,14 +242,25 @@ def facts_of(binding: AttentionBinding, config: AttnConfig) -> AttentionFacts:
 
 
 def rule(facts: AttentionFacts) -> NormAttnPlan:
-    """Fused everywhere, in the checkpoint's precision."""
+    """Fused everywhere, in the checkpoint's precision, the residual folded in."""
     matmul = Matmul.FP8 if facts.fp8_weights else Matmul.BF16
-    return NormAttnPlan(InputProj.FUSED_QKV, matmul)
+    return NormAttnPlan(InputProj.FUSED_QKV, matmul, ResidualAdd.FOLDED)
 
 
 def candidates(first: NormAttnPlan) -> list[NormAttnPlan]:
-    """``first``, then the values to fall back to, fastest first."""
-    order = [first, FUSED_BF16, UNFUSED]
+    """``first``, then the values to fall back to, fastest first.
+
+    The residual add moves outside before the precision drops: ``outside``
+    costs a recomputed sum, the bf16 variant a dequantized weight.
+    """
+    outside = ResidualAdd.OUTSIDE
+    order = [
+        first,
+        dataclasses.replace(first, residual_add=outside),
+        FUSED_BF16,
+        dataclasses.replace(FUSED_BF16, residual_add=outside),
+        UNFUSED,
+    ]
     return list(dict.fromkeys(order))
 
 
@@ -295,6 +338,27 @@ def fused_qkv_supports(  # noqa: C901, PLR0911, PLR0912 - one return per capabil
     return None
 
 
+BOTH_RESIDUAL_ADDS = frozenset(ResidualAdd)
+"""An op that implements both residual adds (the reference's declaration)."""
+
+
+def residual_add_supports(
+    value: ResidualAdd, declared: frozenset[ResidualAdd], *, first_layer: bool = False
+) -> str | None:
+    """Why the fused op cannot add the residual where ``value`` says, or None.
+
+    ``declared`` is the op author's declaration
+    (``FusedCapability.residual_add``). The first decoder layer has no
+    residual, so only ``outside`` serves it (the runner's call there adds
+    nothing).
+    """
+    if first_layer and value is ResidualAdd.FOLDED:
+        return "the first layer has no residual to fold into the fused op"
+    if value not in declared:
+        return f"the fused op does not implement residual_add={value.value}"
+    return None
+
+
 def unreduced_output_supports(
     plan: NormAttnPlan, facts: AttentionFacts, *, fused_unreduced: bool
 ) -> str | None:
@@ -317,6 +381,13 @@ def unreduced_output_supports(
     return None
 
 
+def describe(plan: NormAttnPlan) -> str:
+    """The plan's fields, for messages; unfused has none that matter."""
+    if plan.input_proj is InputProj.UNFUSED:
+        return plan.input_proj.value
+    return f"{plan.input_proj.value}/{plan.matmul.value}/{plan.residual_add.value}"
+
+
 def resolve(pins: Pins, facts: AttentionFacts) -> NormAttnPlan:
     """The rule's plan with the user's pinned fields applied."""
     plan = rule(facts)
@@ -324,6 +395,8 @@ def resolve(pins: Pins, facts: AttentionFacts) -> NormAttnPlan:
         plan = dataclasses.replace(plan, input_proj=pins.input_proj)
     if pins.matmul is not None:
         plan = dataclasses.replace(plan, matmul=pins.matmul)
+    if pins.residual_add is not None:
+        plan = dataclasses.replace(plan, residual_add=pins.residual_add)
     return plan
 
 
@@ -336,12 +409,15 @@ def choose(  # noqa: PLR0913 - the facts and the platform's descriptions, all ke
     where: str = "",
     output_reduced: bool = True,
     fused_unreduced: bool = True,
+    fused_residual_add: frozenset[ResidualAdd] = BOTH_RESIDUAL_ADDS,
 ) -> tuple[NormAttnPlan, list[str]]:
     """The first value the pins allow that ``fused_qkv``'s capability accepts.
 
     With ``output_reduced=False`` (a parent block reduces attention's output
     itself) each value must also return an unreduced output
-    (``unreduced_output_supports``).
+    (``unreduced_output_supports``). A fused value must add the residual
+    where the fused op can (``fused_residual_add``, the op's declaration;
+    ``residual_add_supports``).
 
     Returns:
         The plan, and why each faster value was declined (the rule's value
@@ -360,13 +436,13 @@ def choose(  # noqa: PLR0913 - the facts and the platform's descriptions, all ke
         if plan.input_proj is InputProj.FUSED_QKV:
             why = fused_qkv_supports(
                 facts, matmul=plan.matmul, chip=chip, fp8_kv_cache=fp8_kv_cache
-            )
+            ) or residual_add_supports(plan.residual_add, fused_residual_add)
         if why is None and not output_reduced:
             why = unreduced_output_supports(
                 plan, facts, fused_unreduced=fused_unreduced
             )
         if why is None:
             return plan, declined
-        declined.append(f"{plan.input_proj.value}/{plan.matmul.value} declined: {why}")
+        declined.append(f"{describe(plan)} declined: {why}")
     msg = f"TPU_SUBBLOCK_PLAN {pins} on {where}: {declined[0]}"
     raise ValueError(msg)

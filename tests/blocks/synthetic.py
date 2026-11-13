@@ -29,10 +29,13 @@ from vllm.model_executor.layers import layernorm, linear
 
 from vllm_torchtpu.blocks.norm_attn import runner as runner_mod
 from vllm_torchtpu.blocks.norm_attn.runner import (
+    REFERENCE_CAPABILITY,
     AttentionBinding,
     AttentionRunner,
     AttnConfig,
+    FusedCapability,
     InputProj,
+    ResidualAdd,
 )
 
 HIDDEN = 64
@@ -267,6 +270,8 @@ def build_runner(  # noqa: PLR0913 - the binding and options a runner or referen
     fused_op: runner_mod.FusedOp | None = None,
     *,
     output_reduced: bool = True,
+    residual_add: ResidualAdd = ResidualAdd.FOLDED,
+    capability: FusedCapability = REFERENCE_CAPABILITY,
 ) -> AttentionRunner:
     """Build runner."""
     binding = AttentionBinding(
@@ -283,7 +288,9 @@ def build_runner(  # noqa: PLR0913 - the binding and options a runner or referen
         binding,
         config=config,
         input_proj=input_proj,
+        residual_add=residual_add,
         fused_op=fused_op,
+        fused_capability=capability,
         output_reduced=output_reduced,
     )
 

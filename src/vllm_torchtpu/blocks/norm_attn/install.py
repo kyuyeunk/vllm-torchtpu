@@ -34,9 +34,11 @@ from vllm_torchtpu.blocks.layer_check import Arg, LayerBinding, check_layer, nor
 from vllm_torchtpu.blocks.norm_attn import plan as plan_mod
 from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnBinding, norm_then_attention
 from vllm_torchtpu.blocks.norm_attn.runner import (
+    REFERENCE_CAPABILITY,
     AttentionBinding,
     AttentionRunner,
     AttnConfig,
+    FusedCapability,
     FusedOp,
     InputProj,
     reference_fused_qkv,
@@ -294,18 +296,22 @@ def build_runner(  # noqa: PLR0913 - the runner's arguments, as AttentionRunner 
     name: str,
     binding: AttentionBinding,
     config: AttnConfig,
-    input_proj: InputProj,
+    plan: plan_mod.NormAttnPlan,
     fused_op: FusedOp | None = None,
+    fused_capability: FusedCapability | None = None,
     *,
     output_reduced: bool = True,
 ) -> AttentionRunner:
     """The runner for one declared layer: the declared binding are its arguments."""
+    fused = plan.input_proj is InputProj.FUSED_QKV
     return AttentionRunner(
         name,
         binding,
         config=config,
-        input_proj=input_proj,
-        fused_op=fused_op if input_proj is InputProj.FUSED_QKV else None,
+        input_proj=plan.input_proj,
+        residual_add=plan.residual_add,
+        fused_op=fused_op if fused else None,
+        fused_capability=fused_capability if fused else None,
         output_reduced=output_reduced,
     )
 
@@ -313,14 +319,16 @@ def build_runner(  # noqa: PLR0913 - the runner's arguments, as AttentionRunner 
 FUSED_OP: FusedOp = reference_fused_qkv
 """The fused value's implementation: the plain-torch reference, or a kernel."""
 
-FUSED_OP_UNREDUCED = True
-"""``FUSED_OP``'s capability: it honours ``runner.output_reduced=False``."""
+FUSED_CAPABILITY: FusedCapability = REFERENCE_CAPABILITY
+"""``FUSED_OP``'s declaration: the residual adds and reductions it serves."""
 
 
-def fused_op_for(name: str, binding: NormAttnBinding) -> tuple[FusedOp, bool, str]:
-    """The fused value's op for this layer, its unreduced capability, and a note."""
+def fused_op_for(
+    name: str, binding: NormAttnBinding
+) -> tuple[FusedOp, FusedCapability, str]:
+    """The fused value's op for this layer, its capability, and a note."""
     del name, binding
-    return FUSED_OP, FUSED_OP_UNREDUCED, ""
+    return FUSED_OP, FUSED_CAPABILITY, ""
 
 
 def resolve_runner(
@@ -345,7 +353,7 @@ def resolve_runner(
     """
     config = conform(layer, declaration).config
     binding = declared_binding(layer, declaration)
-    fused_op, fused_unreduced, via = fused_op_for(name, binding)
+    fused_op, capability, via = fused_op_for(name, binding)
     pins = context.subblock_pins or plan_mod.Pins()
     plan, declined = plan_mod.choose(
         pins,
@@ -354,16 +362,27 @@ def resolve_runner(
         fp8_kv_cache=context.fp8_kv_cache,
         where=type(layer).__qualname__,
         output_reduced=output_reduced,
-        fused_unreduced=fused_unreduced,
+        fused_unreduced=capability.unreduced,
+        fused_residual_add=capability.residual_add,
     )
     for item in declined:  # The rule's value fell back: quiet.
         logger.debug("%s: %s", name, item)
     runner = build_runner(
-        name, binding, config, plan.input_proj, fused_op, output_reduced=output_reduced
+        name,
+        binding,
+        config,
+        plan,
+        fused_op,
+        capability,
+        output_reduced=output_reduced,
     )
     source = "user" if pins else "rule"
     fused = plan.input_proj is InputProj.FUSED_QKV
-    matmul = f" matmul={plan.matmul.value}" if fused else ""
+    matmul = (
+        f" matmul={plan.matmul.value} residual_add={plan.residual_add.value}"
+        if fused
+        else ""
+    )
     via = via if fused else ""
     reduced = "" if output_reduced else " output_reduced=False"
     what = f"input_proj={plan.input_proj.value}{matmul}{reduced} ({source}){via}"

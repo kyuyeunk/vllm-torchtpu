@@ -41,7 +41,12 @@ from vllm_torchtpu.blocks.context import InstallContext
 from vllm_torchtpu.blocks.norm_attn import install as norm_attn
 from vllm_torchtpu.blocks.norm_attn import plan as subblock_plan
 from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnBinding, norm_then_attention
-from vllm_torchtpu.blocks.norm_attn.runner import AttentionRunner, InputProj
+from vllm_torchtpu.blocks.norm_attn.runner import (
+    AttentionRunner,
+    FusedCapability,
+    InputProj,
+    ResidualAdd,
+)
 from vllm_torchtpu.blocks.stream import routed_runner
 
 SPECS = (
@@ -330,3 +335,25 @@ def test_installed_forward_has_source() -> None:
     """torch.compile's AOT cache needs source for every code object it traces."""
     for spec in check_subblock.FAMILIES:
         assert check_subblock._source_less(spec) == []  # noqa: SLF001
+
+
+# The fused value's residual add, from the op's declaration.
+
+
+def test_residual_add_follows_the_fused_ops_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Folded where the op implements it, outside where it does not, on Llama."""
+    layer, declaration = _declared(check_subblock.FAMILIES[0])
+    outcome = _install(layer, declaration)
+    assert "residual_add=folded (rule)" in outcome  # str-ok: the install report
+    assert _routed(layer).runner.residual_add is ResidualAdd.FOLDED
+    outside_only = FusedCapability(
+        residual_add=frozenset({ResidualAdd.OUTSIDE}), unreduced=True
+    )
+    monkeypatch.setattr(norm_attn, "FUSED_CAPABILITY", outside_only)
+    layer, declaration = _declared(check_subblock.FAMILIES[0])
+    outcome = _install(layer, declaration)
+    assert "residual_add=outside (rule)" in outcome  # str-ok: the install report
+    with pytest.raises(ValueError, match="does not implement residual_add=folded"):
+        _install(layer, declaration, plan="input_proj=fused_qkv,residual_add=folded")

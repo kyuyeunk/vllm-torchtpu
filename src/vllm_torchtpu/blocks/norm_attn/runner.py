@@ -28,6 +28,16 @@ Every model that declares ``norm_then_attention`` runs this one forward, so a
 fusion of the sub-block (``fused_qkv``, PR #3096's kernel) is one branch here,
 written once against the binding, never against a model class.
 
+The fused value has a field of its own, ``residual_add``: where the residual
+is added to the sublayer's output. ``FOLDED`` hands the residual to the fused
+op, which adds, normalizes and returns the new residual; ``OUTSIDE`` adds it
+here, in torch, and the op only normalizes. Both compute the same stream, so
+both keep the sub-block's contract, but on TPU an add outside the kernel is a
+value XLA recomputes in every fusion that reads it (PR #3096's first binding
+added outside: Llama-70B serving regressed 15%). The op declares which
+values it implements (``FusedCapability``); the plan picks ``FOLDED`` where
+it can.
+
 The runner's contract with its parent is a constructor argument,
 ``output_reduced``: whether its output is summed over tensor-parallel ranks.
 A layer on its own needs the sum; a block that folds attention into a later
@@ -57,6 +67,38 @@ class InputProj(enum.Enum):
     FUSED_QKV = "fused_qkv"
 
 
+class ResidualAdd(enum.Enum):
+    """Where the fused value adds the residual; unfused ignores it.
+
+    The input norm of the unfused value takes the residual itself.
+    """
+
+    _value_: str
+
+    FOLDED = "folded"
+    """The fused op takes the residual and returns the new residual."""
+    OUTSIDE = "outside"
+    """The runner adds before the op, which only normalizes and projects."""
+
+
+@dataclasses.dataclass(frozen=True)
+class FusedCapability:
+    """What a fused op serves: its author's declaration, as typed data.
+
+    Attributes:
+        residual_add: The ``ResidualAdd`` values the op implements. ``FOLDED``
+            means it accepts the residual and returns the new residual it
+            computed; ``OUTSIDE`` means it accepts the stream already added,
+            with no residual. The first decoder layer has no residual, so it
+            runs ``OUTSIDE`` whatever the plan says; an op without
+            ``OUTSIDE`` leaves that layer's calls to unfused.
+        unreduced: Whether the op honours ``runner.output_reduced=False``.
+    """
+
+    residual_add: frozenset[ResidualAdd]
+    unreduced: bool
+
+
 FUSED_CALLS: dict[str, int] = {}
 """Runs of the fused value, per layer class (eager runs only)."""
 
@@ -66,8 +108,11 @@ FusedOp = Callable[
 ]
 """``op(runner, hidden, residual, positions) -> (out, residual)`` or None to decline.
 
-The op reads ``runner.output_reduced`` and returns an output summed over TP
-ranks only when it is True.
+Called with a residual only under ``ResidualAdd.FOLDED``; it then returns the
+new residual it computed. Called with None (``OUTSIDE``, or the first layer),
+``hidden`` is the stream already added and the runner keeps that stream; the
+op's second result is not read. The op reads ``runner.output_reduced`` and
+returns an output summed over TP ranks only when it is True.
 """
 
 
@@ -136,7 +181,9 @@ class AttentionRunner:
     layer_name: str
     config: AttnConfig
     input_proj: InputProj
+    residual_add: ResidualAdd
     fused_op: FusedOp | None
+    fused_capability: FusedCapability | None
     output_reduced: bool
     _forward_entry: Callable[
         [torch.Tensor, torch.Tensor | None, torch.Tensor],
@@ -150,7 +197,9 @@ class AttentionRunner:
         *,
         config: AttnConfig,
         input_proj: InputProj = InputProj.UNFUSED,
+        residual_add: ResidualAdd = ResidualAdd.FOLDED,
         fused_op: FusedOp | None = None,
+        fused_capability: FusedCapability | None = None,
         output_reduced: bool = True,
     ) -> None:
         """Keeps references to the binding; creates no parameter."""
@@ -164,7 +213,9 @@ class AttentionRunner:
         self.layer_name = layer_name
         self.config = config
         self.input_proj = input_proj
+        self.residual_add = residual_add
         self.fused_op = fused_op
+        self.fused_capability = fused_capability
         self.output_reduced = output_reduced
         self._forward_entry = self._select_forward()
 
@@ -178,6 +229,15 @@ class AttentionRunner:
         if self.input_proj is InputProj.FUSED_QKV:
             if self.fused_op is None:
                 msg = f"{self.layer_name}: fused_qkv needs a fused op"
+                raise ValueError(msg)
+            if self.fused_capability is None:
+                msg = f"{self.layer_name}: fused_qkv needs its op's capability"
+                raise ValueError(msg)
+            if self.residual_add not in self.fused_capability.residual_add:
+                msg = (
+                    f"{self.layer_name}: the fused op does not implement "
+                    f"residual_add={self.residual_add.value}"
+                )
                 raise ValueError(msg)
             return self._fused_qkv
         return self._unfused
@@ -214,15 +274,37 @@ class AttentionRunner:
         residual: torch.Tensor | None,
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The fused op on the same binding; where it declines a call, unfused."""
-        if self.fused_op is None:  # _select_forward checked
+        """The fused op on the same binding, the residual added where the plan says.
+
+        Where the op declines a call, or cannot serve it (the first layer,
+        which has no residual to fold, with an op that implements only
+        ``FOLDED``), unfused runs it.
+        """
+        op, capability = self.fused_op, self.fused_capability
+        if op is None or capability is None:  # _select_forward checked
             raise ValueError(self.layer_name)
-        out = self.fused_op(self, hidden, residual, positions)
+        if residual is not None and self.residual_add is ResidualAdd.FOLDED:
+            out = op(self, hidden, residual, positions)
+        elif ResidualAdd.OUTSIDE in capability.residual_add:
+            stream = hidden if residual is None else self.add_outside(hidden, residual)
+            fused = op(self, stream, None, positions)
+            out = None if fused is None else (fused[0], stream)
+        else:
+            out = None
         if out is None:
             return self._unfused(hidden, residual, positions)
         if not torch.compiler.is_compiling():
             FUSED_CALLS[self.layer_name] = FUSED_CALLS.get(self.layer_name, 0) + 1
         return out
+
+    @staticmethod
+    def add_outside(hidden: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        """``ResidualAdd.OUTSIDE``'s add, rounded to the stream's dtype once.
+
+        The platform's fused add-norm adds in float32 and rounds the sum, so
+        this equals the input norm's own new residual.
+        """
+        return (hidden.float() + residual.float()).to(hidden.dtype)
 
     # The composition after the projection, shared by both values.
 
@@ -275,16 +357,24 @@ def reference_fused_qkv(
     residual: torch.Tensor | None,
     positions: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The fused value in plain torch: add, normalize and project in one call.
+    """The fused value in plain torch: normalize and project in one call.
 
     Stands in for PR #3096's kernel on hosts without it. It calls the same
-    binding, keeping the platform's rounding points (the residual sum is
-    rounded to the stream's dtype, as the fused add-norm does), so it equals
-    unfused exactly; a kernel fuses these calls.
+    binding, so it equals unfused; a kernel fuses these calls. Given the
+    residual (``ResidualAdd.FOLDED``) the input norm adds it and returns the
+    new residual; given none (``OUTSIDE``, the first layer) it normalizes
+    the stream it is given. It adds nothing itself.
     """
+    stream: torch.Tensor
     if residual is None:
-        summed = hidden
+        normed, stream = runner.input_norm(hidden), hidden
     else:
-        summed = (hidden.float() + residual.float()).to(hidden.dtype)
-    qkv, _ = runner.qkv_proj(runner.input_norm(summed))
-    return runner.attention_from_qkv(qkv, positions), summed
+        normed, stream = runner.input_norm(hidden, residual)
+    qkv, _ = runner.qkv_proj(normed)
+    return runner.attention_from_qkv(qkv, positions), stream
+
+
+REFERENCE_CAPABILITY = FusedCapability(
+    residual_add=frozenset({ResidualAdd.FOLDED, ResidualAdd.OUTSIDE}), unreduced=True
+)
+"""``reference_fused_qkv``'s declaration: both residual adds, either reduction."""

@@ -445,7 +445,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # "collectives=all_reduce" or "collectives=reduce_scatter_all_gather".
     # Empty: the rule (overlap at >= 8 MiB of activations per chip).
     "TPU_BLOCK_PLAN": env_str("TPU_BLOCK_PLAN", ""),
-    # The pre-norm attention sub-block's plan, e.g. input_proj=unfused.
+    # The pre-norm attention sub-block's plan, e.g. input_proj=unfused or
+    # residual_add=outside (keys: input_proj, matmul, residual_add).
     "TPU_SUBBLOCK_PLAN": env_str("TPU_SUBBLOCK_PLAN", ""),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),

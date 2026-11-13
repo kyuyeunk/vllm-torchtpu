@@ -56,6 +56,7 @@ from vllm_torchtpu.blocks.norm_attn import plan as subblock_plan  # noqa: E402 -
 from vllm_torchtpu.blocks.norm_attn.runner import (  # noqa: E402 - ditto
     AttentionRunner,
     InputProj,
+    ResidualAdd,
     reference_fused_qkv,
 )
 from vllm_torchtpu.blocks.stream import Stream  # noqa: E402 - ditto
@@ -375,7 +376,9 @@ def test_unreduced_output_supports(
     why: str | None,
 ) -> None:
     """Unreduced output supports."""
-    plan = subblock_plan.NormAttnPlan(input_proj, subblock_plan.Matmul.BF16)
+    plan = subblock_plan.NormAttnPlan(
+        input_proj, subblock_plan.Matmul.BF16, ResidualAdd.FOLDED
+    )
     got = subblock_plan.unreduced_output_supports(
         plan, facts, fused_unreduced=fused_unreduced
     )
