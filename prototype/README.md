@@ -88,11 +88,11 @@ installing one leaves the model's `state_dict` and named parameters as built.
 | Scopes nest: several patterns per class | [`declarations_for`](../src/vllm_torchtpu/blocks/__init__.py#L137-L139), [`install`](../src/vllm_torchtpu/blocks/installer.py#L39-L76) |
 | Typed declarations: the binding function, its parts, kinds checked at construction | [`declare_block`](../src/vllm_torchtpu/blocks/__init__.py#L142-L164), [`BlockDeclaration`](../src/vllm_torchtpu/blocks/__init__.py#L65-L131), [`BlockBinding`](../src/vllm_torchtpu/blocks/binding.py#L44-L64), [`BindingKindError`](../src/vllm_torchtpu/blocks/binding.py#L67-L87), [`as_kind`](../src/vllm_torchtpu/blocks/binding.py#L115-L129) |
 | One binding function per model | [GLM-4.5/4.6](../src/vllm_torchtpu/models/vllm/glm4_moe/registration.py#L24-L51), [Mistral](../src/vllm_torchtpu/models/vllm/mistral/registration.py#L24-L37), [Llama](../src/vllm_torchtpu/models/vllm/llama/registration.py#L24-L37), [Qwen3](../src/vllm_torchtpu/models/vllm/qwen3/registration.py#L23-L32), [gpt-oss](../src/vllm_torchtpu/models/vllm/gpt_oss/registration.py#L24-L37), [Qwen3-MoE](../src/vllm_torchtpu/models/vllm/qwen3_moe/registration.py#L23-L32), [Qwen3.5](../src/vllm_torchtpu/models/vllm/qwen3_5/registration.py#L36-L75) |
-| Per model: A (runner unfused vs upstream) and B (the rule's value through the runner) | [`family`](check_subblock.py#L219-L252), [`_install_and_run`](check_subblock.py#L198-L216), [`new_models`](check_subblock.py#L264-L272) |
-| Planted non-conforming declarations (the layer; attention) | [`ScaledAttention`](check_subblock.py#L115-L123), [`_scale_query`](check_subblock.py#L130-L141), [`_planted`](check_subblock.py#L296-L314) |
-| Every code object the installed forward runs has source (torch.compile's AOT cache) | [`_source_less`](check_subblock.py#L317-L361) |
-| The count against #3096 | [`counts`](check_subblock.py#L401-L408) |
-| Reach over current models, from real configs | [`CANDIDATES`](subblock_reach.py#L72-L202), [`MAIN_CANDIDATES`](subblock_reach.py#L208-L264), [`check`](subblock_reach.py#L384-L402) |
+| Per model: A (runner unfused vs upstream) and B (the rule's value through the runner) | [`family`](../tests/blocks/subblock_check.py#L225-L261), [`_install_and_run`](../tests/blocks/subblock_check.py#L199-L216), [`new_models`](../tests/blocks/subblock_check.py#L284-L293) |
+| Planted non-conforming declarations (the layer; attention) | [`ScaledAttention`](../tests/blocks/subblock_fixtures.py#L34-L49), [`scale_query`](../tests/blocks/subblock_fixtures.py#L56-L67), [`_planted`](../tests/blocks/subblock_check.py#L307-L329) |
+| Every code object the installed forward runs has source (torch.compile's AOT cache) | [`source_less`](../tests/blocks/subblock_check.py#L332-L371) |
+| The count against #3096 | [`counts`](../tests/blocks/subblock_check.py#L430-L438) |
+| Reach over current models, from real configs | [`CANDIDATES`](../tests/blocks/subblock_reach.py#L76-L214), [`MAIN_CANDIDATES`](../tests/blocks/subblock_reach.py#L220-L276), [`check`](../tests/blocks/subblock_reach.py#L432-L452) |
 | The startup override | `TPU_SUBBLOCK_PLAN` in `envs.py`, passed by the runner's `_install_blocks` |
 
 ## The kernel's capability, as its author would declare it
@@ -245,6 +245,11 @@ python -m prototype.subblock_reach      # fetches config.json files only
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 JAX_PLATFORMS=cpu python -m pytest tests/blocks
 ```
 
+The scripts in `prototype/` only print. The checks they print live in
+`tests/blocks/` (`subblock_check.py`, `subblock_reach.py`, the planted layers
+in `subblock_fixtures.py`), and pytest asserts the same checks
+(`test_subblock_check.py`, `test_subblock_reach.py`).
+
 ### `prototype.check_subblock` (vLLM and transformers notices omitted)
 
 ```text
@@ -278,8 +283,8 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 JAX_PLATFORMS=cpu python -m pytest tests/blocks
                                      B runner installed; input_proj=fused_qkv matmul=bf16 (rule); fused runs 1; max diff 0.0e+00
   -> PASS
 3 a declaration that does not conform stops startup
-    planted in the layer: startup error: l (ScaledAttention) is declared norm_then_attention: declared norm_then_attention, but extra op aten.mul between attn and post_norm at check_subblock.py:111
-    planted in attention: startup error: l (ScaledQueryAttention) is declared norm_then_attention: declared norm_then_attention (attention on ScaledQueryAttention), but extra op aten.mul between rope and attn at check_subblock.py:127
+    planted in the layer: startup error: l (ScaledAttention) is declared norm_then_attention: declared norm_then_attention, but extra op aten.mul between attn and post_norm at subblock_fixtures.py:47
+    planted in attention: startup error: l (ScaledQueryAttention) is declared norm_then_attention: declared norm_then_attention (attention on ScaledQueryAttention), but extra op aten.mul between rope and attn at subblock_fixtures.py:63
   -> PASS
 4 the same fusion as #3096, by count
     #3096 per-model forwards: 4
@@ -310,12 +315,14 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 JAX_PLATFORMS=cpu python -m pytest tests/blocks
   shows the fused branch runs, here as a reference equal by construction.
 - **gpt-oss** conforms, and `fused_qkv` declines it (sinks): the runner runs
   unfused.
-- **CI.** Comment in `PLANT_MISMATCH = True` and the command exits 1.
-- **pytest.** `458 passed` in `tests/blocks` (with the declared-blocks
-  tests); the two kinds of test above, including a non-conforming
-  declaration stopping startup, gpt-oss falling back automatically, a pin
-  to `fused_qkv` on gpt-oss stopping startup, the source lookup, and the
-  two scopes nesting on Qwen3.5.
+- **CI.** Comment in `PLANT_MISMATCH = True` (`tests/blocks/subblock_check.py`)
+  and the command exits 1; `test_subblock_check.py` fails with it.
+- **pytest.** `590 passed, 3 xfailed` in `tests/blocks` (with the
+  declared-blocks tests and the demos' checks; the xfails are the three
+  layers `suggest_blocks` raises on); the two kinds of test above,
+  including a non-conforming declaration stopping startup, gpt-oss falling
+  back automatically, a pin to `fused_qkv` on gpt-oss stopping startup, the
+  source lookup, and the two scopes nesting on Qwen3.5.
 
 ## On a TPU (v6e-8)
 

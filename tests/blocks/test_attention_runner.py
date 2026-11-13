@@ -40,15 +40,15 @@ import pathlib  # noqa: E402 - after the snapshot above
 import pytest  # noqa: E402 - after the snapshot above
 import torch  # noqa: E402 - after the snapshot above
 from jax.experimental.pallas import tpu as pltpu  # noqa: E402 - after the snapshot
-from synthetic import (  # noqa: E402 - ditto
+from torch import nn  # noqa: E402 - after the snapshot above
+
+from tests.blocks.synthetic import (  # noqa: E402 - ditto
     Roles,
     build_runner,
     make_inputs,
     reference_forward,
     setup_parts,
 )
-from torch import nn  # noqa: E402 - after the snapshot above
-
 from vllm_torchtpu.blocks.norm_attn import plan as plan_mod  # noqa: E402 - ditto
 from vllm_torchtpu.blocks.norm_attn import runner as runner_mod  # noqa: E402 - ditto
 from vllm_torchtpu.blocks.norm_attn.runner import (  # noqa: E402 - ditto

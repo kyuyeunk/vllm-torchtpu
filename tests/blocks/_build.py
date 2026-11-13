@@ -14,10 +14,10 @@
 """Builds one decoder layer of each surveyed vLLM MoE model on the meta device.
 
 Every layer is built from a tiny config through the model's own constructor in
-a single-rank gloo world, with vLLM's platform pinned to CPU by the package
-``__init__``. Nothing loads libtpu. Constructor arguments are supplied by
-name, since each model takes a different subset of (vllm_config, config,
-cache_config, quant_config, ...).
+a single-rank gloo world, with vLLM's platform pinned to CPU by
+``tests/blocks/_platform.py``. Nothing loads libtpu. Constructor arguments
+are supplied by name, since each model takes a different subset of
+(vllm_config, config, cache_config, quant_config, ...).
 """
 
 import contextlib
@@ -38,18 +38,18 @@ from vllm.distributed import (
 )
 
 # Shared tiny sizes: hidden 64, 4 heads of 16, 8 experts of width 32, top-2.
-_TINY = dict(
-    hidden_size=64,
-    intermediate_size=128,
-    moe_intermediate_size=32,
-    num_attention_heads=4,
-    num_key_value_heads=2,
-    head_dim=16,
-    num_hidden_layers=2,
-    max_position_embeddings=128,
-    rms_norm_eps=1e-6,
-    vocab_size=128,
-)
+_TINY = {
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "moe_intermediate_size": 32,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "num_hidden_layers": 2,
+    "max_position_embeddings": 128,
+    "rms_norm_eps": 1e-6,
+    "vocab_size": 128,
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -72,7 +72,7 @@ def _cfg(cls_name: str, **overrides: Any) -> Callable[[], Any]:  # noqa: ANN401
     return make
 
 
-_MOE = dict(num_experts=8, num_experts_per_tok=2)
+_MOE = {"num_experts": 8, "num_experts_per_tok": 2}
 SPECS: tuple[Spec, ...] = (
     Spec(
         "Qwen3.5-MoE (full attention)",

@@ -28,9 +28,9 @@ import dataclasses
 
 import pytest
 import torch
-from synthetic import Roles, build_runner, make_inputs, setup_parts
 from torch import nn
 
+from tests.blocks.synthetic import Roles, build_runner, make_inputs, setup_parts
 from vllm_torchtpu.blocks.norm_attn import plan as plan_mod
 from vllm_torchtpu.blocks.norm_attn import runner as runner_mod
 from vllm_torchtpu.blocks.norm_attn.runner import (

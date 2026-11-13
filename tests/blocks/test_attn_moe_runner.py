@@ -32,7 +32,9 @@ _PRELOADED = frozenset(sys.modules)  # Before this file's imports; see the last 
 import pytest  # noqa: E402 - after the snapshot above
 import torch  # noqa: E402 - after the snapshot above
 import torch.nn.functional as F  # noqa: E402, N812 - after the snapshot; torch's alias
-from synthetic import (  # noqa: E402 - after the snapshot above
+from torch import nn  # noqa: E402 - after the snapshot above
+
+from tests.blocks.synthetic import (  # noqa: E402 - after the snapshot above
     HIDDEN,
     TOKENS,
     Attention,
@@ -44,8 +46,6 @@ from synthetic import (  # noqa: E402 - after the snapshot above
     reference_forward,
     setup_parts,
 )
-from torch import nn  # noqa: E402 - after the snapshot above
-
 from vllm_torchtpu.blocks.attn_moe import plan as block_plan  # noqa: E402 - ditto
 from vllm_torchtpu.blocks.attn_moe import runner as block_runner  # noqa: E402 - ditto
 from vllm_torchtpu.blocks.attn_moe.runner import (  # noqa: E402 - ditto

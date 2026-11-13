@@ -28,9 +28,10 @@ import torch
 from jax.experimental.pallas import tpu as pltpu
 from torch import nn
 from vllm.config.vllm import set_current_vllm_config
-from vllm.model_executor.models.llama import LlamaDecoderLayer
+from vllm.model_executor.models.llama import LlamaAttention, LlamaDecoderLayer
 
-from prototype import _build, check_subblock
+from tests.blocks import _build, subblock_check, subblock_fixtures
+from tests.blocks._report import discard
 from vllm_torchtpu import blocks
 from vllm_torchtpu.blocks import installer
 from vllm_torchtpu.blocks.attn_moe.plan import Collectives
@@ -50,8 +51,8 @@ from vllm_torchtpu.blocks.norm_attn.runner import (
 from vllm_torchtpu.blocks.stream import routed_runner
 
 SPECS = (
-    *check_subblock.FAMILIES,
-    *(check_subblock._spec(c) for c in check_subblock.NEW_MODELS),  # noqa: SLF001 - the shrunk real configs
+    *subblock_check.FAMILIES,
+    *(subblock_check.spec_of(c) for c in subblock_check.NEW_MODELS),
 )
 GPT_OSS = next(s for s in SPECS if s.name == "openai/gpt-oss-20b")
 
@@ -121,22 +122,24 @@ def test_declaration_conforms(spec: _build.Spec) -> None:
 @pytest.mark.parametrize(
     ("planted", "edge"),
     [
-        (check_subblock.ScaledAttention, "aten.mul between attn and post_norm"),
-        (check_subblock.ScaledQueryAttention, "aten.mul between rope and attn"),
+        (subblock_fixtures.ScaledAttention, "aten.mul between attn and post_norm"),
+        (subblock_fixtures.ScaledQueryAttention, "aten.mul between rope and attn"),
     ],
     ids=["in_the_layer", "in_attention"],
 )
 def test_nonconforming_layer_names_edge_and_line(planted: type, edge: str) -> None:
     """A declared layer computing something else stops startup at its line."""
-    layer = _build.build(check_subblock.FAMILIES[0])
+    layer = _build.build(subblock_check.FAMILIES[0])
     layer.__class__ = planted
-    if planted is check_subblock.ScaledQueryAttention:
-        check_subblock._scale_query(layer.get_submodule("self_attn"))  # noqa: SLF001 - the planted forward
-    declaration = blocks.BlockDeclaration.of(planted, check_subblock._llama_binding)  # noqa: SLF001 - the planted layers' binding
+    if planted is subblock_fixtures.ScaledQueryAttention:
+        subblock_fixtures.scale_query(
+            as_kind(layer.get_submodule("self_attn"), LlamaAttention)
+        )
+    declaration = blocks.BlockDeclaration.of(planted, subblock_fixtures.llama_binding)
     with (
         set_current_vllm_config(_build.current_config()),
         pytest.raises(
-            BlockConformanceError, match=rf"{edge} at check_subblock\.py:\d+"
+            BlockConformanceError, match=rf"{edge} at subblock_fixtures\.py:\d+"
         ),
     ):
         norm_attn.conform(layer, declaration)
@@ -156,7 +159,7 @@ def test_binding_reads_a_missing_part_and_fails() -> None:
     For a real class the type checker reports this read before anything runs
     (the attribute is not on the class); here it is deleted at run time.
     """
-    layer, declaration = _declared(check_subblock.FAMILIES[0])
+    layer, declaration = _declared(subblock_check.FAMILIES[0])
     _without_rotary(layer.get_submodule("self_attn"))
     with pytest.raises(AttributeError, match="rotary_emb"):
         declaration.binding(layer)
@@ -164,11 +167,11 @@ def test_binding_reads_a_missing_part_and_fails() -> None:
 
 def test_part_of_the_wrong_kind_is_named_by_attribute() -> None:
     """A binding with a lone q_norm: the kind check names the attribute."""
-    layer, _ = _declared(check_subblock.FAMILIES[0])
+    layer, _ = _declared(subblock_check.FAMILIES[0])
     _lone_q_norm(layer.get_submodule("self_attn"))
 
     def lone(llama: LlamaDecoderLayer) -> NormAttnBinding:
-        binding = check_subblock._llama_binding(llama)  # noqa: SLF001 - Llama's binding
+        binding = subblock_fixtures.llama_binding(llama)
         attention = llama.get_submodule("self_attn")
         q_norm = attention.get_submodule("q_norm")
         return dataclasses.replace(binding, q_norm=q_norm, k_norm=None)
@@ -256,7 +259,7 @@ def test_decoder_routes_through_the_runner(
 
 def test_scopes_nest_on_qwen3_5() -> None:
     """Qwen3.5 declares both scopes; the block builds the attention runner itself."""
-    layer = _build.build(check_subblock.FAMILIES[2])  # Qwen3.5-MoE, full attention
+    layer = _build.build(subblock_check.FAMILIES[2])  # Qwen3.5-MoE, full attention
     context = InstallContext(
         tp=4,
         dtype=torch.bfloat16,
@@ -295,7 +298,7 @@ def test_pin_that_cannot_run_stops_startup() -> None:
 
 def _fp8_llama() -> tuple[nn.Module, blocks.BlockDeclaration]:
     """A meta Llama layer whose qkv_proj holds FP8 weights, and its declaration."""
-    layer, declaration = _declared(check_subblock.FAMILIES[0])
+    layer, declaration = _declared(subblock_check.FAMILIES[0])
     qkv = layer.get_submodule("self_attn.qkv_proj")
     fp8 = _weight(qkv).to(torch.float8_e4m3fn)
     qkv.weight = nn.Parameter(fp8, requires_grad=False)
@@ -319,7 +322,7 @@ def test_fp8_pin_on_a_chip_without_fp8_matmul_stops_startup() -> None:
 
 def test_bf16_kv_cache_falls_back() -> None:
     """A bf16 KV cache (the platform's setting) leaves the rule unfused."""
-    layer, declaration = _declared(check_subblock.FAMILIES[0])
+    layer, declaration = _declared(subblock_check.FAMILIES[0])
     assert "input_proj=unfused (rule)" in _install(layer, declaration, kv="bfloat16")
 
 
@@ -328,13 +331,13 @@ def test_bf16_kv_cache_falls_back() -> None:
 
 def test_smoke_llama_against_upstream() -> None:
     """Llama through the runner, unfused and fused, against its own forward."""
-    assert not check_subblock.family(check_subblock.FAMILIES[0])
+    assert not subblock_check.family(subblock_check.FAMILIES[0], discard)
 
 
 def test_installed_forward_has_source() -> None:
     """torch.compile's AOT cache needs source for every code object it traces."""
-    for spec in check_subblock.FAMILIES:
-        assert check_subblock._source_less(spec) == []  # noqa: SLF001
+    for spec in subblock_check.FAMILIES:
+        assert subblock_check.source_less(spec) == []
 
 
 # The fused value's residual add, from the op's declaration.
@@ -344,7 +347,7 @@ def test_residual_add_follows_the_fused_ops_declaration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Folded where the op implements it, outside where it does not, on Llama."""
-    layer, declaration = _declared(check_subblock.FAMILIES[0])
+    layer, declaration = _declared(subblock_check.FAMILIES[0])
     outcome = _install(layer, declaration)
     assert "residual_add=folded (rule)" in outcome  # str-ok: the install report
     assert _routed(layer).runner.residual_add is ResidualAdd.FOLDED
@@ -352,7 +355,7 @@ def test_residual_add_follows_the_fused_ops_declaration(
         residual_add=frozenset({ResidualAdd.OUTSIDE}), unreduced=True
     )
     monkeypatch.setattr(norm_attn, "FUSED_CAPABILITY", outside_only)
-    layer, declaration = _declared(check_subblock.FAMILIES[0])
+    layer, declaration = _declared(subblock_check.FAMILIES[0])
     outcome = _install(layer, declaration)
     assert "residual_add=outside (rule)" in outcome  # str-ok: the install report
     with pytest.raises(ValueError, match="does not implement residual_add=folded"):

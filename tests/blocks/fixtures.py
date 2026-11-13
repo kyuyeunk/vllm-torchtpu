@@ -42,8 +42,8 @@ class _Children(nn.Module):
         self.ffn = layer.mlp
 
 
-class Renamed(_Children):
-    def forward(
+class Renamed(_Children):  # noqa: D101 - the module docstring describes each fixture
+    def forward(  # noqa: D102 - upstream's forward under the new names
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
@@ -55,8 +55,8 @@ class Renamed(_Children):
         return self.ffn(hidden_states), residual
 
 
-class ReorderedNorms(_Children):
-    def forward(
+class ReorderedNorms(_Children):  # noqa: D101 - ditto
+    def forward(  # noqa: D102 - the planted order
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
@@ -68,10 +68,10 @@ class ReorderedNorms(_Children):
         return self.ffn(hidden_states), residual
 
 
-class DeadBranchAndView(_Children):
+class DeadBranchAndView(_Children):  # noqa: D101 - ditto
     debug = False
 
-    def forward(
+    def forward(  # noqa: D102 - the planted dead code
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,

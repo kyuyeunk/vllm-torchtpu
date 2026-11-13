@@ -29,7 +29,7 @@ from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import RowParallelLinear
 
-from prototype import _build, fixtures
+from tests.blocks import _build, fixtures
 from vllm_torchtpu import blocks
 from vllm_torchtpu.blocks import conformance, installer
 from vllm_torchtpu.blocks.attn_moe import contract_adapter
