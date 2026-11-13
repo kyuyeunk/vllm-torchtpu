@@ -18,7 +18,7 @@ strode its table with the stale 16 and walked off it.
 | The runner keeps no copy | [`block_size, _refresh_smem_request_caps`](../src/vllm_torchtpu/runner/tpu_runner.py#L8593-L8614) in `tpu_runner.py` (L8593-L8614) |
 | KV transfer reads the guard | [`_measure_stage3_layout`](../src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py#L3492-L3535) in `tpu_connector.py` (L3492-L3535) |
 | One source for "is it HND?": vLLM's resolved layout | [`_raiden_seq_on_lane_layout`](../src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py#L632-L640) in `tpu_connector.py` (L632-L640) |
-| The ratchet (30) and the single writer | [`two tests`](../tests/test_pool_layout.py#L201-L215) in `test_pool_layout.py` (L201-L215) |
+| The ratchet (30) and the single writer | [`check_reads, check_writers`](../tools/check_pool_layout_reads.py#L264-L285) in `check_pool_layout_reads.py` (L264-L285) |
 | #211, planted | [`STALE_COPY`](../prototype/early_read.py#L26-L27) in `early_read.py` (L26-L27) |
 
 This branch keeps each fact in the record that already holds it and guards
@@ -45,10 +45,14 @@ layout record:
   `get_resolved_kv_cache_layout() is KVCacheLayout.LBHNC` instead of
   reading `VLLM_KV_CACHE_LAYOUT`.
 
-`tests/test_pool_layout.py` checks the guard, the KV transfer helper, that
-only `pool_layout.py` writes the marker, and a ratchet of the direct reads
-that remain (30 reads in 28 functions; a new one fails, a moved one must
-leave the list).
+The tests sit next to the code each one covers:
+`tests/test_pool_layout.py` checks the guard,
+`tests/runner/test_runner_pool_layout.py` the runner's read, and
+`tests/distributed/test_tpu_connector_pool_layout.py` the KV transfer helper.
+`tools/check_pool_layout_reads.py` is the static lint: only `pool_layout.py`
+writes the marker, and a ratchet of the direct reads that remain (30 reads in
+28 functions; a new one fails, a moved one must leave the list).
+`tests/test_pool_layout_reads.py` runs it.
 
 Assumes vLLM v0.33.0. Run from the repository root with the project's
 virtualenv and vLLM v0.33.0 on `PYTHONPATH`. Importing `vllm.config` loads
@@ -110,8 +114,20 @@ seed copy strides by the stale 16: column 256 of 16 -> IndexError: list index ou
 
 ## Tests
 
-    flock /tmp/vt-tpu.lock env JAX_PLATFORMS=cpu PYTHONPATH=src python -m pytest -q tests/test_pool_layout.py
+    flock /tmp/vt-tpu.lock env JAX_PLATFORMS=cpu PYTHONPATH=src python -m pytest -q \
+        tests/test_pool_layout.py tests/runner/test_runner_pool_layout.py \
+        tests/distributed/test_tpu_connector_pool_layout.py tests/test_pool_layout_reads.py
 
 ```
-6 passed
+12 passed
+```
+
+The lint alone, which imports nothing (so needs no TPU lock):
+
+    python tools/check_pool_layout_reads.py
+
+```
+...
+reads: 30 in 28 functions
+writers: ['pool_layout.py']
 ```

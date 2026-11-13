@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from vllm.config import CacheConfig
 
 # Attribute on `vllm.config.CacheConfig` that holds the stage marker. Only this
-# module writes it; `tests/test_pool_layout.py` checks that.
+# module writes it; `tools/check_pool_layout_reads.py` checks that.
 _ATTR = "_tpu_pool_stage"
 
 
