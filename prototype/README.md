@@ -28,7 +28,7 @@ each step's decisions in several places and leaves them on itself:
 | The plan is built once per step | [`plan_step call in execute_model`](../src/vllm_torchtpu/runner/tpu_runner.py#L4143-L4157) in `tpu_runner.py` (L4143-L4157) |
 | A stage receives its chunk | [`_prepare_inputs`](../src/vllm_torchtpu/runner/tpu_runner.py#L3282-L3286) in `tpu_runner.py` (L3282-L3286) |
 | The builder takes its context as an argument | [`AttentionMetadataBuilder.build`](../src/vllm_torchtpu/layers/core/attention_metadata.py#L523-L529) in `attention_metadata.py` (L523-L529) |
-| Single-writer and stash ratchet tests | [`test_dp_step_has_one_writer, test_builder_context_stash_ratchet`](../tests/runner/test_step_plan.py#L120-L143) in `test_step_plan.py` (L120-L143) |
+| Single-writer and stash ratchet checks | [`check_dp_step, check_stash`](../tools/check_step_plan_writers.py#L107-L125) in `check_step_plan_writers.py` (L107-L125) |
 
 This branch holds the same decisions in two frozen values
 (`src/vllm_torchtpu/runner/step_plan.py`):
@@ -54,7 +54,7 @@ What changes:
 
 What does not change: the runner still stages the context for the chunk
 loop's reads after the forward (mamba rollback indices, draft capture);
-`tests/runner/test_step_plan.py` pins those 5 accesses in 4 functions (main
+`tools/check_step_plan_writers.py` pins those 5 accesses in 4 functions (main
 has 14 in 9). The context also carries device tensors and a write-back list
 (`unified_mamba_state_indices`), which a production version would split
 from the decisions.
@@ -75,7 +75,8 @@ build that keeps them is separate.
     flock /tmp/vt-tpu.lock env JAX_PLATFORMS=cpu PYTHONPATH=src python -m prototype.step_plan
 
 Both ranks call the runner's real `_dp_coordinated_step`, with `all_reduce`
-simulated as the element-wise MAX of what each rank sends.
+simulated as the element-wise MAX of what each rank sends
+(`tests/runner/dp_agreement.py`, shared with the tests).
 
 ```
 DP agreement, one frozen record per rank:
@@ -111,17 +112,39 @@ most-model-len capacity because no remaining request exceeds 1024 tokens.
 
 ## The checks
 
-    flock /tmp/vt-tpu.lock env JAX_PLATFORMS=cpu PYTHONPATH=src python -m pytest -q tests/runner/test_step_plan.py
+    flock /tmp/vt-tpu.lock env JAX_PLATFORMS=cpu PYTHONPATH=src python -m pytest -q \
+        tests/runner/test_step_plan.py tests/runner/test_step_plan_writers.py
 
 ```
-8 passed
+9 passed
 ```
+
+`tests/runner/test_step_plan.py`:
 
 - `split_chunks` agrees with main's chunk counter on four batches.
 - The plan is frozen; a DP forward count below the rank's chunk count raises.
 - `StepPlan.idle` has no chunks and the agreement's forward count.
+- The two ranks above get one agreement that differs only in `other_decode`.
+
+`tools/check_step_plan_writers.py`, a static lint that imports nothing, run
+by `tests/runner/test_step_plan_writers.py`:
+
 - Only `__init__` and `_dp_coordinated_step` assign the runner's `DpStep`.
 - The stash ratchet: the 5 remaining accesses, in 4 functions.
+
+The lint alone:
+
+    python tools/check_step_plan_writers.py
+
+```
+_dp_step written in runner/tpu_runner.py:__init__
+_dp_step written in runner/tpu_runner.py:_dp_coordinated_step
+runner/tpu_runner.py:_dummy_run: WRITE x1
+runner/tpu_runner.py:_mamba_state_index_groups: READ x1
+runner/tpu_runner.py:_prepare_inputs: WRITE x1
+runner/tpu_runner.py:execute_model: READ x2
+stash: 5 accesses in 4 functions
+```
 
 ## On a TPU
 
