@@ -17,8 +17,9 @@ a lower level from reaching up or re-deciding what it was handed:
 
 | Claim | Code |
 |---|---|
-| Scopes import downward, with a ratchet of 9 edges | [`scopes-top-down`](../.importlinter#L14-L35) in `.importlinter` (L14-L35) |
-| The decider never imports the executor | [`family-decides-below-executor`](../.importlinter#L39-L46) in `.importlinter` (L39-L46) |
+| Scopes import downward, with a ratchet of 9 edges | [`scopes-top-down`](../.importlinter#L14-L43) in `.importlinter` (L14-L43) |
+| The decider never imports the executor | [`family-decides-below-executor`](../.importlinter#L47-L62) in `.importlinter` (L47-L62) |
+| A broken contract says why and how to fix it | `broken_contract_guidance` in each contract ([L36-L43](../.importlinter#L36-L43), [L55-L62](../.importlinter#L55-L62)) |
 | Resolved types carry no defaults | [`require_no_default`](../src/vllm_torchtpu/layers/core/resolution.py#L28-L40) in `resolution.py` (L28-L40) |
 | The resolved plan | [`MoeCombinePlan`](../src/vllm_torchtpu/layers/core/moe_plan.py#L71-L88) in `moe_plan.py` (L71-L88) |
 | It decides once | [`plan_combine`](../src/vllm_torchtpu/layers/core/moe_plan.py#L91-L170) in `moe_plan.py` (L91-L170) |
@@ -54,7 +55,10 @@ for the scopes: `runner` (model), `models`, `layers.adapter` (block),
 baseline: 5 adapters read the model's forward context, and 4 edges run from
 kernel modules into layer code. A listed edge that disappears fails the run, so the list
 only shrinks. `family-decides-below-executor` orders the inside of
-`layers.core`: `fused_moe_gmm` imports `moe_plan`, never the reverse.
+`layers.core`: `fused_moe_gmm` imports `moe_plan`, never the reverse. Each
+contract carries `broken_contract_guidance`: import-linter prints it under a
+broken contract, so the failure states the rule, how to fix it, and how to
+record an intended exception.
 
 ```
 Scopes import only downward KEPT (9 ignored imports)
@@ -77,11 +81,38 @@ vllm_torchtpu.layers.core is not allowed to import vllm_torchtpu.layers.adapter:
 
 - vllm_torchtpu.layers.core.moe_plan -> vllm_torchtpu.layers.adapter.fused_moe
 (l.42)
+
+
+A lower scope must not import a higher one. Top to bottom: runner,
+models, layers.adapter, layers.core, kernels.
+How to fix:
+- Take the value as an argument; the scope above passes it in.
+- If both scopes need a type, move the type down, not the import up.
+If the import is intended, add it under ignore_imports in this contract,
+with a comment giving the reason and what removes it.
 ```
 
 Line 43, `from vllm_torchtpu.layers.core import fused_moe_gmm`, breaks the
 second contract the same way:
-`vllm_torchtpu.layers.core.moe_plan is not allowed to import vllm_torchtpu.layers.core.fused_moe_gmm`.
+
+    PYTHONPATH=src lint-imports --contract family-decides-below-executor
+
+```
+vllm_torchtpu.layers.core.moe_plan is not allowed to import
+vllm_torchtpu.layers.core.fused_moe_gmm:
+
+- vllm_torchtpu.layers.core.moe_plan -> vllm_torchtpu.layers.core.fused_moe_gmm
+(l.43)
+
+
+A decision module must not import the code that runs its plan:
+fused_moe_gmm reads the plan from moe_plan, never the reverse.
+How to fix:
+- Pass the fact the decision needs into plan_combine as an argument.
+- If moe_plan needs a type from fused_moe_gmm, move the type down.
+If the import is intended, add an ignore_imports entry to this contract,
+with a comment giving the reason and what removes it.
+```
 
 ## 2. A child accepts only resolved values
 

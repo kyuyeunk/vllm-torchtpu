@@ -33,6 +33,14 @@ ignore_imports =
     vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter -> vllm_torchtpu.layers.adapter.moe_routing
     vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter -> vllm_torchtpu.layers.adapter.quantization.configs
 unmatched_ignore_imports_alerting = error
+broken_contract_guidance =
+    A lower scope must not import a higher one. Top to bottom: runner,
+    models, layers.adapter, layers.core, kernels.
+    How to fix:
+    - Take the value as an argument; the scope above passes it in.
+    - If both scopes need a type, move the type down, not the import up.
+    If the import is intended, add it under ignore_imports in this contract,
+    with a comment giving the reason and what removes it.
 
 # Inside the family scope: the code that runs the MoE combine imports its
 # decision module, never the reverse.
@@ -44,3 +52,11 @@ layers =
     fused_moe_gmm
     moe_plan
     resolution
+broken_contract_guidance =
+    A decision module must not import the code that runs its plan:
+    fused_moe_gmm reads the plan from moe_plan, never the reverse.
+    How to fix:
+    - Pass the fact the decision needs into plan_combine as an argument.
+    - If moe_plan needs a type from fused_moe_gmm, move the type down.
+    If the import is intended, add an ignore_imports entry to this contract,
+    with a comment giving the reason and what removes it.
