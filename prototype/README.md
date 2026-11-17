@@ -9,29 +9,31 @@ eligibility checks written against attribute names. This branch shows the
 same fusion through a declared scope:
 
 1. **The framework publishes a pattern** for the pre-norm attention
-   sub-block, `norm_then_attention`: `input_norm(x, residual)`, then
-   attention on the normed tokens, with the rest of the layer (second norm,
-   MLP or MoE) opaque.
-2. **A model owner declares it with one typed binding function**, in the
-   model's own `registration.py`:
+   sub-block, `NormThenAttention`: its reference forward runs
+   `in_norm(x, residual)`, then `attn` on the normed tokens, with the rest of
+   the layer (`post_norm`, `mlp`: dense or MoE) opaque.
+2. **A model owner declares it in the model's own `registration.py`**,
+   registering against the pattern the way vLLM's `register_oot` registers a
+   layer, and naming each role exactly as the reference does:
 
    ```python
-   @declare_block(Glm4MoeDecoderLayer)
-   def glm4_moe_attention(layer: Glm4MoeDecoderLayer) -> NormAttnBinding:
+   @NormThenAttention.register(Qwen3DecoderLayer)
+   def qwen3_attention(layer: Qwen3DecoderLayer) -> NormThenAttention.Roles:
        attention = layer.self_attn
-       qk_norm = (attention.q_norm, attention.k_norm) if attention.use_qk_norm else None
-       return pre_norm_binding(
-           layer,
-           attention,
-           qk_norm=qk_norm,
-           output_gate=False,
-           stream=positions_first(layer),
+       return NormThenAttention.Roles(
+           in_norm=layer.input_layernorm,
+           attn=Attention.of(attention, qk_norm=(attention.q_norm, attention.k_norm)),
+           post_norm=layer.post_attention_layernorm,
+           mlp=layer.mlp,
+           layer_call=positions_first(layer),
        )
    ```
 
-   The return type names the pattern; the binding dataclass is what
-   `AttentionRunner.__init__` takes; every part is typed attribute access
-   (see "Declarations are typed binding functions" below).
+   The top-level keywords are the pattern's roles. A role made of several
+   modules states them under its own name: `Attention.of` reads attention's
+   parts (QKV, core, output projection, RoPE) by typed attribute access, and
+   `layer_call` says how the layer's forward is called (see "Declarations
+   name the pattern's roles" below).
 3. **The framework verifies the declaration**, twice: with the roles opaque,
    the layer's forward computes the pattern's graph (the normed tokens and
    the positions reach nothing but attention); and with attention's parts
@@ -76,23 +78,23 @@ installing one leaves the model's `state_dict` and named parameters as built.
 
 | Claim | Code |
 |---|---|
-| The pattern (framework-owned) | [`norm_then_attention`](../src/vllm_torchtpu/blocks/norm_attn/pattern.py#L46-L59), [`NormAttnBinding`](../src/vllm_torchtpu/blocks/norm_attn/pattern.py#L73-L147), [`pre_norm_binding`](../src/vllm_torchtpu/blocks/norm_attn/pattern.py#L199-L226) |
-| The runner: parts in, composition owned, plan resolved once | [`AttentionBinding`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L102-L125), [`AttentionRunner`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L128-L269) ([`__init__`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L146-L169), [`_select_forward`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L171-L183), [`_unfused`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L196-L209), [`_fused_qkv`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L211-L225), [`attention_from_qkv`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L229-L254)), [`AttnConfig`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L74-L99) |
-| The fused value's reference (stands in for #3096's kernel) | [`reference_fused_qkv`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L272-L290) |
-| Conformance: the layer's wiring | [`conform`](../src/vllm_torchtpu/blocks/norm_attn/install.py#L88-L145) |
-| Conformance: attention's forward is the runner's composition; a variant the runner does not implement is a stated missing property | [`attention_config`](../src/vllm_torchtpu/blocks/norm_attn/install.py#L155-L181), [`conform_attention`](../src/vllm_torchtpu/blocks/norm_attn/install.py#L184-L266) |
-| A non-conforming declaration stops startup | [`install`](../src/vllm_torchtpu/blocks/installer.py#L39-L76) |
-| The plan and the kernel's capability | [`NormAttnPlan`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L127-L134), [`rule` and fallbacks](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L212-L215), [`AttentionFacts`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L154-L173), [`facts_of`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L185-L209), [`fused_qkv_supports`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L224-L295), [`resolve`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L320-L327), [`choose`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L330-L372); the chip fact [`has_fp8_matmul`](../src/vllm_torchtpu/tpu_info.py#L90-L98) |
-| Install: capability consulted (automatic falls back, a pin that cannot run raises), runner built from the layer's parts, the layer routed through it | [`NormThenAttention`](../src/vllm_torchtpu/blocks/norm_attn/install.py#L384-L403), [`build_runner`](../src/vllm_torchtpu/blocks/norm_attn/install.py#L293-L310), [`NormAttnLayer`](../src/vllm_torchtpu/blocks/norm_attn/install.py#L269-L290) |
-| Scopes nest: the block runner is built from the declared parts and the nested `AttentionRunner`, constructed with `output_reduced=False` | [`AttnMoERunner`](../src/vllm_torchtpu/blocks/attn_moe/runner.py#L121-L237), [`MoEBinding`](../src/vllm_torchtpu/blocks/attn_moe/runner.py#L101-L118), [`AttnMoEBinding`](../src/vllm_torchtpu/blocks/attn_moe/pattern.py#L113-L179), [`AttnThenMoE`](../src/vllm_torchtpu/blocks/attn_moe/install.py#L258-L317), [`unreduced_output_supports`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L298-L317), [`project_out`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L256-L269), [`test_scopes_nest_on_qwen3_5`](../tests/blocks/test_norm_attn_integration.py#L241-L261) |
-| Scopes nest: several patterns per class | [`declarations_for`](../src/vllm_torchtpu/blocks/__init__.py#L137-L139), [`install`](../src/vllm_torchtpu/blocks/installer.py#L39-L76) |
-| Typed declarations: the binding function, its parts, kinds checked at construction | [`declare_block`](../src/vllm_torchtpu/blocks/__init__.py#L142-L164), [`BlockDeclaration`](../src/vllm_torchtpu/blocks/__init__.py#L65-L131), [`BlockBinding`](../src/vllm_torchtpu/blocks/binding.py#L44-L64), [`BindingKindError`](../src/vllm_torchtpu/blocks/binding.py#L67-L87), [`as_kind`](../src/vllm_torchtpu/blocks/binding.py#L115-L129) |
-| One binding function per model | [GLM-4.5/4.6](../src/vllm_torchtpu/models/vllm/glm4_moe/registration.py#L24-L51), [Mistral](../src/vllm_torchtpu/models/vllm/mistral/registration.py#L24-L37), [Llama](../src/vllm_torchtpu/models/vllm/llama/registration.py#L24-L37), [Qwen3](../src/vllm_torchtpu/models/vllm/qwen3/registration.py#L23-L32), [gpt-oss](../src/vllm_torchtpu/models/vllm/gpt_oss/registration.py#L24-L37), [Qwen3-MoE](../src/vllm_torchtpu/models/vllm/qwen3_moe/registration.py#L23-L32), [Qwen3.5](../src/vllm_torchtpu/models/vllm/qwen3_5/registration.py#L36-L75) |
-| Per model: A (runner unfused vs upstream) and B (the rule's value through the runner) | [`family`](../tests/blocks/subblock_check.py#L225-L261), [`_install_and_run`](../tests/blocks/subblock_check.py#L199-L216), [`new_models`](../tests/blocks/subblock_check.py#L284-L293) |
-| Planted non-conforming declarations (the layer; attention) | [`ScaledAttention`](../tests/blocks/subblock_fixtures.py#L34-L49), [`scale_query`](../tests/blocks/subblock_fixtures.py#L56-L67), [`_planted`](../tests/blocks/subblock_check.py#L307-L329) |
-| Every code object the installed forward runs has source (torch.compile's AOT cache) | [`source_less`](../tests/blocks/subblock_check.py#L332-L371) |
-| The count against #3096 | [`counts`](../tests/blocks/subblock_check.py#L430-L438) |
-| Reach over current models, from real configs | [`CANDIDATES`](../tests/blocks/subblock_reach.py#L76-L214), [`MAIN_CANDIDATES`](../tests/blocks/subblock_reach.py#L220-L276), [`check`](../tests/blocks/subblock_reach.py#L432-L452) |
+| The pattern (framework-owned): reference forward, roles, the runner's binding | [`norm_then_attention`](../src/vllm_torchtpu/blocks/norm_attn/pattern.py#L48-L61), [`NormThenAttention`](../src/vllm_torchtpu/blocks/norm_attn/pattern.py#L192-L229), [`norm_attn_binding`](../src/vllm_torchtpu/blocks/norm_attn/pattern.py#L152-L189), [`NormAttnBinding`](../src/vllm_torchtpu/blocks/norm_attn/pattern.py#L75-L149) |
+| The runner: parts in, composition owned, plan resolved once | [`AttentionBinding`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L147-L170), [`AttentionRunner`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L173-L351) ([`__init__`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L193-L220), [`_select_forward`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L222-L243), [`_unfused`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L256-L269), [`_fused_qkv`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L271-L298), [`attention_from_qkv`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L311-L336)), [`AttnConfig`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L119-L144) |
+| The fused value's reference (stands in for #3096's kernel) | [`reference_fused_qkv`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L354-L374) |
+| Conformance: the layer's wiring | [`conform`](../src/vllm_torchtpu/blocks/norm_attn/install.py#L90-L147) |
+| Conformance: attention's forward is the runner's composition; a variant the runner does not implement is a stated missing property | [`attention_config`](../src/vllm_torchtpu/blocks/norm_attn/install.py#L157-L183), [`conform_attention`](../src/vllm_torchtpu/blocks/norm_attn/install.py#L186-L268) |
+| A non-conforming declaration stops startup | [`install`](../src/vllm_torchtpu/blocks/installer.py#L39-L85) |
+| The plan and the kernel's capability | [`NormAttnPlan`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L154-L166), [`rule` and fallbacks](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L212-L215), [`AttentionFacts`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L186-L205), [`facts_of`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L217-L241), [`fused_qkv_supports`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L267-L338), [`resolve`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L391-L400), [`choose`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L403-L448); the chip fact [`has_fp8_matmul`](../src/vllm_torchtpu/tpu_info.py#L90-L98) |
+| Install: capability consulted (automatic falls back, a pin that cannot run raises), runner built from the layer's parts, the layer routed through it | [`NormThenAttentionInstall`](../src/vllm_torchtpu/blocks/norm_attn/install.py#L403-L422), [`build_runner`](../src/vllm_torchtpu/blocks/norm_attn/install.py#L295-L316), [`NormAttnLayer`](../src/vllm_torchtpu/blocks/norm_attn/install.py#L271-L292) |
+| Scopes nest: the block runner is built from the declared parts and the nested `AttentionRunner`, constructed with `output_reduced=False` | [`AttnMoERunner`](../src/vllm_torchtpu/blocks/attn_moe/runner.py#L121-L237), [`MoEBinding`](../src/vllm_torchtpu/blocks/attn_moe/runner.py#L101-L118), [`AttnMoEBinding`](../src/vllm_torchtpu/blocks/attn_moe/pattern.py#L117-L183), [`AttnThenMoE`](../src/vllm_torchtpu/blocks/attn_moe/pattern.py#L186-L259), [`AttnThenMoE.spans`](../src/vllm_torchtpu/blocks/attn_moe/pattern.py#L245-L259), [`AttnThenMoEInstall`](../src/vllm_torchtpu/blocks/attn_moe/install.py#L258-L317), [`unreduced_output_supports`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L362-L381), [`project_out`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L338-L351), [`test_scopes_nest_on_qwen3_5`](../tests/blocks/test_norm_attn_integration.py#L265-L285), [`test_block_span_states_the_sub_block`](../tests/blocks/test_attn_moe_block.py#L116-L138), [`test_opaque_attention_has_no_span`](../tests/blocks/test_attn_moe_block.py#L141-L148) |
+| Scopes nest: several patterns per class | [`declarations_for`](../src/vllm_torchtpu/blocks/__init__.py#L120-L122), [`install`](../src/vllm_torchtpu/blocks/installer.py#L39-L85) |
+| Declarations: registered against the pattern, one keyword per role; kinds checked when the binding is built | [`BlockPattern.register`](../src/vllm_torchtpu/blocks/__init__.py#L183-L204), [`BlockPattern.declaration`](../src/vllm_torchtpu/blocks/__init__.py#L148-L171), [`Attention`](../src/vllm_torchtpu/blocks/roles.py#L81-L145), [`MoE`](../src/vllm_torchtpu/blocks/roles.py#L162-L183), [`BlockDeclaration`](../src/vllm_torchtpu/blocks/__init__.py#L66-L114), [`BlockBinding`](../src/vllm_torchtpu/blocks/binding.py#L44-L64), [`BindingKindError`](../src/vllm_torchtpu/blocks/binding.py#L67-L87), [`as_kind`](../src/vllm_torchtpu/blocks/binding.py#L115-L129) |
+| One declaration per model | [GLM-4.5/4.6](../src/vllm_torchtpu/models/vllm/glm4_moe/registration.py#L24-L60), [Mistral](../src/vllm_torchtpu/models/vllm/mistral/registration.py#L24-L37), [Llama](../src/vllm_torchtpu/models/vllm/llama/registration.py#L24-L37), [Qwen3](../src/vllm_torchtpu/models/vllm/qwen3/registration.py#L23-L33), [gpt-oss](../src/vllm_torchtpu/models/vllm/gpt_oss/registration.py#L24-L37), [Qwen3-MoE](../src/vllm_torchtpu/models/vllm/qwen3_moe/registration.py#L23-L33), [Qwen3.5](../src/vllm_torchtpu/models/vllm/qwen3_5/registration.py#L35-L82) |
+| Per model: A (runner unfused vs upstream) and B (the rule's value through the runner) | [`family`](../tests/blocks/subblock_check.py#L228-L264), [`_install_and_run`](../tests/blocks/subblock_check.py#L202-L219), [`new_models`](../tests/blocks/subblock_check.py#L287-L296) |
+| Planted non-conforming declarations (the layer; attention) | [`ScaledAttention`](../tests/blocks/subblock_fixtures.py#L35-L50), [`scale_query`](../tests/blocks/subblock_fixtures.py#L57-L68), [`_planted`](../tests/blocks/subblock_check.py#L310-L332) |
+| Every code object the installed forward runs has source (torch.compile's AOT cache) | [`source_less`](../tests/blocks/subblock_check.py#L335-L374) |
+| The count against #3096 | [`counts`](../tests/blocks/subblock_check.py#L433-L441) |
+| Reach over current models, from real configs | [`CANDIDATES`](../tests/blocks/subblock_reach.py#L101-L214), [`MAIN_CANDIDATES`](../tests/blocks/subblock_reach.py#L220-L276), [`check`](../tests/blocks/subblock_reach.py#L435-L455) |
 | The startup override | `TPU_SUBBLOCK_PLAN` in `envs.py`, passed by the runner's `_install_blocks` |
 
 ## The kernel's capability, as its author would declare it
@@ -373,7 +375,7 @@ Counted from #3096's diff, file by file:
 | 4 per-model forwards: `fused_attn_proj_patch.py`'s `_patched_qwen3_moe_forward`, `_patched_qwen3_next_forward` (Qwen3-Next and Qwen3.5) and `_patched_gemma4_attention_forward`, plus an edit to #1492's `_overlap_forward` in `qwen3_5_patch.py` | One framework forward, `AttentionRunner`, for every declared model |
 | 5 structural eligibility checks in `layers/adapter/fused_attn_proj.py`: unsupported norm, sequence-parallel input, `layer_scale`, GDN's separate in-projections, first layer without a residual | 1 conformance check, the same for every model |
 | 7 kernel limits (quant method, weight layout, FP8 per channel, batched RPA, head_dim 64 or DCP, KV sharing or sinks, GDN in-projection not FP8) | The kernel's own `supports(...)`, here `fused_qkv_supports`, consulted by the runner's plan |
-| Finding layers by attribute names (`input_layernorm`, `self_attn`, `linear_attn`) and `isinstance` on model classes | One typed binding function per model, in the model's own directory |
+| Finding layers by attribute names (`input_layernorm`, `self_attn`, `linear_attn`) and `isinstance` on model classes | One typed declaration per model (`@NormThenAttention.register`), in the model's own directory |
 
 #3096 is careful work; the count is about where the knowledge lives, not
 about the PR. It also covers Gemma 4 and Gated DeltaNet layers, which this
@@ -394,9 +396,11 @@ The block is a runner too, shaped like `MoERunner` one scope up
   plan table; `_select_forward` picks the value once; the runner becomes the
   layer's `forward` on the instance (no mixin, no `__class__` rebinding).
 - **The attention part.** Input norm, attention, output projection,
-  returning the unreduced attention output and the residual stream. Where
-  the layer declares `norm_then_attention`, the block builds that
-  `AttentionRunner` itself, **with its contract stated at construction**:
+  returning the unreduced attention output and the residual stream. The
+  block's span `in_norm, attn` is the sub-block: where the layer is also
+  declared `NormThenAttention`, the block builds that `AttentionRunner` from
+  the span of its own roles (`BlockPattern.spans`), **with its contract
+  stated at construction**:
   `output_reduced=False`, because the block reduces attention itself under
   both values (an all-reduce, or #1492's reduce-scatter folded into the MoE
   all-reduce). `o_proj.reduce_results` is never written.
@@ -422,55 +426,56 @@ gate, the capability and the contract) and
 model: the nested runner built unreduced from the model's own parts, nothing
 written to `o_proj`, the interim MoE writes, the fallbacks).
 
-## Declarations are typed binding functions
+## Declarations name the pattern's roles
 
-A declaration is a function from the layer to the pattern's parts:
+A declaration registers a layer class against a pattern and returns the
+pattern's `Roles`, one keyword per role of the pattern's reference forward:
 
 ```python
-@declare_block(Glm4MoeDecoderLayer)
-def glm4_moe_block(layer: Glm4MoeDecoderLayer) -> AttnMoEBinding | None:
+@AttnThenMoE.register(Glm4MoeDecoderLayer)
+def glm4_moe_block(layer: Glm4MoeDecoderLayer) -> AttnThenMoE.Roles | None:
     if not isinstance(layer.mlp, Glm4MoE):  # The first_k_dense_replace layers.
         return None
-    attention = layer.self_attn
-    return pre_norm_moe_binding(
-        layer,
-        attention,
-        attention.o_proj,
-        layer.mlp,
-        stream=positions_first(layer),
-        attend=attend_with_positions(attention),
+    return AttnThenMoE.Roles(
+        in_norm=layer.input_layernorm,
+        attn=_attention(layer),          # Attention.of(self_attn, qk_norm=...)
+        post_norm=layer.post_attention_layernorm,
+        moe=MoE.of(layer.mlp),           # the MoE module, its router, its experts
+        layer_call=positions_first(layer),
     )
 ```
 
-- **The pattern is the return type**; `None` means the declaration does not
-  cover this layer. There is no `pattern=`, role dict or `when=`.
-- **Nothing is found by name or kind.** The binding states every part
-  (`out_proj` included, so the block never searches attention for it), the
-  optional ones (`qk_norm`, `output_gate`), and how the
-  layer's forward and its attention are called (`stream`, `attend`, typed
-  Protocols checked against the model's signature). Conformance tracks
-  arguments by identity and reads no parameter name.
-- **The binding is the runner's argument**: `NormAttnBinding` extends
-  `AttentionBinding` and `AttnMoEBinding` extends `MoEBinding`, the dataclasses the
-  runners take; model-free tests build the base dataclass from synthetic
-  parts.
-- **Kinds are checked when the parts are built**, and errors name the
+- **The names are the pattern's.** `attn_then_moe(hidden, residual, *,
+  in_norm, attn, post_norm, moe)` and the declaration use the same four
+  role names; `None` means the declaration does not cover this layer.
+- **Details live under their role.** `Attention.of` states attention's parts
+  and its output projection (so the block never searches for it);
+  `Attention.opaque(module, o_proj=, call=)` states only what a block needs
+  where no sub-block fuses inside (Qwen3.5's Gated DeltaNet layers);
+  `MoE.of` states the router and experts. Nothing is found by name or kind,
+  and conformance tracks arguments by identity, reading no parameter name.
+- **Scopes nest by span.** The block's span `in_norm, attn` is
+  `NormThenAttention`. GLM-4.5 and Qwen3.5 register both (the sub-block alone
+  covers their dense or every layer); on a layer both cover, the installer
+  builds the nested `AttentionRunner` from the block's own span, so the parts
+  are stated once and nest-or-disjoint holds by construction.
+- **Roles become the runner's argument.** `Roles.binding()` builds
+  `NormAttnBinding` / `AttnMoEBinding`, which extend `AttentionBinding` and
+  `MoEBinding`, the dataclasses the runners take; model-free tests build the
+  base dataclass from synthetic parts.
+- **Kinds are checked when the binding is built**, and errors name the
   attribute, recovered by identity: `q_norm=self_attn.q_norm and k_norm come
   together or not at all`.
-- **Shared names are typed helpers, not tables**: `pre_norm_binding` and
-  `pre_norm_moe_binding` take Protocol-typed arguments; `as_kind` narrows a
-  child a model builds from a class parameter (Llama's `attn_layer_type`,
-  gpt-oss's `attention_cls`).
 - **A misspelled attribute is a type error.** `nn.Module.__getattr__`
-  returns `Tensor | Module`, which no part field accepts. basedpyright on
+  returns `Tensor | Module`, which no role field accepts. basedpyright on
   `post_norm=layer.post_attention_layernrom`:
 
   ```text
   error: Argument of type "Tensor | Module" cannot be assigned to parameter "post_norm" of type "Module"
   ```
 
-  and on `pre_norm_binding(layer, layer.self_atn)`: `"Module" is incompatible
-  with protocol "PreNormAttention"`.
+  and on `Attention.of(layer.self_atn)`: `Argument of type "Tensor | Module"
+  cannot be assigned to parameter "module" of type "PreNormAttention"`.
 
 ## Not shown here
 
