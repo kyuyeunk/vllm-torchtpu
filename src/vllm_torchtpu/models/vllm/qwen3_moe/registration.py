@@ -26,7 +26,9 @@ def qwen3_moe_attention(layer: Qwen3MoeDecoderLayer) -> NormThenAttention.Roles:
     attention = layer.self_attn
     return NormThenAttention.Roles(
         in_norm=layer.input_layernorm,
-        attn=Attention.of(attention, qk_norm=(attention.q_norm, attention.k_norm)),
+        attn=Attention.from_module(
+            attention, qk_norm=(attention.q_norm, attention.k_norm)
+        ),
         post_norm=layer.post_attention_layernorm,
         mlp=layer.mlp,
         layer_call=positions_first(layer),

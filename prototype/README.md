@@ -22,7 +22,7 @@ same fusion through a declared scope:
        attention = layer.self_attn
        return NormThenAttention.Roles(
            in_norm=layer.input_layernorm,
-           attn=Attention.of(attention, qk_norm=(attention.q_norm, attention.k_norm)),
+           attn=Attention.from_module(attention, qk_norm=(attention.q_norm, attention.k_norm)),
            post_norm=layer.post_attention_layernorm,
            mlp=layer.mlp,
            layer_call=positions_first(layer),
@@ -30,7 +30,7 @@ same fusion through a declared scope:
    ```
 
    The top-level keywords are the pattern's roles. A role made of several
-   modules states them under its own name: `Attention.of` reads attention's
+   modules states them under its own name: `Attention.from_module` reads attention's
    parts (QKV, core, output projection, RoPE) by typed attribute access, and
    `layer_call` says how the layer's forward is called (see "Declarations
    name the pattern's roles" below).
@@ -78,7 +78,7 @@ installing one leaves the model's `state_dict` and named parameters as built.
 
 | Claim | Code |
 |---|---|
-| The pattern (framework-owned): reference forward, roles, the runner's binding | [`norm_then_attention`](../src/vllm_torchtpu/blocks/norm_attn/pattern.py#L48-L61), [`NormThenAttention`](../src/vllm_torchtpu/blocks/norm_attn/pattern.py#L192-L229), [`norm_attn_binding`](../src/vllm_torchtpu/blocks/norm_attn/pattern.py#L152-L189), [`NormAttnBinding`](../src/vllm_torchtpu/blocks/norm_attn/pattern.py#L75-L149) |
+| The pattern (framework-owned): reference forward, roles, the runner's binding | [`norm_then_attention`](../src/vllm_torchtpu/blocks/norm_attn/pattern.py#L47-L60), [`NormThenAttention`](../src/vllm_torchtpu/blocks/norm_attn/pattern.py#L181-L218), [`norm_attn_binding`](../src/vllm_torchtpu/blocks/norm_attn/pattern.py#L151-L178), [`NormAttnBinding`](../src/vllm_torchtpu/blocks/norm_attn/pattern.py#L74-L148) |
 | The runner: parts in, composition owned, plan resolved once | [`AttentionBinding`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L147-L170), [`AttentionRunner`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L173-L351) ([`__init__`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L193-L220), [`_select_forward`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L222-L243), [`_unfused`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L256-L269), [`_fused_qkv`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L271-L298), [`attention_from_qkv`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L311-L336)), [`AttnConfig`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L119-L144) |
 | The fused value's reference (stands in for #3096's kernel) | [`reference_fused_qkv`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L354-L374) |
 | Conformance: the layer's wiring | [`conform`](../src/vllm_torchtpu/blocks/norm_attn/install.py#L90-L147) |
@@ -86,15 +86,15 @@ installing one leaves the model's `state_dict` and named parameters as built.
 | A non-conforming declaration stops startup | [`install`](../src/vllm_torchtpu/blocks/installer.py#L39-L85) |
 | The plan and the kernel's capability | [`NormAttnPlan`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L154-L166), [`rule` and fallbacks](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L212-L215), [`AttentionFacts`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L186-L205), [`facts_of`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L217-L241), [`fused_qkv_supports`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L267-L338), [`resolve`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L391-L400), [`choose`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L403-L448); the chip fact [`has_fp8_matmul`](../src/vllm_torchtpu/tpu_info.py#L90-L98) |
 | Install: capability consulted (automatic falls back, a pin that cannot run raises), runner built from the layer's parts, the layer routed through it | [`NormThenAttentionInstall`](../src/vllm_torchtpu/blocks/norm_attn/install.py#L403-L422), [`build_runner`](../src/vllm_torchtpu/blocks/norm_attn/install.py#L295-L316), [`NormAttnLayer`](../src/vllm_torchtpu/blocks/norm_attn/install.py#L271-L292) |
-| Scopes nest: the block runner is built from the declared parts and the nested `AttentionRunner`, constructed with `output_reduced=False` | [`AttnMoERunner`](../src/vllm_torchtpu/blocks/attn_moe/runner.py#L121-L237), [`MoEBinding`](../src/vllm_torchtpu/blocks/attn_moe/runner.py#L101-L118), [`AttnMoEBinding`](../src/vllm_torchtpu/blocks/attn_moe/pattern.py#L117-L183), [`AttnThenMoE`](../src/vllm_torchtpu/blocks/attn_moe/pattern.py#L186-L259), [`AttnThenMoE.spans`](../src/vllm_torchtpu/blocks/attn_moe/pattern.py#L245-L259), [`AttnThenMoEInstall`](../src/vllm_torchtpu/blocks/attn_moe/install.py#L258-L317), [`unreduced_output_supports`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L362-L381), [`project_out`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L338-L351), [`test_scopes_nest_on_qwen3_5`](../tests/blocks/test_norm_attn_integration.py#L265-L285), [`test_block_span_states_the_sub_block`](../tests/blocks/test_attn_moe_block.py#L116-L138), [`test_opaque_attention_has_no_span`](../tests/blocks/test_attn_moe_block.py#L141-L148) |
+| Scopes nest: the block runner is built from the declared parts and the nested `AttentionRunner`, constructed with `output_reduced=False` | [`AttnMoERunner`](../src/vllm_torchtpu/blocks/attn_moe/runner.py#L121-L237), [`MoEBinding`](../src/vllm_torchtpu/blocks/attn_moe/runner.py#L101-L118), [`AttnMoEBinding`](../src/vllm_torchtpu/blocks/attn_moe/pattern.py#L117-L183), [`AttnThenMoE`](../src/vllm_torchtpu/blocks/attn_moe/pattern.py#L186-L260), [`AttnThenMoE.spans`](../src/vllm_torchtpu/blocks/attn_moe/pattern.py#L246-L260), [`AttnThenMoEInstall`](../src/vllm_torchtpu/blocks/attn_moe/install.py#L258-L317), [`unreduced_output_supports`](../src/vllm_torchtpu/blocks/norm_attn/plan.py#L362-L381), [`project_out`](../src/vllm_torchtpu/blocks/norm_attn/runner.py#L338-L351), [`test_scopes_nest_on_qwen3_5`](../tests/blocks/test_norm_attn_integration.py#L265-L285), [`test_block_span_states_the_sub_block`](../tests/blocks/test_attn_moe_block.py#L116-L138), [`test_opaque_attention_has_no_span`](../tests/blocks/test_attn_moe_block.py#L141-L148) |
 | Scopes nest: several patterns per class | [`declarations_for`](../src/vllm_torchtpu/blocks/__init__.py#L120-L122), [`install`](../src/vllm_torchtpu/blocks/installer.py#L39-L85) |
-| Declarations: registered against the pattern, one keyword per role; kinds checked when the binding is built | [`BlockPattern.register`](../src/vllm_torchtpu/blocks/__init__.py#L183-L204), [`BlockPattern.declaration`](../src/vllm_torchtpu/blocks/__init__.py#L148-L171), [`Attention`](../src/vllm_torchtpu/blocks/roles.py#L81-L145), [`MoE`](../src/vllm_torchtpu/blocks/roles.py#L162-L183), [`BlockDeclaration`](../src/vllm_torchtpu/blocks/__init__.py#L66-L114), [`BlockBinding`](../src/vllm_torchtpu/blocks/binding.py#L44-L64), [`BindingKindError`](../src/vllm_torchtpu/blocks/binding.py#L67-L87), [`as_kind`](../src/vllm_torchtpu/blocks/binding.py#L115-L129) |
-| One declaration per model | [GLM-4.5/4.6](../src/vllm_torchtpu/models/vllm/glm4_moe/registration.py#L24-L60), [Mistral](../src/vllm_torchtpu/models/vllm/mistral/registration.py#L24-L37), [Llama](../src/vllm_torchtpu/models/vllm/llama/registration.py#L24-L37), [Qwen3](../src/vllm_torchtpu/models/vllm/qwen3/registration.py#L23-L33), [gpt-oss](../src/vllm_torchtpu/models/vllm/gpt_oss/registration.py#L24-L37), [Qwen3-MoE](../src/vllm_torchtpu/models/vllm/qwen3_moe/registration.py#L23-L33), [Qwen3.5](../src/vllm_torchtpu/models/vllm/qwen3_5/registration.py#L35-L82) |
+| Declarations: registered against the pattern, one keyword per role; kinds checked when the binding is built | [`BlockPattern.register`](../src/vllm_torchtpu/blocks/__init__.py#L183-L204), [`BlockPattern.declaration`](../src/vllm_torchtpu/blocks/__init__.py#L148-L171), [`Attention`](../src/vllm_torchtpu/blocks/roles.py#L88-L147), [`MoE`](../src/vllm_torchtpu/blocks/roles.py#L205-L226), [`BlockDeclaration`](../src/vllm_torchtpu/blocks/__init__.py#L66-L114), [`BlockBinding`](../src/vllm_torchtpu/blocks/binding.py#L44-L64), [`BindingKindError`](../src/vllm_torchtpu/blocks/binding.py#L67-L87), [`as_kind`](../src/vllm_torchtpu/blocks/binding.py#L115-L129) |
+| One declaration per model | [GLM-4.5/4.6](../src/vllm_torchtpu/models/vllm/glm4_moe/registration.py#L24-L60), [Mistral](../src/vllm_torchtpu/models/vllm/mistral/registration.py#L24-L37), [Llama](../src/vllm_torchtpu/models/vllm/llama/registration.py#L24-L37), [Qwen3](../src/vllm_torchtpu/models/vllm/qwen3/registration.py#L23-L35), [gpt-oss](../src/vllm_torchtpu/models/vllm/gpt_oss/registration.py#L24-L37), [Qwen3-MoE](../src/vllm_torchtpu/models/vllm/qwen3_moe/registration.py#L23-L35), [Qwen3.5](../src/vllm_torchtpu/models/vllm/qwen3_5/registration.py#L34-L77) |
 | Per model: A (runner unfused vs upstream) and B (the rule's value through the runner) | [`family`](../tests/blocks/subblock_check.py#L228-L264), [`_install_and_run`](../tests/blocks/subblock_check.py#L202-L219), [`new_models`](../tests/blocks/subblock_check.py#L287-L296) |
 | Planted non-conforming declarations (the layer; attention) | [`ScaledAttention`](../tests/blocks/subblock_fixtures.py#L35-L50), [`scale_query`](../tests/blocks/subblock_fixtures.py#L57-L68), [`_planted`](../tests/blocks/subblock_check.py#L310-L332) |
 | Every code object the installed forward runs has source (torch.compile's AOT cache) | [`source_less`](../tests/blocks/subblock_check.py#L335-L374) |
 | The count against #3096 | [`counts`](../tests/blocks/subblock_check.py#L433-L441) |
-| Reach over current models, from real configs | [`CANDIDATES`](../tests/blocks/subblock_reach.py#L101-L214), [`MAIN_CANDIDATES`](../tests/blocks/subblock_reach.py#L220-L276), [`check`](../tests/blocks/subblock_reach.py#L435-L455) |
+| Reach over current models, from real configs | [`CANDIDATES`](../tests/blocks/subblock_reach.py#L100-L213), [`MAIN_CANDIDATES`](../tests/blocks/subblock_reach.py#L219-L275), [`check`](../tests/blocks/subblock_reach.py#L433-L453) |
 | The startup override | `TPU_SUBBLOCK_PLAN` in `envs.py`, passed by the runner's `_install_blocks` |
 
 ## The kernel's capability, as its author would declare it
@@ -438,9 +438,9 @@ def glm4_moe_block(layer: Glm4MoeDecoderLayer) -> AttnThenMoE.Roles | None:
         return None
     return AttnThenMoE.Roles(
         in_norm=layer.input_layernorm,
-        attn=_attention(layer),          # Attention.of(self_attn, qk_norm=...)
+        attn=_attention(layer),          # Attention.from_module(self_attn, qk_norm=...)
         post_norm=layer.post_attention_layernorm,
-        moe=MoE.of(layer.mlp),           # the MoE module, its router, its experts
+        moe=MoE.from_module(layer.mlp),  # the MoE module, its router, its experts
         layer_call=positions_first(layer),
     )
 ```
@@ -448,12 +448,16 @@ def glm4_moe_block(layer: Glm4MoeDecoderLayer) -> AttnThenMoE.Roles | None:
 - **The names are the pattern's.** `attn_then_moe(hidden, residual, *,
   in_norm, attn, post_norm, moe)` and the declaration use the same four
   role names; `None` means the declaration does not cover this layer.
-- **Details live under their role.** `Attention.of` states attention's parts
-  and its output projection (so the block never searches for it);
-  `Attention.opaque(module, o_proj=, call=)` states only what a block needs
-  where no sub-block fuses inside (Qwen3.5's Gated DeltaNet layers);
-  `MoE.of` states the router and experts. Nothing is found by name or kind,
-  and conformance tracks arguments by identity, reading no parameter name.
+- **Details live under their role, and each role class is one kind.**
+  `Attention.from_module` states standard attention's parts and its output
+  projection (so the block never searches for it). `LinearAttention.from_module`
+  states only what a block needs from Gated DeltaNet (the module and its
+  output projection); its forward is not the sub-block's, so the sub-block
+  pattern does not accept it (`NormThenAttention.Roles.attn` is typed
+  `Attention`). `MoE.from_module` states the router and experts. Each class
+  knows how the layer calls its module, so no declaration states a call
+  convention for attention. Nothing is found by name or kind, and conformance
+  tracks arguments by identity, reading no parameter name.
 - **Scopes nest by span.** The block's span `in_norm, attn` is
   `NormThenAttention`. GLM-4.5 and Qwen3.5 register both (the sub-block alone
   covers their dense or every layer); on a layer both cover, the installer
@@ -474,7 +478,7 @@ def glm4_moe_block(layer: Glm4MoeDecoderLayer) -> AttnThenMoE.Roles | None:
   error: Argument of type "Tensor | Module" cannot be assigned to parameter "post_norm" of type "Module"
   ```
 
-  and on `Attention.of(layer.self_atn)`: `Argument of type "Tensor | Module"
+  and on `Attention.from_module(layer.self_atn)`: `Argument of type "Tensor | Module"
   cannot be assigned to parameter "module" of type "PreNormAttention"`.
 
 ## Not shown here

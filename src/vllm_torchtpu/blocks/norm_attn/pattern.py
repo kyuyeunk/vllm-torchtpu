@@ -36,7 +36,6 @@ from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLine
 
 from vllm_torchtpu.blocks import BlockPattern, Pattern, calls
 from vllm_torchtpu.blocks.binding import BlockBinding, as_kind
-from vllm_torchtpu.blocks.conformance import BlockConformanceError
 from vllm_torchtpu.blocks.norm_attn.runner import AttentionBinding
 from vllm_torchtpu.blocks.roles import Attention, BlockRoles
 from vllm_torchtpu.blocks.stream import Attend, Stream
@@ -161,17 +160,7 @@ def norm_attn_binding(
 
     Shared by ``NormThenAttention`` and by a block that nests the sub-block
     over the same span (``AttnThenMoE``, where the rest is its MoE).
-
-    Raises:
-        BlockConformanceError: ``attn`` is opaque (``Attention.opaque``), so
-            the sub-block has no parts to compose.
     """
-    if attn.qkv_proj is None or attn.core is None or attn.rotary is None:
-        msg = (
-            f"attn={type(attn.module).__name__} is declared opaque "
-            "(Attention.opaque), so norm_then_attention has no parts to compose"
-        )
-        raise BlockConformanceError(msg)
     return NormAttnBinding(
         input_norm=in_norm,
         qkv_proj=attn.qkv_proj,
@@ -206,7 +195,7 @@ class NormThenAttention(BlockPattern):
 
         Attributes:
             in_norm: The input RMSNorm, called as ``(x, residual)``.
-            attn: The attention role (``Attention.of``).
+            attn: The attention role (``Attention.from_module``).
             post_norm: The post-attention RMSNorm (opaque to the sub-block).
             mlp: The rest of the layer (opaque to the sub-block).
             layer_call: How the layer's forward is called and read.

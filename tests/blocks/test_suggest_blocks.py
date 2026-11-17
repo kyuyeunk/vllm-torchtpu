@@ -14,10 +14,12 @@
 """The proposals ``python -m prototype.suggest_blocks`` prints, verdict by verdict.
 
 Each surveyed layer (``_build.SPECS``) gets the verdict the suggestion tool
-recorded. On this branch the tool raises for three layers (the demo exits 1
-at the first, DeepSeek-V3): the conformance stub does not bind DeepSeek's
-``llama_4_scaling`` or Jamba Mamba's ``output``, and Jamba's attention layer
-has no RowParallelLinear to propose. Those are strict xfails naming the error.
+recorded. An attention that fits neither ``Attention`` nor
+``LinearAttention`` under vLLM's usual names declines with the missing part
+(DeepSeek-V3's latent attention has no ``qkv_proj``; Jamba's attention layer
+neither). The tool raises for one layer (the demo exits 1 there): the
+conformance stub does not bind Jamba Mamba's ``output``. That is a strict
+xfail naming the error.
 """
 
 import pytest
@@ -38,10 +40,10 @@ _RECORDED: tuple[Suggestion | type[Exception], ...] = (
     Suggestion.CONFORMS,  # MiniMax-M2
     Suggestion.CONFORMS,  # Llama4 (MoE layer)
     Suggestion.DECLINES,  # GPT-OSS
-    TypeError,  # DeepSeek-V3: the stub does not bind llama_4_scaling
+    Suggestion.DECLINES,  # DeepSeek-V3: latent attention, no qkv_proj
     Suggestion.DECLINES,  # Bailing-MoE
     Suggestion.DECLINES,  # Kimi-Linear (nvidia)
-    IndexError,  # Jamba (attention layer): no RowParallelLinear in attention
+    Suggestion.DECLINES,  # Jamba (attention layer): no usual attention parts
     TypeError,  # Jamba (Mamba layer): the stub does not bind output
     Suggestion.NOT_BUILT,  # Nemotron-H (MoE layer)
 )

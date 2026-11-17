@@ -30,7 +30,7 @@ def gpt_oss_attention(layer: TransformerBlock) -> NormThenAttention.Roles:
     """
     return NormThenAttention.Roles(
         in_norm=layer.input_layernorm,
-        attn=Attention.of(as_kind(layer.attn, OAIAttention)),
+        attn=Attention.from_module(as_kind(layer.attn, OAIAttention)),
         post_norm=layer.post_attention_layernorm,
         mlp=layer.mlp,
         layer_call=hidden_positions_residual(layer),

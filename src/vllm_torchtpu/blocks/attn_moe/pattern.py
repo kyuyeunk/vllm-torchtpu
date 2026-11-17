@@ -44,7 +44,7 @@ from vllm_torchtpu.blocks.attn_moe.plan import BlockKey, MoEPath, RouterMode
 from vllm_torchtpu.blocks.attn_moe.runner import MoEBinding
 from vllm_torchtpu.blocks.binding import BlockBinding, as_kind
 from vllm_torchtpu.blocks.norm_attn.pattern import NormThenAttention, is_residual_norm
-from vllm_torchtpu.blocks.roles import Attention, BlockRoles, MoE
+from vllm_torchtpu.blocks.roles import Attention, BlockRoles, LinearAttention, MoE
 from vllm_torchtpu.blocks.stream import Attend, Stream
 
 Norm = Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
@@ -200,15 +200,15 @@ class AttnThenMoE(BlockPattern):
 
         Attributes:
             in_norm: The input RMSNorm, called as ``(x, residual)``.
-            attn: The attention role (``Attention.of``, or ``Attention.opaque``
-                where no sub-block fuses inside it).
+            attn: The attention role: ``Attention`` for standard attention,
+                ``LinearAttention`` for Gated DeltaNet (no sub-block inside).
             post_norm: The post-attention RMSNorm.
-            moe: The MoE role (``MoE.of``).
+            moe: The MoE role (``MoE.from_module``).
             layer_call: How the layer's forward is called and read.
         """
 
         in_norm: nn.Module
-        attn: Attention
+        attn: Attention | LinearAttention
         post_norm: nn.Module
         moe: MoE
         layer_call: Stream
@@ -230,13 +230,14 @@ class AttnThenMoE(BlockPattern):
         def norm_attn(self) -> NormThenAttention.Roles | None:
             """The sub-block's roles over the span ``in_norm, attn``, if any.
 
-            None where ``attn`` is opaque: it states no parts to compose.
+            None for linear attention: its forward is not the sub-block's.
             """
-            if self.attn.qkv_proj is None:
+            attn = self.attn
+            if not isinstance(attn, Attention):
                 return None
             return NormThenAttention.Roles(
                 in_norm=self.in_norm,
-                attn=self.attn,
+                attn=attn,
                 post_norm=self.post_norm,
                 mlp=self.moe.module,
                 layer_call=self.layer_call,

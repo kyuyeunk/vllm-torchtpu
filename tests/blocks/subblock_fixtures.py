@@ -72,7 +72,7 @@ def llama_roles(layer: LlamaDecoderLayer) -> NormThenAttention.Roles:
     """The planted layers' declaration (they reuse Llama's children)."""
     return NormThenAttention.Roles(
         in_norm=layer.input_layernorm,
-        attn=Attention.of(as_kind(layer.self_attn, LlamaAttention)),
+        attn=Attention.from_module(as_kind(layer.self_attn, LlamaAttention)),
         post_norm=layer.post_attention_layernorm,
         mlp=layer.mlp,
         layer_call=positions_first(layer),

@@ -17,13 +17,14 @@ A pattern names its roles in its reference forward (``in_norm``, ``attn``,
 ``post_norm``, ...). A model owner's declaration returns the pattern's
 ``Roles`` dataclass, whose top-level fields carry exactly those names. A role
 that needs more than one module states the rest under its own name:
-``Attention`` carries attention's parts and how the layer calls it, and
-``MoE`` the router and experts, so the declaration reads like the pattern,
-one keyword per role.
+``Attention`` (standard attention) and ``LinearAttention`` (Gated DeltaNet)
+carry attention's parts, and ``MoE`` the router and experts, so the
+declaration reads like the pattern, one keyword per role. Each role class
+knows how the layer calls its module.
 """
 
 import dataclasses
-from typing import Protocol, Self
+from typing import Protocol, Self, cast
 
 import torch
 from torch import nn
@@ -32,7 +33,13 @@ from vllm.model_executor.layers.linear import RowParallelLinear
 
 from vllm_torchtpu.blocks.binding import BlockBinding
 from vllm_torchtpu.blocks.calls import Experts, Router
-from vllm_torchtpu.blocks.stream import Attend, attend_with_positions
+from vllm_torchtpu.blocks.stream import (
+    Attend,
+    AttentionWithoutPositions,
+    AttentionWithPositions,
+    attend_with_positions,
+    attend_without_positions,
+)
 
 
 class BlockRoles:
@@ -80,37 +87,34 @@ class PreNormAttention(Protocol):
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class Attention:
-    """The ``attn`` role: the attention module, its parts and how it is called.
+    """The ``attn`` role for standard attention: the module and its parts.
 
-    Build it with ``Attention.of`` for an attention module with vLLM's usual
-    part names; every read is typed attribute access. A block that only needs
-    the module and its output projection (a Gated DeltaNet layer inside
-    ``attn_then_moe``) uses ``Attention.opaque``; such a role has no parts, so
-    no sub-block can fuse inside it.
+    Build it with ``Attention.from_module``, which reads vLLM's usual part
+    names by typed attribute access. Every part is stated, so a sub-block
+    (``NormThenAttention``) can fuse inside it. The layer calls the module
+    with the normed tokens and the positions.
 
     Attributes:
         module: The attention module the layer calls.
+        qkv_proj: Its input projection.
+        core: The attention core on ``(q, k, v)``.
         o_proj: Its output projection.
-        call: How the layer calls ``module`` on the normed tokens.
-        qkv_proj: The input projection, or None for an opaque role.
-        core: The attention core on ``(q, k, v)``, or None for an opaque role.
-        rotary: RoPE on ``(positions, q, k)``, or None for an opaque role.
+        rotary: RoPE on ``(positions, q, k)``.
         q_norm, k_norm: Per-head norms on q and k, both or neither.
         output_gate: Whether the projection also emits a per-head output gate.
     """
 
     module: nn.Module
+    qkv_proj: nn.Module
+    core: nn.Module
     o_proj: RowParallelLinear
-    call: Attend
-    qkv_proj: nn.Module | None = None
-    core: nn.Module | None = None
-    rotary: nn.Module | None = None
+    rotary: nn.Module
     q_norm: nn.Module | None = None
     k_norm: nn.Module | None = None
     output_gate: bool = False
 
     @classmethod
-    def of(
+    def from_module(
         cls,
         module: PreNormAttention,
         *,
@@ -127,22 +131,61 @@ class Attention:
         q_norm, k_norm = qk_norm if qk_norm is not None else (None, None)
         return cls(
             module=module,  # pyright: ignore[reportArgumentType] - a Protocol over an nn.Module
-            o_proj=module.o_proj,
-            call=attend_with_positions(module),
             qkv_proj=module.qkv_proj,
             core=module.attn,
+            o_proj=module.o_proj,
             rotary=module.rotary_emb,
             q_norm=q_norm,
             k_norm=k_norm,
             output_gate=output_gate,
         )
 
+    @property
+    def call(self) -> Attend:
+        """How the layer calls the module: normed tokens and positions."""
+        # Standard attention's forward takes both (``PreNormAttention``).
+        return attend_with_positions(cast("AttentionWithPositions", self.module))
+
+
+class LinearAttentionModule(Protocol):
+    """A linear-attention module (Gated DeltaNet) with vLLM's usual names."""
+
+    def forward(self, *, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The call the layer makes; no positions."""
+        ...
+
+    @property
+    def out_proj(self) -> RowParallelLinear:
+        """The part's ``out_proj``."""
+        ...
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class LinearAttention:
+    """The ``attn`` role for linear attention (Gated DeltaNet).
+
+    A block needs only the module and its output projection from it; its
+    forward is not the standard attention composition, so no sub-block fuses
+    inside it. The layer calls the module with the normed tokens only.
+
+    Attributes:
+        module: The linear-attention module the layer calls.
+        o_proj: Its output projection.
+    """
+
+    module: nn.Module
+    o_proj: RowParallelLinear
+
     @classmethod
-    def opaque(
-        cls, module: nn.Module, *, o_proj: RowParallelLinear, call: Attend
-    ) -> Self:
-        """A role that states only the module, its output projection and its call."""
-        return cls(module=module, o_proj=o_proj, call=call)
+    def from_module(cls, module: LinearAttentionModule) -> Self:
+        """The role of a linear-attention module with vLLM's usual names."""
+        return cls(module=module, o_proj=module.out_proj)  # pyright: ignore[reportArgumentType] - a Protocol over an nn.Module
+
+    @property
+    def call(self) -> Attend:
+        """How the layer calls the module: normed tokens only."""
+        # Linear attention's forward reads no positions (``LinearAttentionModule``).
+        return attend_without_positions(cast("AttentionWithoutPositions", self.module))
 
 
 class RoutedMoE(Protocol):
@@ -174,7 +217,7 @@ class MoE:
     experts: Experts
 
     @classmethod
-    def of(cls, module: RoutedMoE) -> Self:
+    def from_module(cls, module: RoutedMoE) -> Self:
         """The role of a MoE module with vLLM's usual part names."""
         return cls(
             module=module,  # pyright: ignore[reportArgumentType] - a Protocol over an nn.Module

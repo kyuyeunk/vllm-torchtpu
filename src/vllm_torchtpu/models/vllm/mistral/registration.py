@@ -30,7 +30,7 @@ def mistral_attention(layer: MistralDecoderLayer) -> NormThenAttention.Roles:
     """
     return NormThenAttention.Roles(
         in_norm=layer.input_layernorm,
-        attn=Attention.of(as_kind(layer.self_attn, MistralAttention)),
+        attn=Attention.from_module(as_kind(layer.self_attn, MistralAttention)),
         post_norm=layer.post_attention_layernorm,
         mlp=layer.mlp,
         layer_call=positions_first(layer),

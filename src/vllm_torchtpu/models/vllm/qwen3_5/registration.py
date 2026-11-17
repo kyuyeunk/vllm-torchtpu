@@ -25,29 +25,19 @@ from vllm.model_executor.models.qwen3_next import Qwen3NextSparseMoeBlock
 
 from vllm_torchtpu.blocks.attn_moe.pattern import AttnThenMoE
 from vllm_torchtpu.blocks.norm_attn.pattern import NormThenAttention
-from vllm_torchtpu.blocks.roles import Attention, MoE
+from vllm_torchtpu.blocks.roles import Attention, LinearAttention, MoE
 from vllm_torchtpu.blocks.stream import (
-    attend_without_positions,
     hidden_residual_positions,
 )
 
 
-def _attention(layer: Qwen3_5DecoderLayer) -> Attention:
-    """The attn role, for either attention kind.
-
-    Full attention states its parts, so the sub-block can fuse inside it.
-    Gated DeltaNet reads no positions and states only its output projection.
-    """
-    if layer.layer_type == "full_attention":  # str-ok: the model's own layer_type
-        attention = layer.self_attn
-        return Attention.of(
-            attention,
-            qk_norm=(attention.q_norm, attention.k_norm),
-            output_gate=attention.attn_output_gate,
-        )
-    gdn = layer.linear_attn
-    return Attention.opaque(
-        gdn, o_proj=gdn.out_proj, call=attend_without_positions(gdn)
+def _full_attention(layer: Qwen3_5DecoderLayer) -> Attention:
+    """The attn role of a full-attention layer: its parts, so a sub-block fits."""
+    attention = layer.self_attn
+    return Attention.from_module(
+        attention,
+        qk_norm=(attention.q_norm, attention.k_norm),
+        output_gate=attention.attn_output_gate,
     )
 
 
@@ -61,9 +51,14 @@ def qwen3_5_block(layer: Qwen3_5DecoderLayer) -> AttnThenMoE.Roles | None:
         return None
     return AttnThenMoE.Roles(
         in_norm=layer.input_layernorm,
-        attn=_attention(layer),
+        attn=(
+            _full_attention(layer)
+            if layer.layer_type
+            == "full_attention"  # str-ok: the model's own layer_type
+            else LinearAttention.from_module(layer.linear_attn)  # Gated DeltaNet
+        ),
         post_norm=layer.post_attention_layernorm,
-        moe=MoE.of(layer.mlp),
+        moe=MoE.from_module(layer.mlp),
         layer_call=hidden_residual_positions(layer),
     )
 
@@ -75,7 +70,7 @@ def qwen3_5_attention(layer: Qwen3_5DecoderLayer) -> NormThenAttention.Roles | N
         return None
     return NormThenAttention.Roles(
         in_norm=layer.input_layernorm,
-        attn=_attention(layer),
+        attn=_full_attention(layer),
         post_norm=layer.post_attention_layernorm,
         mlp=layer.mlp,
         layer_call=hidden_residual_positions(layer),

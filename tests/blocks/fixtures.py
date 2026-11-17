@@ -26,12 +26,10 @@ own forward, so only the wiring differs from upstream:
 
 import torch
 from torch import nn
-from vllm.model_executor.layers.linear import RowParallelLinear
 
 from vllm_torchtpu.blocks.attn_moe.pattern import AttnThenMoE
-from vllm_torchtpu.blocks.binding import as_kind
 from vllm_torchtpu.blocks.roles import Attention, MoE
-from vllm_torchtpu.blocks.stream import attend_with_positions, hidden_residual_positions
+from vllm_torchtpu.blocks.stream import hidden_residual_positions
 
 
 class _Children(nn.Module):
@@ -92,11 +90,7 @@ def renamed_roles(layer: _Children) -> AttnThenMoE.Roles:
     """The fixtures' declaration: the same roles under the new names."""
     return AttnThenMoE.Roles(
         in_norm=layer.pre_norm,
-        attn=Attention.opaque(
-            layer.mixer,
-            o_proj=as_kind(layer.mixer.get_submodule("o_proj"), RowParallelLinear),
-            call=attend_with_positions(layer.mixer),  # pyright: ignore[reportArgumentType]
-        ),
+        attn=Attention.from_module(layer.mixer),  # pyright: ignore[reportArgumentType]
         post_norm=layer.mid_norm,
         moe=MoE(
             module=layer.ffn,

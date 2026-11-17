@@ -47,7 +47,6 @@ from vllm_torchtpu.blocks.norm_attn.plan import facts_of, fused_qkv_supports
 from vllm_torchtpu.blocks.roles import Attention
 from vllm_torchtpu.blocks.stream import (
     Stream,
-    attend_with_positions,
     hidden_positions_residual,
     hidden_residual_positions,
     positions_first,
@@ -397,7 +396,6 @@ def guess_roles(layer: nn.Module) -> NormThenAttention.Roles:
         attn=Attention(
             module=attention,
             o_proj=o_proj,  # pyright: ignore[reportArgumentType] - the survey's guess
-            call=attend_with_positions(attention),  # pyright: ignore[reportArgumentType]
             qkv_proj=_child(attention, "qkv_proj"),
             core=_child(attention, "attn"),
             rotary=_child(attention, "rotary_emb"),

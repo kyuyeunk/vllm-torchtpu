@@ -25,7 +25,7 @@ def _attention(layer: Glm4MoeDecoderLayer) -> Attention:
     """The attn role: GLM-4 MoE's attention, with q/k norms where configured."""
     attention = layer.self_attn
     qk_norm = (attention.q_norm, attention.k_norm) if attention.use_qk_norm else None
-    return Attention.of(attention, qk_norm=qk_norm)
+    return Attention.from_module(attention, qk_norm=qk_norm)
 
 
 @AttnThenMoE.register(Glm4MoeDecoderLayer)
@@ -40,7 +40,7 @@ def glm4_moe_block(layer: Glm4MoeDecoderLayer) -> AttnThenMoE.Roles | None:
         in_norm=layer.input_layernorm,
         attn=_attention(layer),
         post_norm=layer.post_attention_layernorm,
-        moe=MoE.of(layer.mlp),
+        moe=MoE.from_module(layer.mlp),
         layer_call=positions_first(layer),
     )
 
