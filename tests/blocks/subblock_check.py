@@ -17,7 +17,7 @@ Runs on a CPU against vLLM v0.33.0; ``python -m prototype.check_subblock``
 prints the checks and ``test_subblock_check.py`` asserts them.
 
 For each family the model owner declares ``norm_then_attention`` (one
-``declare_block`` call in ``models/vllm/<model>/registration.py``); the check
+``@NormThenAttention.register`` in ``models/vllm/<model>/registration.py``); the check
 then confirms the declaration, installs the plan value ``fused_qkv`` (written
 once, against the pattern's roles) and compares the layer's output with
 upstream's on random weights. A planted layer with an extra multiply between
@@ -97,7 +97,7 @@ FAMILIES = tuple(
 
 
 # Current models #3096 does not target, from their real configs (shrunk):
-# each gets the fusion from one declare_block call in its registration.py.
+# each gets the fusion from one @NormThenAttention.register in registration.py.
 NEW_MODELS = (
     subblock_reach.GLM_4_5_AIR,
     subblock_reach.MINISTRAL_8B,

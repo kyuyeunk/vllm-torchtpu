@@ -13,9 +13,9 @@
 # limitations under the License.
 """What a model's binding function returns: a pattern's binding, typed.
 
-A model owner declares a block by writing a function from its decoder layer
-to the pattern's binding dataclass (``declare_block``). The dataclass is the
-declaration's whole content:
+A model owner declares a block by returning the pattern's ``Roles``
+(``BlockPattern.register``); ``Roles.binding`` turns them into the pattern's
+binding dataclass, which is what the runner and conformance take:
 
 - **Which pattern.** Each binding class names its pattern (``pattern``), so the
   binding function's return type says which pattern the layer conforms to.

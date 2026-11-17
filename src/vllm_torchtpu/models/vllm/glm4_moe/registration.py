@@ -15,37 +15,45 @@
 
 from vllm.model_executor.models.glm4_moe import Glm4MoE, Glm4MoeDecoderLayer
 
-from vllm_torchtpu.blocks import declare_block
-from vllm_torchtpu.blocks.attn_moe.pattern import AttnMoEBinding, pre_norm_moe_binding
+from vllm_torchtpu.blocks.attn_moe.pattern import AttnThenMoE
 from vllm_torchtpu.blocks.norm_attn.pattern import NormThenAttention
-from vllm_torchtpu.blocks.roles import Attention
-from vllm_torchtpu.blocks.stream import attend_with_positions, positions_first
+from vllm_torchtpu.blocks.roles import Attention, MoE
+from vllm_torchtpu.blocks.stream import positions_first
 
 
-@declare_block(Glm4MoeDecoderLayer)
-def glm4_moe_block(layer: Glm4MoeDecoderLayer) -> AttnMoEBinding | None:
-    """The attention-then-MoE block (attn_then_moe), on the MoE layers."""
+def _attention(layer: Glm4MoeDecoderLayer) -> Attention:
+    """The attn role: GLM-4 MoE's attention, with q/k norms where configured."""
+    attention = layer.self_attn
+    qk_norm = (attention.q_norm, attention.k_norm) if attention.use_qk_norm else None
+    return Attention.of(attention, qk_norm=qk_norm)
+
+
+@AttnThenMoE.register(Glm4MoeDecoderLayer)
+def glm4_moe_block(layer: Glm4MoeDecoderLayer) -> AttnThenMoE.Roles | None:
+    """The attention-then-MoE block (attn_then_moe), on the MoE layers.
+
+    Its span ``in_norm, attn`` is the sub-block below, built from these roles.
+    """
     if not isinstance(layer.mlp, Glm4MoE):  # The first_k_dense_replace layers.
         return None
-    attention = layer.self_attn
-    return pre_norm_moe_binding(
-        layer,
-        attention,
-        attention.o_proj,
-        layer.mlp,
-        stream=positions_first(layer),
-        attend=attend_with_positions(attention),
+    return AttnThenMoE.Roles(
+        in_norm=layer.input_layernorm,
+        attn=_attention(layer),
+        post_norm=layer.post_attention_layernorm,
+        moe=MoE.of(layer.mlp),
+        layer_call=positions_first(layer),
     )
 
 
 @NormThenAttention.register(Glm4MoeDecoderLayer)
 def glm4_moe_attention(layer: Glm4MoeDecoderLayer) -> NormThenAttention.Roles:
-    """The pre-norm attention sub-block (norm_then_attention), nested in the block."""
-    attention = layer.self_attn
-    qk_norm = (attention.q_norm, attention.k_norm) if attention.use_qk_norm else None
+    """The pre-norm attention sub-block (norm_then_attention), on every layer.
+
+    On the MoE layers the block above builds it from its own span.
+    """
     return NormThenAttention.Roles(
         in_norm=layer.input_layernorm,
-        attn=Attention.of(attention, qk_norm=qk_norm),
+        attn=_attention(layer),
         post_norm=layer.post_attention_layernorm,
         mlp=layer.mlp,
         layer_call=positions_first(layer),

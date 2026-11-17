@@ -44,9 +44,10 @@ from tests.blocks._report import Emit
 from tests.blocks.subblock_reach import guess_stream
 from vllm_torchtpu.blocks import BlockDeclaration
 from vllm_torchtpu.blocks.attn_moe.install import conform
-from vllm_torchtpu.blocks.attn_moe.pattern import AttnMoEBinding
+from vllm_torchtpu.blocks.attn_moe.pattern import AttnThenMoE
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
 from vllm_torchtpu.blocks.norm_attn.pattern import is_residual_norm
+from vllm_torchtpu.blocks.roles import Attention, MoE
 from vllm_torchtpu.blocks.stream import attend_with_positions, attend_without_positions
 
 
@@ -71,8 +72,8 @@ class Names:
     experts: str
 
 
-def _binding(names: Names) -> Callable[[nn.Module], AttnMoEBinding]:
-    def guessed(layer: nn.Module) -> AttnMoEBinding:
+def _roles(names: Names) -> Callable[[nn.Module], AttnThenMoE.Roles]:
+    def guessed(layer: nn.Module) -> AttnThenMoE.Roles:
         moe = layer.get_submodule(names.moe)
         attention = layer.get_submodule(names.attention)
         projections = [
@@ -81,20 +82,24 @@ def _binding(names: Names) -> Callable[[nn.Module], AttnMoEBinding]:
         parameters = inspect.signature(attention.forward).parameters
         # The survey reads the forward's parameter names.
         reads_positions = "positions" in parameters  # str-ok: a parameter name
-        return AttnMoEBinding(
-            input_norm=layer.get_submodule(names.input_norm),
-            attention=attention,
-            out_proj=projections[-1],
-            post_norm=layer.get_submodule(names.post_norm),
-            moe=moe,
-            router=moe.get_submodule(names.router),
-            experts=moe.get_submodule(names.experts),
-            stream=guess_stream(layer),
-            attend=(
-                attend_with_positions(attention)  # pyright: ignore[reportArgumentType]
-                if reads_positions
-                else attend_without_positions(attention)  # pyright: ignore[reportArgumentType]
+        return AttnThenMoE.Roles(
+            in_norm=layer.get_submodule(names.input_norm),
+            attn=Attention.opaque(
+                attention,
+                o_proj=projections[-1],
+                call=(
+                    attend_with_positions(attention)  # pyright: ignore[reportArgumentType]
+                    if reads_positions
+                    else attend_without_positions(attention)  # pyright: ignore[reportArgumentType]
+                ),
             ),
+            post_norm=layer.get_submodule(names.post_norm),
+            moe=MoE(
+                module=moe,
+                router=moe.get_submodule(names.router),
+                experts=moe.get_submodule(names.experts),
+            ),
+            layer_call=guess_stream(layer),
         )
 
     return guessed
@@ -130,7 +135,7 @@ def propose(layer: nn.Module) -> tuple[BlockDeclaration, Names] | str:
             router=found[0],
             experts=found[1],
         )
-        declaration = BlockDeclaration.of(type(layer), _binding(names))
+        declaration = AttnThenMoE.declaration(type(layer), _roles(names))
         try:
             with set_current_vllm_config(_build.current_config()):
                 conform(layer, declaration)
@@ -164,15 +169,16 @@ def suggest(spec: _build.Spec, emit: Emit) -> Suggestion:
         emit(f"  {found}")
         return Suggestion.DECLINES
     _, n = found
-    emit(f"  @declare_block({spec.layer_class})")
-    emit(f"  def block(layer: {spec.layer_class}) -> AttnMoEBinding:")
-    emit("      return AttnMoEBinding(")
-    emit(f"          input_norm=layer.{n.input_norm},")
-    emit(f"          attention=layer.{n.attention},")
+    emit(f"  @AttnThenMoE.register({spec.layer_class})")
+    emit(f"  def block(layer: {spec.layer_class}) -> AttnThenMoE.Roles:")
+    emit("      return AttnThenMoE.Roles(")
+    emit(f"          in_norm=layer.{n.input_norm},")
+    emit(f"          attn=Attention.opaque(layer.{n.attention}, ...),")
     emit(f"          post_norm=layer.{n.post_norm},")
-    emit(f"          moe=layer.{n.moe},")
-    emit(f"          router=layer.{n.moe}.{n.router},")
-    emit(f"          experts=layer.{n.moe}.{n.experts},")
+    emit(f"          moe=MoE(module=layer.{n.moe},")
+    emit(f"                  router=layer.{n.moe}.{n.router},")
+    emit(f"                  experts=layer.{n.moe}.{n.experts}),")
+    emit("          layer_call=...,")
     emit("      )")
     return Suggestion.CONFORMS
 

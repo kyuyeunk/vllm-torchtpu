@@ -17,8 +17,9 @@ A pattern names its roles in its reference forward (``in_norm``, ``attn``,
 ``post_norm``, ...). A model owner's declaration returns the pattern's
 ``Roles`` dataclass, whose top-level fields carry exactly those names. A role
 that needs more than one module states the rest under its own name:
-``Attention`` carries attention's parts and how the layer calls it, so the
-declaration reads like the pattern, one keyword per role.
+``Attention`` carries attention's parts and how the layer calls it, and
+``MoE`` the router and experts, so the declaration reads like the pattern,
+one keyword per role.
 """
 
 import dataclasses
@@ -26,9 +27,11 @@ from typing import Protocol, Self
 
 import torch
 from torch import nn
+from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.linear import RowParallelLinear
 
 from vllm_torchtpu.blocks.binding import BlockBinding
+from vllm_torchtpu.blocks.calls import Experts, Router
 from vllm_torchtpu.blocks.stream import Attend, attend_with_positions
 
 
@@ -140,3 +143,41 @@ class Attention:
     ) -> Self:
         """A role that states only the module, its output projection and its call."""
         return cls(module=module, o_proj=o_proj, call=call)
+
+
+class RoutedMoE(Protocol):
+    """A MoE module with vLLM's usual part names."""
+
+    @property
+    def gate(self) -> GateLinear:
+        """The part's ``gate`` (the router)."""
+        ...
+
+    @property
+    def experts(self) -> nn.Module:
+        """The part's ``experts`` (the MoE runner)."""
+        ...
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class MoE:
+    """The ``moe`` role: the MoE module, its router and its experts.
+
+    Attributes:
+        module: The MoE module the layer calls.
+        router: The router, returning logits (a ``GateLinear``).
+        experts: The MoE runner, taking ``(hidden_states, router_logits)``.
+    """
+
+    module: nn.Module
+    router: Router
+    experts: Experts
+
+    @classmethod
+    def of(cls, module: RoutedMoE) -> Self:
+        """The role of a MoE module with vLLM's usual part names."""
+        return cls(
+            module=module,  # pyright: ignore[reportArgumentType] - a Protocol over an nn.Module
+            router=module.gate,
+            experts=module.experts,
+        )

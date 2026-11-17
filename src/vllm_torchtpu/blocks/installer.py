@@ -51,14 +51,23 @@ def install(model: nn.Module, context: InstallContext) -> list[Installed]:
         cls = type(module)
         try:
             declared = [d for d in declarations_for(cls) if d.when(module)]
+            patterns = {d.pattern for d in declared}
+            # Where the layer is declared for a block and a sub-block it nests,
+            # the block builds the sub-block from the span of its own roles.
+            nested = {
+                span.pattern: span
+                for d in declared
+                for span in d.spans
+                if span.pattern in patterns
+                and span.pattern in IMPLEMENTATIONS[d.pattern].nests
+                and span.when(module)
+            }
         except BlockConformanceError as e:
             msg = f"{name} ({cls.__qualname__}): {e}"
             raise BlockConformanceError(msg) from e
-        inner = {p for d in declared for p in IMPLEMENTATIONS[d.pattern].nests}
-        nested = {d.pattern: d for d in declared if d.pattern in inner}
         for declaration in declared:
-            if declaration.pattern in inner:
-                continue  # The enclosing pattern's installer builds it.
+            if declaration.pattern in nested:
+                continue  # The enclosing block builds it from its span.
             impl = IMPLEMENTATIONS[declaration.pattern]
             try:
                 report.append(impl.install(name, module, declaration, context, nested))

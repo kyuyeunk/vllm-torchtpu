@@ -17,10 +17,11 @@ Ownership is split at the declaration:
 
 - **The model owner declares.** In the model's own directory
   (``models/<family>/<model>/registration.py``, the only place a model's
-  identity appears) a binding function decorated with ``declare_block``
-  takes a decoder layer and returns the pattern's binding dataclass, built by
-  typed attribute access, or None where the layer does not conform. The
-  return type names the pattern; the type checker checks the attributes.
+  identity appears) a function decorated with ``@Pattern.register(Layer)``
+  (``BlockPattern.register``) takes a decoder layer and returns the
+  pattern's ``Roles``, one keyword per role of the pattern's reference
+  forward, built by typed attribute access, or None where the layer does not
+  conform. The type checker checks the attributes.
 - **The framework runs what is declared.** The pattern, the conformance
   check, the block plan, the child-contract adapter and the block forward
   live here, in a shared package. A declaration that does not conform fails
@@ -33,21 +34,19 @@ bucket, and installs the block's forward where the plan needs it. Layers
 whose plan is the default are left as upstream built them.
 
 Scopes nest, so one decoder class may declare several patterns: a block
-(``attn_then_moe``) and a sub-block inside it (``norm_then_attention``). An
-implementation lists the patterns it nests (``nests``); where a layer declares
-both, the outer one receives the inner declaration and builds the inner
-runner itself, with the contract it needs, so the inner installer never runs
-on that layer.
+(``AttnThenMoE``) and a sub-block over a span of its roles
+(``NormThenAttention``, the span ``in_norm, attn``). Where a layer is
+declared for both, the block builds the sub-block from that span of its own
+roles (``BlockPattern.spans``), with the contract it needs, so the inner
+installer never runs on that layer.
 """
 
 import dataclasses
 import functools
 import importlib
 import importlib.machinery
-import inspect
 import pathlib
 import pkgutil
-import typing
 from collections.abc import Callable
 from typing import ClassVar, cast
 
@@ -70,35 +69,17 @@ class BlockDeclaration:
 
     Attributes:
         layer_class: The decoder layer class, matched exactly.
-        pattern: The pattern's reference forward, read off the binding
-            function's binding type.
-        binding_of: The binding function.
+        pattern: The pattern's reference forward (``BlockPattern.reference``).
+        binding_of: The model owner's function, turned into the runner's
+            binding (``BlockPattern.declaration``).
+        spans: Declarations of sub-blocks over a span of this pattern's roles,
+            derived from the same declaration (``BlockPattern.spans``).
     """
 
     layer_class: type
     pattern: Pattern
     binding_of: Binding
-
-    @classmethod
-    def of[L: nn.Module](
-        cls, layer_class: type[L], binding_of: Callable[[L], BlockBinding | None]
-    ) -> "BlockDeclaration":
-        """The declaration ``binding_of`` makes; its return type names the pattern."""
-        signature = inspect.signature(binding_of, eval_str=True)
-        returns = cast("object", signature.return_annotation)  # inspect types it Any
-        kinds = [
-            t
-            for t in typing.get_args(returns) or (returns,)
-            if isinstance(t, type) and issubclass(t, BlockBinding)
-        ]
-        if len(kinds) != 1:
-            msg = (
-                f"{binding_of.__qualname__} must return one BlockBinding dataclass "
-                f"(or None), not {returns}"
-            )
-            raise TypeError(msg)
-        # Called only on instances of ``layer_class``.
-        return cls(layer_class, kinds[0].pattern, cast("Binding", binding_of))
+    spans: tuple["BlockDeclaration", ...] = ()
 
     def binding(self, layer: nn.Module) -> BlockBinding | None:
         """The layer's binding, or None where the declaration does not cover it.
@@ -186,7 +167,18 @@ class BlockPattern:
                 raise TypeError(msg)
             return roles.binding()
 
-        return BlockDeclaration(layer_class, cls.reference, binding_of)
+        spans = cls.spans(layer_class, read)
+        return BlockDeclaration(layer_class, cls.reference, binding_of, spans)
+
+    @classmethod
+    def spans(
+        cls,
+        layer_class: type,
+        roles_of: Callable[[nn.Module], BlockRoles | None],
+    ) -> tuple[BlockDeclaration, ...]:
+        """Sub-blocks this pattern derives from a span of its roles; none by default."""
+        del layer_class, roles_of
+        return ()
 
     @classmethod
     def register[L: nn.Module, R: BlockRoles](
@@ -210,31 +202,6 @@ class BlockPattern:
             return roles_of
 
         return decorate
-
-
-def declare_block[L: nn.Module, P: BlockBinding](
-    layer_class: type[L],
-) -> Callable[[Callable[[L], P | None]], Callable[[L], P | None]]:
-    """Declares a binding function for ``layer_class`` (the model owner's API).
-
-    The function takes the layer, typed as ``layer_class``, so its attribute
-    reads are type-checked against the model's class, and returns the
-    pattern's binding dataclass, or None where the layer does not conform.
-    """
-
-    def register(binding_of: Callable[[L], P | None]) -> Callable[[L], P | None]:
-        declaration = BlockDeclaration.of(layer_class, binding_of)
-        key = (layer_class, declaration.pattern)
-        if key in DECLARATIONS:
-            msg = (
-                f"{layer_class.__qualname__} is already declared for "
-                f"{declaration.pattern.__name__}"
-            )
-            raise ValueError(msg)
-        DECLARATIONS[key] = declaration
-        return binding_of
-
-    return register
 
 
 def load_declarations() -> None:

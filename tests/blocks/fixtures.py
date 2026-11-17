@@ -28,8 +28,9 @@ import torch
 from torch import nn
 from vllm.model_executor.layers.linear import RowParallelLinear
 
-from vllm_torchtpu.blocks.attn_moe.pattern import AttnMoEBinding
+from vllm_torchtpu.blocks.attn_moe.pattern import AttnThenMoE
 from vllm_torchtpu.blocks.binding import as_kind
+from vllm_torchtpu.blocks.roles import Attention, MoE
 from vllm_torchtpu.blocks.stream import attend_with_positions, hidden_residual_positions
 
 
@@ -87,16 +88,20 @@ class DeadBranchAndView(_Children):  # noqa: D101 - ditto
         return self.ffn(hidden_states), residual
 
 
-def renamed_binding(layer: _Children) -> AttnMoEBinding:
-    """The fixtures' binding function: the same binding under the new names."""
-    return AttnMoEBinding(
-        input_norm=layer.pre_norm,
-        attention=layer.mixer,
-        out_proj=as_kind(layer.mixer.get_submodule("o_proj"), RowParallelLinear),
+def renamed_roles(layer: _Children) -> AttnThenMoE.Roles:
+    """The fixtures' declaration: the same roles under the new names."""
+    return AttnThenMoE.Roles(
+        in_norm=layer.pre_norm,
+        attn=Attention.opaque(
+            layer.mixer,
+            o_proj=as_kind(layer.mixer.get_submodule("o_proj"), RowParallelLinear),
+            call=attend_with_positions(layer.mixer),  # pyright: ignore[reportArgumentType]
+        ),
         post_norm=layer.mid_norm,
-        moe=layer.ffn,
-        router=layer.ffn.get_submodule("gate"),
-        experts=layer.ffn.get_submodule("experts"),
-        stream=hidden_residual_positions(layer),  # pyright: ignore[reportArgumentType]
-        attend=attend_with_positions(layer.mixer),  # pyright: ignore[reportArgumentType]
+        moe=MoE(
+            module=layer.ffn,
+            router=layer.ffn.get_submodule("gate"),
+            experts=layer.ffn.get_submodule("experts"),
+        ),
+        layer_call=hidden_residual_positions(layer),  # pyright: ignore[reportArgumentType]
     )

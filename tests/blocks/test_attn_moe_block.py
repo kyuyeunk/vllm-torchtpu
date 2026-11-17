@@ -22,6 +22,8 @@ writes. Execution numerics and the collective order are
 ``test_attn_moe_runner.py``'s job (model-free).
 """
 
+import dataclasses
+
 import pytest
 import torch
 from torch import nn
@@ -40,6 +42,7 @@ from vllm_torchtpu.blocks.attn_moe.runner import AttnMoERunner, ModelAttention
 from vllm_torchtpu.blocks.binding import as_kind
 from vllm_torchtpu.blocks.context import InstallContext
 from vllm_torchtpu.blocks.norm_attn import install as norm_attn
+from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnBinding, norm_then_attention
 from vllm_torchtpu.blocks.norm_attn.runner import AttentionRunner
 from vllm_torchtpu.blocks.stream import routed_runner
 
@@ -63,8 +66,8 @@ def test_every_declaration_conforms(spec: _build.Spec) -> None:
 def test_mismatch_stops_startup(monkeypatch: pytest.MonkeyPatch) -> None:
     """A declared layer that does not conform is a startup error."""
     layer = fixtures.ReorderedNorms(_build.build(_build.SPECS[0]))
-    declaration = blocks.BlockDeclaration.of(
-        fixtures.ReorderedNorms, fixtures.renamed_binding
+    declaration = pattern_mod.AttnThenMoE.declaration(
+        fixtures.ReorderedNorms, fixtures.renamed_roles
     )
     monkeypatch.setitem(
         blocks.DECLARATIONS,
@@ -108,6 +111,41 @@ def _block_runner(layer: nn.Module) -> AttnMoERunner:
     runner = routed_runner(layer)
     assert isinstance(runner, AttnMoERunner)
     return runner
+
+
+@pytest.mark.parametrize("spec", [QWEN3_5_FULL, GLM], ids=lambda s: s.name)
+def test_block_span_states_the_sub_block(spec: _build.Spec) -> None:
+    """The block's span ``in_norm, attn`` gives the sub-block's parts.
+
+    The model's own NormThenAttention declaration and the block's span name
+    the same modules, so the block needs no second statement of them.
+    """
+    layer = _build.build(spec)
+    blocks.load_declarations()
+    block = blocks.DECLARATIONS[(type(layer), pattern_mod.attn_then_moe)]
+    sub = blocks.DECLARATIONS[(type(layer), norm_then_attention)]
+    (span,) = block.spans
+    assert span.pattern is norm_then_attention
+    from_span, from_sub = span.binding(layer), sub.binding(layer)
+    assert isinstance(from_span, NormAttnBinding)
+    assert isinstance(from_sub, NormAttnBinding)
+    for field in dataclasses.fields(NormAttnBinding):
+        if field.name in {"mlp", "stream", "attend"}:
+            continue  # The rest of the layer, and two call adapters.
+        assert getattr(from_span, field.name) is getattr(from_sub, field.name), (
+            field.name
+        )
+    assert from_span.mlp is layer.get_submodule("mlp")
+
+
+def test_opaque_attention_has_no_span() -> None:
+    """A Gated DeltaNet layer states only its output projection: no sub-block."""
+    layer = _build.build(QWEN3_5_LINEAR)
+    blocks.load_declarations()
+    block = blocks.DECLARATIONS[(type(layer), pattern_mod.attn_then_moe)]
+    (span,) = block.spans
+    assert block.when(layer)
+    assert not span.when(layer)
 
 
 @pytest.mark.parametrize("spec", [QWEN3_5_FULL, GLM], ids=lambda s: s.name)

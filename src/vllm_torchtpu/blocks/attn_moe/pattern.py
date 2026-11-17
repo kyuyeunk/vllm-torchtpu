@@ -14,11 +14,12 @@
 """The attn_then_moe pattern: a reference forward and what each role must be.
 
 Framework-owned. A model owner declares that a decoder layer conforms to this
-pattern with a binding function returning ``AttnMoEBinding`` (``declare_block``).
-The conformance check then holds the layer to two things:
+pattern with ``@AttnThenMoE.register``, returning ``AttnThenMoE.Roles``. The
+conformance check then holds the layer to two things:
 
 - **Kinds.** Each part is what its field says (``AttnMoEBinding.problems``, run
-  when the binding are built): two RMSNorm-family norms called with a residual;
+  when the roles become the runner's binding): two RMSNorm-family norms
+  called with a residual;
   an attention child holding an attention layer and ending in a
   ``RowParallelLinear`` to the hidden size; a MoE child owning the MoE runner
   and the ``GateLinear`` router.
@@ -28,8 +29,9 @@ The conformance check then holds the layer to two things:
 """
 
 import dataclasses
+import functools
 from collections.abc import Callable
-from typing import ClassVar, Protocol, override
+from typing import ClassVar, override
 
 import torch
 from torch import nn
@@ -37,10 +39,12 @@ from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.linear import RowParallelLinear
 
+from vllm_torchtpu.blocks import BlockDeclaration, BlockPattern, Pattern
 from vllm_torchtpu.blocks.attn_moe.plan import BlockKey, MoEPath, RouterMode
 from vllm_torchtpu.blocks.attn_moe.runner import MoEBinding
 from vllm_torchtpu.blocks.binding import BlockBinding, as_kind
-from vllm_torchtpu.blocks.norm_attn.pattern import is_residual_norm
+from vllm_torchtpu.blocks.norm_attn.pattern import NormThenAttention, is_residual_norm
+from vllm_torchtpu.blocks.roles import Attention, BlockRoles, MoE
 from vllm_torchtpu.blocks.stream import Attend, Stream
 
 Norm = Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
@@ -179,52 +183,77 @@ class AttnMoEBinding(MoEBinding, BlockBinding):
         return problems
 
 
-class RoutedMoE(Protocol):
-    """A MoE child with vLLM's usual part names."""
+class AttnThenMoE(BlockPattern):
+    """PR 1492's block: norm, attention, norm, MoE, on the residual stream.
 
-    @property
-    def gate(self) -> GateLinear:
-        """The part's ``gate``."""
-        ...
+    The block's plan chooses its collectives (all-reduce, or the overlap).
+    Its span ``in_norm, attn`` is PR 3096's sub-block (``NormThenAttention``):
+    where a layer class is declared for both, the block builds the sub-block
+    from that span of its own roles, so one declaration states the parts once.
+    """
 
-    @property
-    def experts(self) -> nn.Module:
-        """The part's ``experts``."""
-        ...
+    reference: ClassVar[Pattern] = attn_then_moe
 
+    @dataclasses.dataclass(frozen=True, kw_only=True)
+    class Roles(BlockRoles):
+        """One keyword per role of ``attn_then_moe``.
 
-class PreNormMoELayer(Protocol):
-    """A pre-norm decoder layer with vLLM's usual child names (attention aside)."""
+        Attributes:
+            in_norm: The input RMSNorm, called as ``(x, residual)``.
+            attn: The attention role (``Attention.of``, or ``Attention.opaque``
+                where no sub-block fuses inside it).
+            post_norm: The post-attention RMSNorm.
+            moe: The MoE role (``MoE.of``).
+            layer_call: How the layer's forward is called and read.
+        """
 
-    @property
-    def input_layernorm(self) -> nn.Module:
-        """The part's ``input_layernorm``."""
-        ...
+        in_norm: nn.Module
+        attn: Attention
+        post_norm: nn.Module
+        moe: MoE
+        layer_call: Stream
 
-    @property
-    def post_attention_layernorm(self) -> nn.Module:
-        """The part's ``post_attention_layernorm``."""
-        ...
+        @override
+        def binding(self) -> AttnMoEBinding:
+            return AttnMoEBinding(
+                input_norm=self.in_norm,
+                attention=self.attn.module,
+                out_proj=self.attn.o_proj,
+                post_norm=self.post_norm,
+                moe=self.moe.module,
+                router=self.moe.router,
+                experts=self.moe.experts,
+                stream=self.layer_call,
+                attend=self.attn.call,
+            )
 
+        def norm_attn(self) -> NormThenAttention.Roles | None:
+            """The sub-block's roles over the span ``in_norm, attn``, if any.
 
-def pre_norm_moe_binding(  # noqa: PLR0913 - one argument per declared part
-    layer: PreNormMoELayer,
-    attention: nn.Module,
-    out_proj: RowParallelLinear,
-    moe: RoutedMoE,
-    *,
-    stream: Stream,
-    attend: Attend,
-) -> AttnMoEBinding:
-    """The binding of a layer, its attention and its MoE, under vLLM's usual names."""
-    return AttnMoEBinding(
-        input_norm=layer.input_layernorm,
-        attention=attention,
-        out_proj=out_proj,
-        post_norm=layer.post_attention_layernorm,
-        moe=moe,  # pyright: ignore[reportArgumentType] - a Protocol over an nn.Module
-        router=moe.gate,
-        experts=moe.experts,
-        stream=stream,
-        attend=attend,
-    )
+            None where ``attn`` is opaque: it states no parts to compose.
+            """
+            if self.attn.qkv_proj is None:
+                return None
+            return NormThenAttention.Roles(
+                in_norm=self.in_norm,
+                attn=self.attn,
+                post_norm=self.post_norm,
+                mlp=self.moe.module,
+                layer_call=self.layer_call,
+            )
+
+    @override
+    @classmethod
+    def spans(
+        cls,
+        layer_class: type,
+        roles_of: Callable[[nn.Module], BlockRoles | None],
+    ) -> tuple[BlockDeclaration, ...]:
+        roles_type = cls.Roles
+
+        @functools.wraps(roles_of)
+        def norm_attn_of(layer: nn.Module) -> NormThenAttention.Roles | None:
+            roles = roles_of(layer)
+            return roles.norm_attn() if isinstance(roles, roles_type) else None
+
+        return (NormThenAttention.declaration(layer_class, norm_attn_of),)

@@ -46,6 +46,7 @@ from vllm_torchtpu.blocks.attn_moe import plan as plan_mod
 from vllm_torchtpu.blocks.attn_moe.install import apply_block, conform
 from vllm_torchtpu.blocks.attn_moe.pattern import (
     AttnMoEBinding,
+    AttnThenMoE,
     attn_then_moe,
     block_key,
 )
@@ -82,12 +83,12 @@ def _cases() -> list[tuple[str, nn.Module, BlockDeclaration, bool]]:
         (fixtures.DeadBranchAndView, True),
     ):
         layer = cls(_build.build(full))
-        declaration = BlockDeclaration.of(cls, fixtures.renamed_binding)
+        declaration = AttnThenMoE.declaration(cls, fixtures.renamed_roles)
         cases.append((f"fixture {cls.__name__}", layer, declaration, expect))
     if PLANT_MISMATCH:
         layer = fixtures.ReorderedNorms(_build.build(full))
-        declaration = BlockDeclaration.of(
-            fixtures.ReorderedNorms, fixtures.renamed_binding
+        declaration = AttnThenMoE.declaration(
+            fixtures.ReorderedNorms, fixtures.renamed_roles
         )
         cases.append(("declared ReorderedNorms (planted)", layer, declaration, True))
     return cases
@@ -171,8 +172,8 @@ def mismatch_raises(emit: Emit) -> list[str]:
     """A declaration that does not conform stops startup."""
     layer = fixtures.ReorderedNorms(_build.build(_build.SPECS[0]))
     key = (fixtures.ReorderedNorms, attn_then_moe)
-    blocks.DECLARATIONS[key] = BlockDeclaration.of(
-        fixtures.ReorderedNorms, fixtures.renamed_binding
+    blocks.DECLARATIONS[key] = AttnThenMoE.declaration(
+        fixtures.ReorderedNorms, fixtures.renamed_roles
     )
     context = InstallContext(
         tp=4,
