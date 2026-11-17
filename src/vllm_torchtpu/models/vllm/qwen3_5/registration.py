@@ -25,7 +25,8 @@ from vllm.model_executor.models.qwen3_next import Qwen3NextSparseMoeBlock
 
 from vllm_torchtpu.blocks import declare_block
 from vllm_torchtpu.blocks.attn_moe.pattern import AttnMoEBinding, pre_norm_moe_binding
-from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnBinding, pre_norm_binding
+from vllm_torchtpu.blocks.norm_attn.pattern import NormThenAttention
+from vllm_torchtpu.blocks.roles import Attention
 from vllm_torchtpu.blocks.stream import (
     attend_with_positions,
     attend_without_positions,
@@ -60,16 +61,20 @@ def qwen3_5_block(layer: Qwen3_5DecoderLayer) -> AttnMoEBinding | None:
     )
 
 
-@declare_block(Qwen3_5DecoderLayer)
-def qwen3_5_attention(layer: Qwen3_5DecoderLayer) -> NormAttnBinding | None:
+@NormThenAttention.register(Qwen3_5DecoderLayer)
+def qwen3_5_attention(layer: Qwen3_5DecoderLayer) -> NormThenAttention.Roles | None:
     """The pre-norm attention sub-block, on full-attention layers."""
     if layer.layer_type != "full_attention":  # str-ok: the model's own layer_type
         return None
     attention = layer.self_attn
-    return pre_norm_binding(
-        layer,
-        attention,
-        qk_norm=(attention.q_norm, attention.k_norm),
-        output_gate=attention.attn_output_gate,
-        stream=hidden_residual_positions(layer),
+    return NormThenAttention.Roles(
+        in_norm=layer.input_layernorm,
+        attn=Attention.of(
+            attention,
+            qk_norm=(attention.q_norm, attention.k_norm),
+            output_gate=attention.attn_output_gate,
+        ),
+        post_norm=layer.post_attention_layernorm,
+        mlp=layer.mlp,
+        layer_call=hidden_residual_positions(layer),
     )

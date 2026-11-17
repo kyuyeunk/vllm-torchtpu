@@ -13,10 +13,10 @@
 # limitations under the License.
 """The norm_then_attention sub-block: a reference forward and its role kinds.
 
-Framework-owned. A pre-norm decoder layer runs ``input_norm(hidden, residual)``
+Framework-owned. A pre-norm decoder layer runs ``in_norm(hidden, residual)``
 and then attention on the normed tokens; every model that does so can declare
-that its layer conforms, and every fusion written against this pattern's
-roles then serves it with no per-model code.
+that its layer conforms (``@NormThenAttention.register``), and every fusion
+written against this pattern's roles then serves it with no per-model code.
 
 The sub-block is checked in context: the rest of the layer (the second norm
 and the MLP, dense or MoE) is opaque, so the check holds the layer to the
@@ -26,7 +26,7 @@ It is the front half of ``attn_then_moe``; the two plans nest by scope.
 
 import dataclasses
 from collections.abc import Callable
-from typing import ClassVar, Protocol, override
+from typing import ClassVar, override
 
 import torch
 from torch import nn
@@ -34,10 +34,12 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
 
-from vllm_torchtpu.blocks import calls
+from vllm_torchtpu.blocks import BlockPattern, Pattern, calls
 from vllm_torchtpu.blocks.binding import BlockBinding, as_kind
+from vllm_torchtpu.blocks.conformance import BlockConformanceError
 from vllm_torchtpu.blocks.norm_attn.runner import AttentionBinding
-from vllm_torchtpu.blocks.stream import Attend, Stream, attend_with_positions
+from vllm_torchtpu.blocks.roles import Attention, BlockRoles
+from vllm_torchtpu.blocks.stream import Attend, Stream
 
 Norm = Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
 Op = Callable[[torch.Tensor], torch.Tensor]
@@ -147,80 +149,81 @@ class NormAttnBinding(AttentionBinding, BlockBinding):
         return problems
 
 
-class PreNormAttention(Protocol):
-    """An attention module with vLLM's usual part names, called by keyword."""
-
-    def forward(
-        self, *, positions: torch.Tensor, hidden_states: torch.Tensor
-    ) -> torch.Tensor:
-        """The call the runner makes."""
-        ...
-
-    @property
-    def qkv_proj(self) -> nn.Module:
-        """The part's ``qkv_proj``."""
-        ...
-
-    @property
-    def attn(self) -> nn.Module:
-        """The part's ``attn``."""
-        ...
-
-    @property
-    def o_proj(self) -> RowParallelLinear:
-        """The part's ``o_proj``."""
-        ...
-
-    @property
-    def rotary_emb(self) -> nn.Module:
-        """The part's ``rotary_emb``."""
-        ...
-
-
-class PreNormLayer(Protocol):
-    """A pre-norm decoder layer with vLLM's usual child names (attention aside)."""
-
-    @property
-    def input_layernorm(self) -> nn.Module:
-        """The part's ``input_layernorm``."""
-        ...
-
-    @property
-    def post_attention_layernorm(self) -> nn.Module:
-        """The part's ``post_attention_layernorm``."""
-        ...
-
-    @property
-    def mlp(self) -> nn.Module:
-        """The part's ``mlp``."""
-        ...
-
-
-def pre_norm_binding(
-    layer: PreNormLayer,
-    attention: PreNormAttention,
+def norm_attn_binding(
     *,
-    qk_norm: tuple[nn.Module, nn.Module] | None,
-    output_gate: bool,
-    stream: Stream,
+    in_norm: nn.Module,
+    attn: Attention,
+    post_norm: nn.Module,
+    mlp: nn.Module,
+    layer_call: Stream,
 ) -> NormAttnBinding:
-    """The binding of a layer and attention that use vLLM's usual names.
+    """The runner's binding for the span ``in_norm, attn`` and the layer's rest.
 
-    Per-head q/k norms are optional in vLLM's attentions, so the binding
-    function states them (``qk_norm``); every part is typed attribute access.
+    Shared by ``NormThenAttention`` and by a block that nests the sub-block
+    over the same span (``AttnThenMoE``, where the rest is its MoE).
+
+    Raises:
+        BlockConformanceError: ``attn`` is opaque (``Attention.opaque``), so
+            the sub-block has no parts to compose.
     """
+    if attn.qkv_proj is None or attn.core is None or attn.rotary is None:
+        msg = (
+            f"attn={type(attn.module).__name__} is declared opaque "
+            "(Attention.opaque), so norm_then_attention has no parts to compose"
+        )
+        raise BlockConformanceError(msg)
     return NormAttnBinding(
-        input_norm=layer.input_layernorm,
-        qkv_proj=attention.qkv_proj,
-        attn=attention.attn,
-        o_proj=attention.o_proj,
-        rotary=attention.rotary_emb,
-        q_norm=None if qk_norm is None else qk_norm[0],
-        k_norm=None if qk_norm is None else qk_norm[1],
-        attention=attention,  # pyright: ignore[reportArgumentType] - a Protocol over an nn.Module
-        post_norm=layer.post_attention_layernorm,
-        mlp=layer.mlp,
-        output_gate=output_gate,
-        stream=stream,
-        attend=attend_with_positions(attention),
+        input_norm=in_norm,
+        qkv_proj=attn.qkv_proj,
+        attn=attn.core,
+        o_proj=attn.o_proj,
+        rotary=attn.rotary,
+        q_norm=attn.q_norm,
+        k_norm=attn.k_norm,
+        attention=attn.module,
+        post_norm=post_norm,
+        mlp=mlp,
+        output_gate=attn.output_gate,
+        stream=layer_call,
+        attend=attn.call,
     )
+
+
+class NormThenAttention(BlockPattern):
+    """#3096's sub-block: the input norm, then attention, in a pre-norm layer.
+
+    The sub-block is the span ``in_norm, attn``. ``reference`` is the layer's
+    whole forward with the rest (``post_norm``, ``mlp``) opaque, so
+    conformance can trace the layer as it is; the runner replaces only the
+    span.
+    """
+
+    reference: ClassVar[Pattern] = norm_then_attention
+
+    @dataclasses.dataclass(frozen=True, kw_only=True)
+    class Roles(BlockRoles):
+        """One keyword per role of ``norm_then_attention``.
+
+        Attributes:
+            in_norm: The input RMSNorm, called as ``(x, residual)``.
+            attn: The attention role (``Attention.of``).
+            post_norm: The post-attention RMSNorm (opaque to the sub-block).
+            mlp: The rest of the layer (opaque to the sub-block).
+            layer_call: How the layer's forward is called and read.
+        """
+
+        in_norm: nn.Module
+        attn: Attention
+        post_norm: nn.Module
+        mlp: nn.Module
+        layer_call: Stream
+
+        @override
+        def binding(self) -> NormAttnBinding:
+            return norm_attn_binding(
+                in_norm=self.in_norm,
+                attn=self.attn,
+                post_norm=self.post_norm,
+                mlp=self.mlp,
+                layer_call=self.layer_call,
+            )

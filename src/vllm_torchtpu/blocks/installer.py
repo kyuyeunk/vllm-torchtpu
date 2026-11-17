@@ -18,20 +18,20 @@ import logging
 from torch import nn
 
 from vllm_torchtpu.blocks import Pattern, declarations_for, load_declarations
-from vllm_torchtpu.blocks.attn_moe.install import AttnThenMoE
+from vllm_torchtpu.blocks.attn_moe.install import AttnThenMoEInstall
 from vllm_torchtpu.blocks.attn_moe.pattern import attn_then_moe
 from vllm_torchtpu.blocks.binding import named_modules
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
 from vllm_torchtpu.blocks.context import BlockImplementation, InstallContext, Installed
-from vllm_torchtpu.blocks.norm_attn.install import NormThenAttention
+from vllm_torchtpu.blocks.norm_attn.install import NormThenAttentionInstall
 from vllm_torchtpu.blocks.norm_attn.pattern import norm_then_attention
 
 # vllm_torchtpu.logger's proxy resolves to vLLM's logger of this name.
 logger = logging.getLogger("vllm." + __name__)
 
 IMPLEMENTATIONS: dict[Pattern, BlockImplementation] = {
-    attn_then_moe: AttnThenMoE(),
-    norm_then_attention: NormThenAttention(),
+    attn_then_moe: AttnThenMoEInstall(),
+    norm_then_attention: NormThenAttentionInstall(),
 }
 """The framework's implementation of each pattern."""
 

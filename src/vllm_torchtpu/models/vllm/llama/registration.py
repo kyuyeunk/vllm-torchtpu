@@ -15,23 +15,23 @@
 
 from vllm.model_executor.models.llama import LlamaAttention, LlamaDecoderLayer
 
-from vllm_torchtpu.blocks import declare_block
 from vllm_torchtpu.blocks.binding import as_kind
-from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnBinding, pre_norm_binding
+from vllm_torchtpu.blocks.norm_attn.pattern import NormThenAttention
+from vllm_torchtpu.blocks.roles import Attention
 from vllm_torchtpu.blocks.stream import positions_first
 
 
-@declare_block(LlamaDecoderLayer)
-def llama_attention(layer: LlamaDecoderLayer) -> NormAttnBinding:
+@NormThenAttention.register(LlamaDecoderLayer)
+def llama_attention(layer: LlamaDecoderLayer) -> NormThenAttention.Roles:
     """The pre-norm attention sub-block (norm_then_attention).
 
     Llama builds ``self_attn`` from a class parameter (``attn_layer_type``),
-    so the binding names the class it covers.
+    so the declaration names the class it covers.
     """
-    return pre_norm_binding(
-        layer,
-        as_kind(layer.self_attn, LlamaAttention),
-        qk_norm=None,
-        output_gate=False,
-        stream=positions_first(layer),
+    return NormThenAttention.Roles(
+        in_norm=layer.input_layernorm,
+        attn=Attention.of(as_kind(layer.self_attn, LlamaAttention)),
+        post_norm=layer.post_attention_layernorm,
+        mlp=layer.mlp,
+        layer_call=positions_first(layer),
     )

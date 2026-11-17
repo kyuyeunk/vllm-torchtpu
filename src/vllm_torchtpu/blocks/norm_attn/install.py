@@ -400,7 +400,7 @@ def install_standalone(
     return Installed(name, type(layer).__qualname__, f"runner installed; {what}")
 
 
-class NormThenAttention:
+class NormThenAttentionInstall:
     """Conforms, resolves and installs one declared norm_then_attention layer.
 
     Inside a declared block that nests this pattern, the block's installer

@@ -14,7 +14,7 @@
 """Planted Llama layers for the sub-block's conformance check.
 
 Each reuses a built Llama layer's children and is declared
-``norm_then_attention`` with ``llama_binding``; neither conforms:
+``norm_then_attention`` with ``llama_roles``; neither conforms:
 
 - ``ScaledAttention``: scales attention's output before the second norm.
 - ``ScaledQueryAttention``: its attention scales q after RoPE
@@ -27,7 +27,8 @@ import torch
 from vllm.model_executor.models.llama import LlamaAttention, LlamaDecoderLayer
 
 from vllm_torchtpu.blocks.binding import as_kind
-from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnBinding, pre_norm_binding
+from vllm_torchtpu.blocks.norm_attn.pattern import NormThenAttention
+from vllm_torchtpu.blocks.roles import Attention
 from vllm_torchtpu.blocks.stream import positions_first
 
 
@@ -67,12 +68,12 @@ def scale_query(attn: LlamaAttention) -> None:
     attn.forward = forward  # The planted forward.
 
 
-def llama_binding(layer: LlamaDecoderLayer) -> NormAttnBinding:
-    """The planted layers' binding function (they reuse Llama's children)."""
-    return pre_norm_binding(
-        layer,
-        as_kind(layer.self_attn, LlamaAttention),
-        qk_norm=None,
-        output_gate=False,
-        stream=positions_first(layer),
+def llama_roles(layer: LlamaDecoderLayer) -> NormThenAttention.Roles:
+    """The planted layers' declaration (they reuse Llama's children)."""
+    return NormThenAttention.Roles(
+        in_norm=layer.input_layernorm,
+        attn=Attention.of(as_kind(layer.self_attn, LlamaAttention)),
+        post_norm=layer.post_attention_layernorm,
+        mlp=layer.mlp,
+        layer_call=positions_first(layer),
     )

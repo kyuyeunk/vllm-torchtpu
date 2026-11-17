@@ -41,6 +41,7 @@ on that layer.
 """
 
 import dataclasses
+import functools
 import importlib
 import importlib.machinery
 import inspect
@@ -48,12 +49,13 @@ import pathlib
 import pkgutil
 import typing
 from collections.abc import Callable
-from typing import cast
+from typing import ClassVar, cast
 
 from torch import nn
 
 from vllm_torchtpu.blocks.binding import BindingKindError, BlockBinding, attribute_of
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
+from vllm_torchtpu.blocks.roles import BlockRoles
 
 Pattern = Callable[..., object]
 """A pattern's reference forward, e.g. ``attn_then_moe``; it names the pattern."""
@@ -137,6 +139,77 @@ DECLARATIONS: dict[tuple[type, Pattern], BlockDeclaration] = {}
 def declarations_for(layer_class: type) -> list[BlockDeclaration]:
     """Every pattern ``layer_class`` is declared to conform to."""
     return [d for (cls, _), d in DECLARATIONS.items() if cls is layer_class]
+
+
+class BlockPattern:
+    """A pattern: its reference forward, and the roles a model declares for it.
+
+    Each pattern is a subclass that sets ``reference`` and defines a nested
+    ``Roles`` dataclass whose top-level fields are the reference's role names.
+    A model owner declares a layer class against it, as vLLM's
+    ``PluggableLayer.register_oot`` registers a layer::
+
+        @NormThenAttention.register(LlamaDecoderLayer)
+        def llama(layer: LlamaDecoderLayer) -> NormThenAttention.Roles:
+            return NormThenAttention.Roles(in_norm=..., attn=..., ...)
+
+    The function takes the layer, typed as its class, so the type checker
+    checks its attribute reads, and returns the pattern's ``Roles``, or None
+    where the layer does not conform.
+    """
+
+    reference: ClassVar[Pattern]
+    """The pattern's reference forward, with one keyword argument per role."""
+
+    Roles: ClassVar[type[BlockRoles]]
+    """The dataclass a declaration returns; its fields are the roles."""
+
+    @classmethod
+    def declaration[L: nn.Module](
+        cls, layer_class: type[L], roles_of: Callable[[L], BlockRoles | None]
+    ) -> BlockDeclaration:
+        """The declaration ``roles_of`` makes, without registering it."""
+        roles_type = cls.Roles
+        # Called only on instances of ``layer_class``.
+        read = cast("Callable[[nn.Module], BlockRoles | None]", roles_of)
+
+        @functools.wraps(roles_of)
+        def binding_of(layer: nn.Module) -> BlockBinding | None:
+            roles = read(layer)
+            if roles is None:
+                return None
+            if not isinstance(roles, roles_type):
+                msg = (
+                    f"{roles_of.__qualname__} returns {type(roles).__name__}, "
+                    f"not {cls.__name__}.Roles"
+                )
+                raise TypeError(msg)
+            return roles.binding()
+
+        return BlockDeclaration(layer_class, cls.reference, binding_of)
+
+    @classmethod
+    def register[L: nn.Module, R: BlockRoles](
+        cls, layer_class: type[L]
+    ) -> Callable[[Callable[[L], R | None]], Callable[[L], R | None]]:
+        """Declares that ``layer_class`` conforms to this pattern (model owner API).
+
+        Raises:
+            ValueError: ``layer_class`` is already declared for this pattern.
+        """
+
+        def decorate(roles_of: Callable[[L], R | None]) -> Callable[[L], R | None]:
+            declaration = cls.declaration(layer_class, roles_of)
+            key = (layer_class, declaration.pattern)
+            if key in DECLARATIONS:
+                msg = (
+                    f"{layer_class.__qualname__} is already declared for {cls.__name__}"
+                )
+                raise ValueError(msg)
+            DECLARATIONS[key] = declaration
+            return roles_of
+
+        return decorate
 
 
 def declare_block[L: nn.Module, P: BlockBinding](

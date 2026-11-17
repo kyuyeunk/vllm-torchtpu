@@ -255,7 +255,7 @@ def _all_default(table: plan_mod.BlockPlanTable) -> plan_mod.BlockPlanTable:
     )
 
 
-class AttnThenMoE:
+class AttnThenMoEInstall:
     """Conforms, resolves and installs one declared attn_then_moe layer.
 
     Where the layer also declares ``norm_then_attention``, the block builds

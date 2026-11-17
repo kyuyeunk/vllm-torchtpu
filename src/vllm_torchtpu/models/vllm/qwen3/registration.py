@@ -15,18 +15,19 @@
 
 from vllm.model_executor.models.qwen3 import Qwen3DecoderLayer
 
-from vllm_torchtpu.blocks import declare_block
-from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnBinding, pre_norm_binding
+from vllm_torchtpu.blocks.norm_attn.pattern import NormThenAttention
+from vllm_torchtpu.blocks.roles import Attention
 from vllm_torchtpu.blocks.stream import positions_first
 
 
-@declare_block(Qwen3DecoderLayer)
-def qwen3_attention(layer: Qwen3DecoderLayer) -> NormAttnBinding:
+@NormThenAttention.register(Qwen3DecoderLayer)
+def qwen3_attention(layer: Qwen3DecoderLayer) -> NormThenAttention.Roles:
     """The pre-norm attention sub-block (norm_then_attention)."""
-    return pre_norm_binding(
-        layer,
-        layer.self_attn,
-        qk_norm=(layer.self_attn.q_norm, layer.self_attn.k_norm),
-        output_gate=False,
-        stream=positions_first(layer),
+    attention = layer.self_attn
+    return NormThenAttention.Roles(
+        in_norm=layer.input_layernorm,
+        attn=Attention.of(attention, qk_norm=(attention.q_norm, attention.k_norm)),
+        post_norm=layer.post_attention_layernorm,
+        mlp=layer.mlp,
+        layer_call=positions_first(layer),
     )

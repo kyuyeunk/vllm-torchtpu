@@ -17,7 +17,8 @@ from vllm.model_executor.models.glm4_moe import Glm4MoE, Glm4MoeDecoderLayer
 
 from vllm_torchtpu.blocks import declare_block
 from vllm_torchtpu.blocks.attn_moe.pattern import AttnMoEBinding, pre_norm_moe_binding
-from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnBinding, pre_norm_binding
+from vllm_torchtpu.blocks.norm_attn.pattern import NormThenAttention
+from vllm_torchtpu.blocks.roles import Attention
 from vllm_torchtpu.blocks.stream import attend_with_positions, positions_first
 
 
@@ -37,15 +38,15 @@ def glm4_moe_block(layer: Glm4MoeDecoderLayer) -> AttnMoEBinding | None:
     )
 
 
-@declare_block(Glm4MoeDecoderLayer)
-def glm4_moe_attention(layer: Glm4MoeDecoderLayer) -> NormAttnBinding:
+@NormThenAttention.register(Glm4MoeDecoderLayer)
+def glm4_moe_attention(layer: Glm4MoeDecoderLayer) -> NormThenAttention.Roles:
     """The pre-norm attention sub-block (norm_then_attention), nested in the block."""
     attention = layer.self_attn
     qk_norm = (attention.q_norm, attention.k_norm) if attention.use_qk_norm else None
-    return pre_norm_binding(
-        layer,
-        attention,
-        qk_norm=qk_norm,
-        output_gate=False,
-        stream=positions_first(layer),
+    return NormThenAttention.Roles(
+        in_norm=layer.input_layernorm,
+        attn=Attention.of(attention, qk_norm=qk_norm),
+        post_norm=layer.post_attention_layernorm,
+        mlp=layer.mlp,
+        layer_call=positions_first(layer),
     )

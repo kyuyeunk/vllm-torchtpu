@@ -40,11 +40,11 @@ from vllm.config import set_current_vllm_config
 
 from tests.blocks import _build
 from tests.blocks._report import Emit
-from vllm_torchtpu.blocks import BlockDeclaration
 from vllm_torchtpu.blocks.conformance import BlockConformanceError
 from vllm_torchtpu.blocks.norm_attn import install as norm_attn
-from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnBinding
+from vllm_torchtpu.blocks.norm_attn.pattern import NormThenAttention
 from vllm_torchtpu.blocks.norm_attn.plan import facts_of, fused_qkv_supports
+from vllm_torchtpu.blocks.roles import Attention
 from vllm_torchtpu.blocks.stream import (
     Stream,
     attend_with_positions,
@@ -381,30 +381,33 @@ def _child(layer: nn.Module, *names: str) -> nn.Module:
     raise AttributeError(msg)
 
 
-def guess_binding(layer: nn.Module) -> NormAttnBinding:
-    """The binding under vLLM's usual names, for the survey (not a declaration).
+def guess_roles(layer: nn.Module) -> NormThenAttention.Roles:
+    """The roles under vLLM's usual names, for the survey (not a declaration).
 
-    A model owner's binding function reads its own class's attributes; the
-    survey runs over many classes, so it tries the common names.
+    A model owner's declaration reads its own class's attributes; the survey
+    runs over many classes, so it tries the common names.
     """
     attention = _child(layer, "self_attn", "attn")
     q_norm = getattr(attention, "q_norm", None)  # str-ok: the survey's guess
     k_norm = getattr(attention, "k_norm", None)  # str-ok: the survey's guess
     gate = getattr(attention, "attn_output_gate", False)  # str-ok: ditto
-    return NormAttnBinding(
-        input_norm=_child(layer, "input_layernorm"),
-        qkv_proj=_child(attention, "qkv_proj"),
-        attn=_child(attention, "attn"),
-        o_proj=_child(attention, "o_proj"),
-        rotary=_child(attention, "rotary_emb"),
-        q_norm=q_norm,
-        k_norm=k_norm,
-        attention=attention,
+    o_proj = _child(attention, "o_proj")
+    return NormThenAttention.Roles(
+        in_norm=_child(layer, "input_layernorm"),
+        attn=Attention(
+            module=attention,
+            o_proj=o_proj,  # pyright: ignore[reportArgumentType] - the survey's guess
+            call=attend_with_positions(attention),  # pyright: ignore[reportArgumentType]
+            qkv_proj=_child(attention, "qkv_proj"),
+            core=_child(attention, "attn"),
+            rotary=_child(attention, "rotary_emb"),
+            q_norm=q_norm,
+            k_norm=k_norm,
+            output_gate=bool(gate),
+        ),
         post_norm=_child(layer, "post_attention_layernorm"),
         mlp=_child(layer, "mlp", "block_sparse_moe", "feed_forward"),
-        output_gate=bool(gate),
-        stream=guess_stream(layer),
-        attend=attend_with_positions(attention),  # pyright: ignore[reportArgumentType]
+        layer_call=guess_stream(layer),
     )
 
 
@@ -440,14 +443,14 @@ def check(c: Candidate) -> tuple[Verdict, str]:
     except Exception as e:  # noqa: BLE001 - report why it does not build
         first = (str(e).splitlines() or [""])[0][:90]
         return Verdict.NOT_BUILDABLE, f"{type(e).__name__}: {first}"
-    declaration = BlockDeclaration.of(type(layer), guess_binding)
+    declaration = NormThenAttention.declaration(type(layer), guess_roles)
     try:
         with set_current_vllm_config(_build.current_config()):
             config = norm_attn.conform(layer, declaration).config
     except (BlockConformanceError, AttributeError) as e:
         return Verdict.DECLINES, str(e).split(", but ", 1)[-1][:110]
     # Capability on the model's real head sizes, which the layer was built with.
-    why = fused_qkv_supports(facts_of(guess_binding(layer), config))
+    why = fused_qkv_supports(facts_of(guess_roles(layer).binding(), config))
     serves = f"declines: {why}" if why else "can serve it"
     return Verdict.CONFORMS, f"fused_qkv: {serves}"
 

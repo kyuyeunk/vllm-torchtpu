@@ -41,7 +41,11 @@ from vllm_torchtpu.blocks.conformance import BlockConformanceError
 from vllm_torchtpu.blocks.context import InstallContext
 from vllm_torchtpu.blocks.norm_attn import install as norm_attn
 from vllm_torchtpu.blocks.norm_attn import plan as subblock_plan
-from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnBinding, norm_then_attention
+from vllm_torchtpu.blocks.norm_attn.pattern import (
+    NormAttnBinding,
+    NormThenAttention,
+    norm_then_attention,
+)
 from vllm_torchtpu.blocks.norm_attn.runner import (
     AttentionRunner,
     FusedCapability,
@@ -135,7 +139,7 @@ def test_nonconforming_layer_names_edge_and_line(planted: type, edge: str) -> No
         subblock_fixtures.scale_query(
             as_kind(layer.get_submodule("self_attn"), LlamaAttention)
         )
-    declaration = blocks.BlockDeclaration.of(planted, subblock_fixtures.llama_binding)
+    declaration = NormThenAttention.declaration(planted, subblock_fixtures.llama_roles)
     with (
         set_current_vllm_config(_build.current_config()),
         pytest.raises(
@@ -170,13 +174,14 @@ def test_part_of_the_wrong_kind_is_named_by_attribute() -> None:
     layer, _ = _declared(subblock_check.FAMILIES[0])
     _lone_q_norm(layer.get_submodule("self_attn"))
 
-    def lone(llama: LlamaDecoderLayer) -> NormAttnBinding:
-        binding = subblock_fixtures.llama_binding(llama)
+    def lone(llama: LlamaDecoderLayer) -> NormThenAttention.Roles:
+        roles = subblock_fixtures.llama_roles(llama)
         attention = llama.get_submodule("self_attn")
         q_norm = attention.get_submodule("q_norm")
-        return dataclasses.replace(binding, q_norm=q_norm, k_norm=None)
+        attn = dataclasses.replace(roles.attn, q_norm=q_norm, k_norm=None)
+        return dataclasses.replace(roles, attn=attn)
 
-    declaration = blocks.BlockDeclaration.of(LlamaDecoderLayer, lone)
+    declaration = NormThenAttention.declaration(LlamaDecoderLayer, lone)
     with pytest.raises(
         BlockConformanceError,
         match=r"q_norm=self_attn\.q_norm and k_norm come together",

@@ -52,7 +52,10 @@ from vllm_torchtpu.blocks.context import InstallContext
 from vllm_torchtpu.blocks.norm_attn import install as norm_attn
 from vllm_torchtpu.blocks.norm_attn import plan as subblock_plan
 from vllm_torchtpu.blocks.norm_attn import runner as runner_mod
-from vllm_torchtpu.blocks.norm_attn.pattern import norm_then_attention
+from vllm_torchtpu.blocks.norm_attn.pattern import (
+    NormThenAttention,
+    norm_then_attention,
+)
 from vllm_torchtpu.blocks.stream import routed_runner
 
 # Comment in to see CI fail: the planted layer becomes a declared model.
@@ -311,8 +314,8 @@ def _planted(planted_cls: type[nn.Module], where: str, emit: Emit) -> list[str]:
         subblock_fixtures.scale_query(
             as_kind(layer.get_submodule("self_attn"), LlamaAttention)
         )
-    declaration = blocks.BlockDeclaration.of(
-        planted_cls, subblock_fixtures.llama_binding
+    declaration = NormThenAttention.declaration(
+        planted_cls, subblock_fixtures.llama_roles
     )
     key = (planted_cls, norm_then_attention)
     blocks.DECLARATIONS[key] = declaration

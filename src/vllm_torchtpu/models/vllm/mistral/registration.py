@@ -15,23 +15,23 @@
 
 from vllm.model_executor.models.mistral import MistralAttention, MistralDecoderLayer
 
-from vllm_torchtpu.blocks import declare_block
 from vllm_torchtpu.blocks.binding import as_kind
-from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnBinding, pre_norm_binding
+from vllm_torchtpu.blocks.norm_attn.pattern import NormThenAttention
+from vllm_torchtpu.blocks.roles import Attention
 from vllm_torchtpu.blocks.stream import positions_first
 
 
-@declare_block(MistralDecoderLayer)
-def mistral_attention(layer: MistralDecoderLayer) -> NormAttnBinding:
+@NormThenAttention.register(MistralDecoderLayer)
+def mistral_attention(layer: MistralDecoderLayer) -> NormThenAttention.Roles:
     """The pre-norm attention sub-block (norm_then_attention).
 
     Mistral builds ``self_attn`` from Llama's class parameter
-    (``attn_layer_type=MistralAttention``), so the binding names the class.
+    (``attn_layer_type=MistralAttention``), so the declaration names the class.
     """
-    return pre_norm_binding(
-        layer,
-        as_kind(layer.self_attn, MistralAttention),
-        qk_norm=None,
-        output_gate=False,
-        stream=positions_first(layer),
+    return NormThenAttention.Roles(
+        in_norm=layer.input_layernorm,
+        attn=Attention.of(as_kind(layer.self_attn, MistralAttention)),
+        post_norm=layer.post_attention_layernorm,
+        mlp=layer.mlp,
+        layer_call=positions_first(layer),
     )
