@@ -24,7 +24,7 @@ knows how the layer calls its module.
 """
 
 import dataclasses
-from typing import Protocol, Self, cast
+from typing import Protocol, Self, cast, runtime_checkable
 
 import torch
 from torch import nn
@@ -37,6 +37,7 @@ from vllm_torchtpu.blocks.stream import (
     Attend,
     AttentionWithoutPositions,
     AttentionWithPositions,
+    Stream,
     attend_with_positions,
     attend_without_positions,
 )
@@ -46,13 +47,36 @@ class BlockRoles:
     """Base of every pattern's ``Roles`` dataclass.
 
     Subclasses are frozen keyword-only dataclasses whose fields are the
-    pattern's role names. ``binding`` turns them into what the pattern's
-    runner and conformance check take.
+    pattern's role names, plus ``layer_call``. ``binding`` turns them into
+    what the pattern's runner takes.
     """
+
+    layer_call: Stream  # pyright: ignore[reportUninitializedInstanceVariable] - each Roles dataclass sets it
+    """How the layer's forward is called and read."""
 
     def binding(self) -> BlockBinding:
         """The runner's binding, checked for kinds as it is built."""
         raise NotImplementedError
+
+
+@runtime_checkable
+class ModuleRole(Protocol):
+    """A role of several modules (``Attention``, ``MoE``): the one called."""
+
+    @property
+    def module(self) -> nn.Module:
+        """The module the layer calls for this role."""
+        ...
+
+
+@runtime_checkable
+class CalledRole(ModuleRole, Protocol):
+    """A role whose module the layer calls with more than the pattern passes."""
+
+    @property
+    def call(self) -> Attend:
+        """How the layer calls ``module``: the pattern's input and the positions."""
+        ...
 
 
 class PreNormAttention(Protocol):

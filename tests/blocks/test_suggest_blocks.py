@@ -44,7 +44,7 @@ _RECORDED: tuple[Suggestion | type[Exception], ...] = (
     Suggestion.DECLINES,  # Bailing-MoE
     Suggestion.DECLINES,  # Kimi-Linear (nvidia)
     Suggestion.DECLINES,  # Jamba (attention layer): no usual attention parts
-    TypeError,  # Jamba (Mamba layer): the stub does not bind output
+    Suggestion.DECLINES,  # Jamba (Mamba layer): its mixer takes an output buffer
     Suggestion.NOT_BUILT,  # Nemotron-H (MoE layer)
 )
 

@@ -53,6 +53,7 @@ _LIB.define("pair(Tensor x, Tensor residual, str role) -> (Tensor, Tensor)")  # 
 _LIB.define("unary(Tensor x, str role) -> Tensor")  # pyright: ignore[reportUnknownMemberType] - torch.library is untyped
 _LIB.define("binary(Tensor x, Tensor y, str role) -> Tensor")  # pyright: ignore[reportUnknownMemberType] - torch.library is untyped
 _LIB.define("project(Tensor x, int width, str role) -> Tensor")  # pyright: ignore[reportUnknownMemberType] - torch.library is untyped
+_LIB.define("output(Tensor[] xs, int index, str role) -> Tensor")  # pyright: ignore[reportUnknownMemberType] - torch.library is untyped
 
 
 @torch.library.impl(_LIB, "pair", "CompositeExplicitAutograd")
@@ -79,25 +80,35 @@ def _project(x: Tensor, width: int, role: str) -> Tensor:
     return x.new_empty((*x.shape[:-1], width))
 
 
+@torch.library.impl(_LIB, "output", "CompositeExplicitAutograd")
+def _output(xs: list[Tensor], index: int, role: str) -> Tensor:
+    del role
+    floats = [x for x in xs if x.is_floating_point()] or xs
+    return floats[min(index, len(floats) - 1)].clone()
+
+
 for _name, _fake in (
     ("blockrole::pair", _pair),
     ("blockrole::unary", _unary),
     ("blockrole::binary", _binary),
     ("blockrole::project", _project),
+    ("blockrole::output", _output),
 ):
     _ = torch.library.register_fake(_name)(_fake)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType] - torch.library is untyped
 
-# torch.ops is untyped; these are the typed boundary over the four ops.
+# torch.ops is untyped; these are the typed boundary over the five ops.
 _UNARY: Callable[[Tensor, str], object] = torch.ops.blockrole.unary
 _BINARY: Callable[[Tensor, Tensor, str], object] = torch.ops.blockrole.binary
 _PAIR: Callable[[Tensor, Tensor, str], tuple[object, object]] = torch.ops.blockrole.pair
 _PROJECT: Callable[[Tensor, int, str], object] = torch.ops.blockrole.project
+_OUTPUT: Callable[[list[Tensor], int, str], object] = torch.ops.blockrole.output
 _ROLE_OPS: frozenset[object] = frozenset(
     {
         torch.ops.blockrole.pair.default,
         torch.ops.blockrole.unary.default,
         torch.ops.blockrole.binary.default,
         torch.ops.blockrole.project.default,
+        torch.ops.blockrole.output.default,
     }
 )
 
@@ -127,6 +138,16 @@ def pair(x: Tensor, residual: Tensor, label: str) -> tuple[Tensor, Tensor]:
 def project(x: Tensor, width: int, label: str) -> Tensor:
     """An opaque projection to ``width`` labelled ``label``."""
     return _tensor(_PROJECT(x, width, label))
+
+
+def output(xs: Sequence[Tensor], index: int, label: str) -> Tensor:
+    """Output ``index`` of an opaque op on ``xs`` labelled ``label``.
+
+    Shaped like the ``index``-th floating-point input (the first, past the
+    last): a role maps activations to activations; integer inputs such as
+    positions only steer it.
+    """
+    return _tensor(_OUTPUT(list(xs), index, label))
 
 
 class BlockConformanceError(ValueError):

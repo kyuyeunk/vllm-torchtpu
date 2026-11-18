@@ -31,7 +31,6 @@ from vllm_torchtpu.blocks.attn_moe.contract_adapter import (
 )
 from vllm_torchtpu.blocks.attn_moe.pattern import (
     AttnMoEBinding,
-    attn_then_moe,
     block_key,
     moe_explicit_router,
     moe_runner_router,
@@ -43,15 +42,10 @@ from vllm_torchtpu.blocks.attn_moe.runner import (
 )
 from vllm_torchtpu.blocks.binding import as_kind
 from vllm_torchtpu.blocks.context import InstallContext, Installed
-from vllm_torchtpu.blocks.layer_check import (
-    TOKENS,
-    LayerBinding,
-    check_layer,
-    norm_stub,
-)
 from vllm_torchtpu.blocks.norm_attn import install as norm_attn
 from vllm_torchtpu.blocks.norm_attn import plan as subblock_plan
 from vllm_torchtpu.blocks.norm_attn.pattern import norm_then_attention
+from vllm_torchtpu.blocks.pattern_check import TOKENS, check_pattern, layer_key
 from vllm_torchtpu.blocks.stream import route
 
 # vllm_torchtpu.logger's proxy resolves to vLLM's logger of this name.
@@ -82,7 +76,7 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> AttnMoEBinding:
     """Checks a declared layer against attn_then_moe; returns its binding.
 
     The binding' kinds are checked when the binding function builds them; this
-    checks the wiring: the layer's forward (``check_layer``) and the MoE
+    checks the wiring: the layer's forward (``check_pattern``) and the MoE
     child's forward, which the block replaces by calling the router and the
     experts itself.
 
@@ -91,38 +85,13 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> AttnMoEBinding:
             forward or its MoE child's forward computes another graph.
     """
     binding = declared_binding(layer, declaration)
-    state: dict[str, object] = vars(layer)
-    flags = tuple(
-        sorted((k, v) for k, v in state.items() if isinstance(v, (bool, str)))
-    )
-    shapes = tuple(tuple(t.shape) for t in layer.parameters())
-    cache_key = (type(layer), declaration.binding_of, flags, shapes)
+    cache_key = layer_key(layer, declaration.roles_of)
     if cache_key in _conformed:
         return binding
     router = as_kind(binding.router, GateLinear)
     runner = as_kind(binding.experts, MoERunner)
     width, hidden = router.output_size, router.input_size
-    _ = check_layer(
-        layer,
-        LayerBinding(
-            input_norm=binding.input_norm,
-            attention=binding.attention,
-            post_norm=binding.post_norm,
-            rest=binding.moe,
-            stream=binding.stream,
-            attend=binding.attend,
-        ),
-        hidden,
-        lambda h, r: attn_then_moe(
-            h,
-            r,
-            in_norm=norm_stub("in_norm"),
-            attn=lambda t: conf.unary(t, "attn"),
-            post_norm=norm_stub("post_norm"),
-            moe=lambda t: conf.unary(t, "rest"),
-        ),
-        "attn_then_moe",
-    )
+    check_pattern(layer, declaration.pattern, declaration.roles(layer), hidden)
     _check_moe(layer, binding.moe, router, runner, width, hidden)
     _conformed.add(cache_key)
     return binding

@@ -72,6 +72,8 @@ class BlockDeclaration:
         pattern: The pattern's reference forward (``BlockPattern.reference``).
         binding_of: The model owner's function, turned into the runner's
             binding (``BlockPattern.declaration``).
+        roles_of: The model owner's function itself: layer -> the pattern's
+            ``Roles``, or None.
         spans: Declarations of sub-blocks over a span of this pattern's roles,
             derived from the same declaration (``BlockPattern.spans``).
     """
@@ -79,6 +81,7 @@ class BlockDeclaration:
     layer_class: type
     pattern: Pattern
     binding_of: Binding
+    roles_of: Callable[[nn.Module], BlockRoles | None]
     spans: tuple["BlockDeclaration", ...] = ()
 
     def binding(self, layer: nn.Module) -> BlockBinding | None:
@@ -92,6 +95,18 @@ class BlockDeclaration:
             return self.binding_of(layer)
         except BindingKindError as e:
             raise BlockConformanceError(e.describe(layer)) from e
+
+    def roles(self, layer: nn.Module) -> BlockRoles:
+        """The layer's declared roles.
+
+        Raises:
+            BlockConformanceError: The declaration does not cover the layer.
+        """
+        roles = self.roles_of(layer)
+        if roles is None:
+            msg = f"{self.binding_of.__qualname__} returns None for this layer"
+            raise BlockConformanceError(msg)
+        return roles
 
     def when(self, layer: nn.Module) -> bool:
         """Whether the declaration covers this instance."""
@@ -155,20 +170,23 @@ class BlockPattern:
         read = cast("Callable[[nn.Module], BlockRoles | None]", roles_of)
 
         @functools.wraps(roles_of)
-        def binding_of(layer: nn.Module) -> BlockBinding | None:
+        def checked(layer: nn.Module) -> BlockRoles | None:
             roles = read(layer)
-            if roles is None:
-                return None
-            if not isinstance(roles, roles_type):
+            if roles is not None and not isinstance(roles, roles_type):
                 msg = (
                     f"{roles_of.__qualname__} returns {type(roles).__name__}, "
                     f"not {cls.__name__}.Roles"
                 )
                 raise TypeError(msg)
-            return roles.binding()
+            return roles
+
+        @functools.wraps(roles_of)
+        def binding_of(layer: nn.Module) -> BlockBinding | None:
+            roles = checked(layer)
+            return None if roles is None else roles.binding()
 
         spans = cls.spans(layer_class, read)
-        return BlockDeclaration(layer_class, cls.reference, binding_of, spans)
+        return BlockDeclaration(layer_class, cls.reference, binding_of, checked, spans)
 
     @classmethod
     def spans(

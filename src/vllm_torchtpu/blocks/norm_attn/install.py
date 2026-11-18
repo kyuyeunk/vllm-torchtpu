@@ -30,9 +30,8 @@ from vllm_torchtpu.blocks import BlockDeclaration, Pattern, calls
 from vllm_torchtpu.blocks import conformance as conf
 from vllm_torchtpu.blocks.binding import as_kind
 from vllm_torchtpu.blocks.context import InstallContext, Installed
-from vllm_torchtpu.blocks.layer_check import Arg, LayerBinding, check_layer, norm_stub
 from vllm_torchtpu.blocks.norm_attn import plan as plan_mod
-from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnBinding, norm_then_attention
+from vllm_torchtpu.blocks.norm_attn.pattern import NormAttnBinding
 from vllm_torchtpu.blocks.norm_attn.runner import (
     REFERENCE_CAPABILITY,
     AttentionBinding,
@@ -43,12 +42,12 @@ from vllm_torchtpu.blocks.norm_attn.runner import (
     InputProj,
     reference_fused_qkv,
 )
+from vllm_torchtpu.blocks.pattern_check import TOKENS, check_pattern, layer_key
 from vllm_torchtpu.blocks.stream import Stream, route
 
 # vllm_torchtpu.logger's proxy resolves to vLLM's logger of this name.
 logger = logging.getLogger("vllm." + __name__)
 
-_TOKENS = 8
 Tensor = torch.Tensor
 
 
@@ -102,41 +101,15 @@ def conform(layer: nn.Module, declaration: BlockDeclaration) -> Conformed:
         BlockConformanceError: Naming the part, edge and source line.
     """
     declared = declared_binding(layer, declaration)
-    # Layers of one class differ in flags their forward branches on
-    # (layer_type, layer_scale) and, built at other sizes, in their shapes.
-    state: dict[str, object] = vars(layer)
-    flags = tuple(
-        sorted((k, v) for k, v in state.items() if isinstance(v, (bool, str)))
-    )
-    shapes = tuple(tuple(t.shape) for t in layer.parameters())
-    cache_key = (type(layer), declaration.binding_of, flags, shapes)
+    cache_key = layer_key(layer, declaration.roles_of)
     if cache_key in _conformed:
         return _conformed[cache_key]
-    reads = check_layer(
+    check_pattern(
         layer,
-        LayerBinding(
-            input_norm=declared.input_norm,
-            attention=declared.attention,
-            post_norm=declared.post_norm,
-            rest=declared.mlp,
-            stream=declared.stream,
-            attend=declared.attend,
-        ),
+        declaration.pattern,
+        declaration.roles(layer),
         as_kind(declared.qkv_proj, LinearBase).input_size,
-        lambda h, r: norm_then_attention(
-            h,
-            r,
-            in_norm=norm_stub("in_norm"),
-            attn=lambda t: conf.unary(t, "attn"),
-            post_norm=norm_stub("post_norm"),
-            mlp=lambda t: conf.unary(t, "rest"),
-        ),
-        "norm_then_attention",
     )
-    if Arg.POSITIONS not in reads:
-        raise _fail(
-            layer, "attention does not read the positions the runner's RoPE needs"
-        )
 
     # Attention's own forward against the runner's composition. The declared
     # binding are opaque there, so a forward that calls another module than the
@@ -247,8 +220,8 @@ def conform_attention(binding: NormAttnBinding, where: str = "") -> AttnConfig:
         config=config,
     )
     args = (
-        torch.empty(_TOKENS, qkv_proj.input_size, device="meta", dtype=torch.bfloat16),
-        torch.empty(_TOKENS, device="meta", dtype=torch.long),
+        torch.empty(TOKENS, qkv_proj.input_size, device="meta", dtype=torch.bfloat16),
+        torch.empty(TOKENS, device="meta", dtype=torch.long),
     )
     names = ("hidden", "positions")
 
